@@ -6,6 +6,7 @@ import * as path from 'path';
 import * as dotenv from 'dotenv';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
+import { SEED_DATA_SCHEMA_VERSION } from '@/lib/seed-data-schema-version';
 
 dotenv.config();
 
@@ -116,7 +117,7 @@ async function extractDataForPairs(prisma: PrismaClient, pairsArg: string[]) {
     metadata: {
       extractedAt: new Date().toISOString(),
       pairs: pairs.map(p => `${p.cityId}/${p.meetingId}`),
-      schema_version: "1.0"
+      schema_version: SEED_DATA_SCHEMA_VERSION
     },
     // Core entities
     topics,

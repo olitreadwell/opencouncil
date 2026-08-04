@@ -4,6 +4,7 @@ import * as path from 'path'
 import { env } from '@/env.mjs'
 import { CITY_DEFAULTS } from "@/lib/zod-schemas/city"
 import { CORE_PROCESSING_TASKS } from "@/lib/tasks/types"
+import { SEED_DATA_SCHEMA_VERSION, isSeedDataStale } from "@/lib/seed-data-schema-version"
 
 const prisma = new PrismaClient()
 
@@ -366,12 +367,23 @@ async function main() {
 async function getSeedData() {
   // Check if local file exists
   if (fs.existsSync(SEED_DATA_PATH)) {
-    console.log(`Using local seed data file: ${SEED_DATA_PATH}`)
     const data = JSON.parse(fs.readFileSync(SEED_DATA_PATH, 'utf-8'))
-    return data
+
+    if (isSeedDataStale(data)) {
+      const cachedVersion = data?.metadata?.schema_version ?? 'missing'
+      console.warn(
+        `Local seed data file (${SEED_DATA_PATH}) is stale: it was generated for schema_version ` +
+        `"${cachedVersion}", but this checkout expects "${SEED_DATA_SCHEMA_VERSION}". ` +
+        `Deleting the cached file and downloading a fresh copy...`
+      )
+      fs.unlinkSync(SEED_DATA_PATH)
+    } else {
+      console.log(`Using local seed data file: ${SEED_DATA_PATH}`)
+      return data
+    }
   }
 
-  // If no local file, download from URL
+  // If no local file (or it was stale and just got deleted), download from URL
   // Dynamic import to avoid bundling axios in production builds
   // (preview deployments pre-download the seed data with curl)
   console.log(`Downloading seed data from: ${SEED_DATA_URL}`)

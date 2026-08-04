@@ -40,11 +40,12 @@ The seed data follows a structure that avoids duplication and maintains clear re
 The seeding process is handled by `prisma/seed.ts` which:
 
 1. Checks for a local `seed_data.json` file
-2. If not found, downloads it from the project's GitHub repository
-3. Seeds the database with the data in dependency order
-4. Creates synthetic task statuses for meetings with processed data
-5. Creates predefined [test users for development](#test-users)
-6. Prints a per-meeting summary table showing what was seeded
+2. If found but stale (its `metadata.schema_version` doesn't match the current schema version), deletes it and re-downloads
+3. If not found, downloads it from the project's GitHub repository
+4. Seeds the database with the data in dependency order
+5. Creates synthetic task statuses for meetings with processed data
+6. Creates predefined [test users for development](#test-users)
+7. Prints a per-meeting summary table showing what was seeded
 
 ### Dependencies and Order
 
