@@ -3,6 +3,7 @@ import * as path from 'path';
 import { City, CouncilMeeting, Subject, Person, Party, Topic, AdministrativeBody } from '@prisma/client';
 import { SeedData } from './db/types';
 import { env } from '@/env.mjs';
+import { SEED_DATA_SCHEMA_VERSION, isSeedDataStale } from './seed-data-schema-version';
 
 // Cache the seed data to avoid repeated file reads
 let seedDataCache: SeedData | null = null;
@@ -43,6 +44,16 @@ export function loadSeedData(): SeedData {
     try {
         const seedDataPath = getSeedDataPath();
         const data = JSON.parse(fs.readFileSync(seedDataPath, 'utf-8'));
+
+        if (isSeedDataStale(data)) {
+            const cachedVersion = data?.metadata?.schema_version ?? 'missing';
+            throw new Error(
+                `Seed data file (${seedDataPath}) is stale: it was generated for schema_version ` +
+                `"${cachedVersion}", but this checkout expects "${SEED_DATA_SCHEMA_VERSION}". ` +
+                `Regenerate it with 'npx prisma db seed' or 'npm run generate-seed'.`
+            );
+        }
+
         seedDataCache = data;
         return data;
     } catch (error) {
