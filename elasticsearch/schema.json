@@ -92,6 +92,11 @@
         "properties": {
           "contribution_id": { "type": "keyword" },
           "speaker_person_id": { "type": "keyword" },
+          "speaker_name": {
+            "type": "text",
+            "analyzer": "greek",
+            "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
+          },
           "speaker_person_name": {
             "type": "text",
             "analyzer": "greek",
@@ -327,6 +332,7 @@
           "columns": [
             "id",
             "text",
+            "speaker_name",
             "speaker_person_id",
             "speaker_person_name",
             "speaker_person_name_en",
