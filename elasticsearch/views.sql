@@ -76,6 +76,7 @@ SELECT
   sc.id,  -- Keep as `id` for WAL compatibility; renamed to contribution_id in schema.json
   sc."subjectId" AS subject_id,
   sc.text,
+  sc."speakerName" AS speaker_name,
   sp.id AS speaker_person_id,
   sp.name AS speaker_person_name,
   sp.name_en AS speaker_person_name_en,

@@ -95,7 +95,9 @@ function tierBaseByField(should: estypes.QueryDslQueryContainer[]): Record<strin
         if (!inner) continue;
         if (inner.nested) {
             const field = Object.keys(inner.nested.query?.match ?? {})[0] ?? '';
-            add(field.endsWith('speaker_person_name') ? 'speakerName' : 'transcript', base);
+            const isSpeakerName =
+                field.endsWith('speaker_person_name') || field.endsWith('speaker_name');
+            add(isSpeakerName ? 'speakerName' : 'transcript', base);
             continue;
         }
         if (inner.match_phrase) {
@@ -348,7 +350,10 @@ describe('buildSearchQuery lexical ranking', () => {
             + bases.descriptionPhrase + bases.transcript + bases.speakerName;
 
         expect(titleStack).toBeCloseTo(64, 5);
-        expect(nonTitleStack).toBeCloseTo(71.3, 5);
+        // The raw display name of speakers without a Person record (issue 644)
+        // joins the speakerName tier as its own clause, so the strongest stack
+        // collects one more partial base than it did with the person name only.
+        expect(nonTitleStack).toBeCloseTo(71.6, 5);
         // The stack already leads on the constants alone — no metadata is needed
         // to invert the pair. Whether title matches actually lead is a property
         // of the corpus, measured by scripts/search-eval.ts --tier-margin. If
@@ -517,6 +522,26 @@ describe('buildSearchQuery speaker-name clause', () => {
         expect(minimumShouldMatchOf(clause?.inner?.nested?.query)).toBe('2<75%');
     });
 
+    // A contribution whose speaker has no Person record carries its display
+    // name on SpeakerContribution.speakerName. Index it (issue 644) and match
+    // it with the same gate and tier as the person-linked name, so unlinked
+    // speakers become searchable instead of only their transcript text.
+    it('matches the raw display name of speakers without a person record', () => {
+        const clause = nestedClauseOn(
+            scoredShouldClauses('Χάρης Δούκας'),
+            'speaker_contributions.speaker_name'
+        );
+
+        expect(clause?.inner?.nested?.query?.match?.['speaker_contributions.speaker_name'])
+            .toEqual({
+                query: 'Χάρης Δούκας',
+                minimum_should_match: '2<75%',
+            });
+
+        const personClause = speakerNameClause('Χάρης Δούκας');
+        expect(clause!.base!).toBe(personClause!.base!);
+    });
+
     // A separate nested clause from the transcript one, so the two can carry
     // different tiers: a subject the person spoke in is a far weaker answer than
     // one whose debate says the words.
@@ -527,6 +552,10 @@ describe('buildSearchQuery speaker-name clause', () => {
 
         expect(speaker?.inner).not.toBe(transcript?.inner);
         expect(speaker!.base!).not.toBe(transcript!.base!);
+
+        const rawName = nestedClauseOn(should, 'speaker_contributions.speaker_name');
+        expect(rawName?.inner).not.toBe(transcript?.inner);
+        expect(rawName!.base!).not.toBe(transcript!.base!);
     });
 });
 
@@ -1132,10 +1161,17 @@ describe('buildSearchQuery cross-field coverage', () => {
             const nested = gateAlternatives(query)
                 .map(c => c.nested?.query?.bool?.should as estypes.QueryDslQueryContainer[])
                 .find(Boolean);
-            return nested?.find(c => c.match?.['speaker_contributions.speaker_person_name']);
+            return nested?.filter(
+                c => c.match?.['speaker_contributions.speaker_person_name'] ||
+                     c.match?.['speaker_contributions.speaker_name']
+            ) ?? [];
         };
 
-        expect(minimumShouldMatchOf(speakerGate('Ιωάννης Μαλτέζος υδρονομείς'))).toBe('100%');
+        const gates = speakerGate('Ιωάννης Μαλτέζος υδρονομείς');
+        expect(gates).toHaveLength(2);
+        for (const gate of gates) {
+            expect(minimumShouldMatchOf(gate)).toBe('100%');
+        }
         // The transcript alternative keeps the ordinary threshold: a contribution
         // covering 2 of 3 terms is a real coverage claim, a name is not.
         const transcript = gateAlternatives('Ιωάννης Μαλτέζος υδρονομείς')
@@ -1158,6 +1194,13 @@ describe('buildSearchQuery cross-field coverage', () => {
             ?.find(c => c.match?.['speaker_contributions.speaker_person_name']);
 
         expect(speaker?.match?.['speaker_contributions.speaker_person_name'])
+            .toMatchObject({ query: 'Χάρης Δούκας', minimum_should_match: '100%' });
+
+        const rawName = clauses
+            .map(c => c.nested?.query?.bool?.should as estypes.QueryDslQueryContainer[])
+            .find(Boolean)
+            ?.find(c => c.match?.['speaker_contributions.speaker_name']);
+        expect(rawName?.match?.['speaker_contributions.speaker_name'])
             .toMatchObject({ query: 'Χάρης Δούκας', minimum_should_match: '100%' });
     });
 
@@ -1197,7 +1240,7 @@ describe('buildSearchQuery cross-field coverage', () => {
         expect(alternatives.map(c => c.combined_fields?.query).filter(Boolean)).toEqual(spellings);
         expect(alternatives.filter(c => c.match?.['name']).flatMap(queryTextsOf)).toEqual(spellings);
         expect(alternatives.filter(c => c.nested).flatMap(queryTextsOf))
-            .toEqual([spellings[0], spellings[0], spellings[1], spellings[1]]);
+            .toEqual([spellings[0], spellings[0], spellings[0], spellings[1], spellings[1], spellings[1]]);
     });
 
     it('scores partial field coverage below full coverage in the same tier', () => {
