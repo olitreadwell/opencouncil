@@ -221,7 +221,7 @@ This categorization provides better organization and helps users understand the 
     *   `Highlight`: `prisma/schema.prisma`
     *   `HighlightedUtterance`: `prisma/schema.prisma`
 *   **Frontend Components**:
-    *   `CouncilMeeting`: `src/components/meetings/CouncilMeeting.tsx`
+    *   `CouncilMeetingWrapper`: `src/components/meetings/CouncilMeetingWrapper.tsx`
     *   `HighlightsList`: `src/components/meetings/HighlightsList.tsx` (main list interface)
     *   `HighlightView`: `src/components/meetings/HighlightView.tsx` (individual highlight view with responsive video)
     *   `HighlightVideo`: `src/components/meetings/HighlightVideo.tsx` (adaptive video player with aspect ratio detection)
