@@ -37,7 +37,7 @@ OpenCouncil is developed by [Schema Labs](https://schemalabs.gr), a non-profit o
 
 ## Technical Architecture
 
-Next.js 14 (TypeScript) + PostgreSQL/PostGIS + Prisma. A separate [task server](https://github.com/schemalabz/opencouncil-tasks) handles media processing and AI features. See the [documentation index](./docs/README.md) for architecture details and the full deployment topology.
+Next.js 16 (TypeScript) + PostgreSQL/PostGIS + Prisma. A separate [task server](https://github.com/schemalabz/opencouncil-tasks) handles media processing and AI features. See the [documentation index](./docs/README.md) for architecture details and the full deployment topology.
 
 ### Prerequisites
 

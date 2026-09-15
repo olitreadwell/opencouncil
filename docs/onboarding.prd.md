@@ -88,7 +88,7 @@ These are the detailed user journeys for signing up for notifications or petitio
 ## Key Components
 - [`MunicipalitySelector`](/src/components/onboarding/selectors/MunicipalitySelector.tsx) - Searchable combobox with quick selection buttons
 - [`LocationSelector`](/src/components/onboarding/selectors/LocationSelector.tsx) - Google Places integration with map markers
-- [`TopicSelector`](/src/components/onboarding/selectors/TopicSelector.tsx) - Database topic selection with badges
+- [`TopicFilter`](/src/components/filters/TopicFilter.tsx) - Database topic selection with badges
 - [`UserInfoForm`](/src/components/onboarding/UserInfoForm.tsx) - Email/phone collection with validation
 - Step components in [`src/components/onboarding/steps/`](/src/components/onboarding/steps/)
 
