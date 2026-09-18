@@ -12,7 +12,7 @@
 # Examples:
 #   ./exec.sh npx prisma generate
 #   ./exec.sh npx prisma migrate dev
-#   ./exec.sh npx tsx scripts/find_duplicate_subjects.ts --city chania
+#   ./exec.sh npx tsx scripts/find-municipal-committee.ts --city chania
 #   ./exec.sh npm run test
 #   ./exec.sh /bin/sh              # Interactive shell
 # ============================================
@@ -81,7 +81,7 @@ if [ $# -eq 0 ]; then
     echo "Examples:"
     echo "  $0 npx prisma generate"
     echo "  $0 npx prisma migrate dev"
-    echo "  $0 npx tsx scripts/find_duplicate_subjects.ts --city chania"
+    echo "  $0 npx tsx scripts/find-municipal-committee.ts --city chania"
     echo "  $0 npm run test"
     echo "  $0 /bin/sh                    # Interactive shell"
     echo ""
