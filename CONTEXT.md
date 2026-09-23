@@ -1,5 +1,5 @@
 # schemalabz/opencouncil context
-> refreshed 2026-09-09 | upstream default: main @ 2ff47df1
+> refreshed 2026-09-24 | upstream default: main @ b125f996
 
 ## Identity & policies
 - upstream: schemalabz/opencouncil, default branch main, TypeScript/Next.js (Prisma, Elasticsearch, Nix flake)
