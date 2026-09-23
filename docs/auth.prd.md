@@ -1,6 +1,6 @@
 # Administrator Authentication
 
-OpenCouncil has entities like Cities, Parties and People (see db/schema.prisma).
+OpenCouncil has entities like Cities, Parties and People (see prisma/schema.prisma).
 
 Separately we also have User Accounts, which can belong to either citizens or administrators.
 We'll concern ourselves with citizen authentication and citizen authenticated feaures later.
@@ -37,4 +37,4 @@ then they are "onboarded", but /profile still lets them edit these things.
 Αν είστε δημοτικός σύμβουλος ή υπάλληλος δήμου και θέλετε να επεξεργαστείτε κάτι στο OpenCouncil, τότε καλέστε μας στο {env.CONTACT_PHONE}.
 
 
-Importantly, src/lib/auth.js needs to be updated!
+Importantly, src/lib/auth.ts needs to be updated!

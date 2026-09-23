@@ -1,6 +1,6 @@
 # User Onboarding & Authentication
 
-(see `db/schema.prisma` for data models: `User`, `VerificationToken`, `Session`, `Account`, `NotificationPreference`, `Petition`)
+(see `prisma/schema.prisma` for data models: `User`, `VerificationToken`, `Session`, `Account`, `NotificationPreference`, `Petition`)
 (see `docs/user-management.prd.md` for admin-specific user management)
 
 OpenCouncil supports several pathways for user authentication and account creation. This document provides a technical overview of these flows, from a citizen signing up for notifications to an administrator being invited to the platform.
@@ -46,7 +46,7 @@ These are the detailed user journeys for signing up for notifications or petitio
 
 ### Entry Points
 
-**Landing page**: [`src/app/[locale]/(other)/page.tsx`](/src/app/[locale]/(other)/page.tsx) includes a [`MunicipalitySelector`](/src/components/onboarding/selectors/MunicipalitySelector.tsx) component that routes users to:
+**Landing page**: [`src/app/[locale]/(landing-immersive)/page.tsx`](/src/app/[locale]/(landing-immersive)/page.tsx) includes a [`MunicipalitySelector`](/src/components/onboarding/selectors/MunicipalitySelector.tsx) component that routes users to:
 - `/${cityId}` for cities with `isListed = true` (main city page)
 - `/${cityId}/petition` for cities with `isListed = false` (petition flow)
 
@@ -88,7 +88,7 @@ These are the detailed user journeys for signing up for notifications or petitio
 ## Key Components
 - [`MunicipalitySelector`](/src/components/onboarding/selectors/MunicipalitySelector.tsx) - Searchable combobox with quick selection buttons
 - [`LocationSelector`](/src/components/onboarding/selectors/LocationSelector.tsx) - Google Places integration with map markers
-- [`TopicSelector`](/src/components/onboarding/selectors/TopicSelector.tsx) - Database topic selection with badges
+- [`TopicFilter`](/src/components/filters/TopicFilter.tsx) - Database topic selection with badges
 - [`UserInfoForm`](/src/components/onboarding/UserInfoForm.tsx) - Email/phone collection with validation
 - Step components in [`src/components/onboarding/steps/`](/src/components/onboarding/steps/)
 

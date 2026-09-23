@@ -49,7 +49,7 @@ sequenceDiagram
 
 ### Route Handlers
 - `src/app/qr/[code]/route.ts` - Public redirect handler (GET request, DB lookup, UTM injection, 307 redirect)
-- `src/middleware.ts` - Middleware configuration (bypasses i18n for `/qr/*` paths using regex `qr\/`)
+- `src/proxy.ts` - Middleware configuration (bypasses i18n for `/qr/*` paths using regex `qr\/`)
 
 ### API Endpoints
 - `src/app/api/admin/qr/route.ts` - Admin CRUD (GET: list campaigns, POST: create campaign with duplicate code detection)
@@ -57,7 +57,7 @@ sequenceDiagram
 
 ### Frontend Components
 - `src/app/[locale]/(admin)/admin/qr/page.tsx` - Admin management page (server component, displays table with name column)
-- `src/components/admin/qr/qr-controls.tsx` - Client controls (CreateForm with inline error display, ToggleActive, DeleteButton, CopyButton)
+- `src/app/[locale]/(admin)/admin/qr/page.tsx` - Client controls (CreateForm with inline error display, ToggleActive, DeleteButton, CopyButton)
 - `src/components/admin/sidebar.tsx` - Admin navigation (QR Campaigns menu item with QrCode icon)
 
 ### Utilities
@@ -130,7 +130,7 @@ When scanned, poster 01 redirects to:
 
 **See Also**
 
-- [Authentication Guide](./authentication.md) - Understanding admin authorization checks
+- [Authentication Guide](../auth.prd.md) - Understanding admin authorization checks
 - [Environment Variables](../environment-variables.md) - Required configuration for `NEXTAUTH_URL`
 - Database schema documentation - QrCampaign model details
 
