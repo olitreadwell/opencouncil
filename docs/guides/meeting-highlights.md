@@ -221,7 +221,7 @@ This categorization provides better organization and helps users understand the 
     *   `Highlight`: `prisma/schema.prisma`
     *   `HighlightedUtterance`: `prisma/schema.prisma`
 *   **Frontend Components**:
-    *   `CouncilMeeting`: `src/components/meetings/CouncilMeeting.tsx`
+    *   `CouncilMeetingWrapper`: `src/components/meetings/CouncilMeetingWrapper.tsx`
     *   `HighlightsList`: `src/components/meetings/HighlightsList.tsx` (main list interface)
     *   `HighlightView`: `src/components/meetings/HighlightView.tsx` (individual highlight view with responsive video)
     *   `HighlightVideo`: `src/components/meetings/HighlightVideo.tsx` (adaptive video player with aspect ratio detection)
@@ -232,7 +232,7 @@ This categorization provides better organization and helps users understand the 
     *   `HighlightModeBar`: `src/components/meetings/HighlightModeBar.tsx` (streamlined editing interface with statistics, save/reset/exit, preview button, and guide)
     *   `HighlightGuideDialog`: `src/components/meetings/HighlightGuideDialog.tsx` (in-app user guide for highlights)
     *   `Utterance`: `src/components/meetings/transcript/Utterance.tsx` (enhanced with highlight selection and context menu creation)
-    *   `TranscriptControls`: `src/components/meetings/TranscriptControls.tsx` (timeline visualization with clip navigation)
+    *   `TranscriptControls`: `src/components/meetings/bar/PlaybackBar.tsx` (timeline visualization with clip navigation)
 *   **State Management**:
     *   `HighlightContext`: `src/components/meetings/HighlightContext.tsx` (centralized highlight state, calculations, edit/preview lifecycle, save/reset/exit)
     *   `CouncilMeetingDataContext`: `src/components/meetings/CouncilMeetingDataContext.tsx` (centralized meeting data and highlight management with add/update/remove methods)

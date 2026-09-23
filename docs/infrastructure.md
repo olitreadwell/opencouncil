@@ -1,6 +1,6 @@
 # Infrastructure & Deployment
 
-How OpenCouncil's environments, databases, and services are connected. For database access procedures (roles, copying data), see [guides/database-access.md](./guides/database-access.md).
+How OpenCouncil's environments, databases, and services are connected. For database access procedures (roles, copying data), see [docker-usage.md](./docker-usage.md).
 
 ## Deployment Topology
 

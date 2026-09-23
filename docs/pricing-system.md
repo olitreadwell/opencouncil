@@ -257,10 +257,10 @@ const defaultValues = {
 
 ### Components Using Pricing
 
-1. **`src/components/static/Pricing.tsx`**: Public pricing calculator
+1. **`src/components/about/PricingSection.tsx`**: Public pricing calculator
 2. **`src/components/admin/offers/offer-form.tsx`**: Admin offer creation
 3. **`src/components/offer-letter/offer-letter.tsx`**: Generated offer letters
-4. **`src/components/static/About.tsx`**: Landing page pricing display
+4. **`src/components/about/AboutPage.tsx`**: Landing page pricing display
 
 ### Backward Compatibility
 
