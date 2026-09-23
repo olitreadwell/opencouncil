@@ -29,6 +29,7 @@
 - 2026-08-05 issue #335 — pr-opened-substantive-green (fork PR #1) — stale seed-data detection
 - 2026-08-25 issue #644 — pr-opened (fork PR #39) — index SpeakerContribution.speakerName into ES
 - 2026-09-09 trivial pass — pr-opened (fork PR) — typos/dead-links/stale-commands cleanup
+- 2026-09-23 trivial pass — pr-opened (fork PR #78) — stale doc file-path refs in 4 docs + cityCreatorAI prompt typo
 
 ## Mined gaps (discovered, not yet attempted)
 - 2026-09-09 trivial/minor-fix pass across whole repo (typos, dead links, stale command refs, wrong doc lines) — status: attempted
