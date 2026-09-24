@@ -202,7 +202,7 @@ const stats = await createNotificationsForMeeting(
 
 ### 4. Notification View Page
 
-#### `src/app/notifications/[id]/page.tsx` - Public notification view:
+#### `src/app/[locale]/(other)/notifications/[id]/page.tsx` - Public notification view:
 **Requirements:**
 - **Unauthenticated access**: No login required
 - **Mobile-first responsive design**: Optimized for mobile devices
@@ -313,7 +313,7 @@ PATCH /api/users/[userId]/notification-preferences - Update preferences
 
 #### Email Template Components:
 ```typescript
-// src/lib/notifications/templates/email.tsx
+// src/lib/email/templates/NotificationEmail.tsx
 export function NotificationEmailTemplate({notification, subjects, unsubscribeUrl}) {
   // HTML email with:
   // - Header with city/administrative body branding
