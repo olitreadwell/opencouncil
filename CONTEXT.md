@@ -1,5 +1,5 @@
 # schemalabz/opencouncil context
-> refreshed 2026-09-24 | upstream default: main @ 75dc4ee2
+> refreshed 2026-10-02 | upstream default: main @ f9832f1e
 
 ## Identity & policies
 - upstream: schemalabz/opencouncil, default branch main, TypeScript/Next.js (Prisma, Elasticsearch, Nix flake)
@@ -23,7 +23,8 @@
 
 ## Issue-area health
 - 9 open good-first-issues / help-wanted
-- prior fork PRs: #1 (issue #335 seed-data), #39 (issue #644 SpeakerContribution.speakerName ES index)
+- umbrella issue #45 (API documentation) still open; maintainer kouloumos lists remaining sub-gaps: statistics route, admin/consultations/auth registrations, contribution guide, /docs intro, and the 500 write routes return when withUserAuthorizedToEdit throws (last one now attempted)
+- prior fork PRs: #1 (issue #335 seed-data), #39 (issue #644 SpeakerContribution.speakerName ES index), #81 (issue #597 i18n plurals)
 
 ## Gap ledger (dedupe — READ FIRST, never re-pick)
 - 2026-08-05 issue #335 — pr-opened-substantive-green (fork PR #1) — stale seed-data detection
@@ -32,6 +33,7 @@
 - 2026-09-23 trivial pass — pr-opened (fork PR #78) — stale doc file-path refs in 4 docs + cityCreatorAI prompt typo
 - 2026-09-24 trivial pass — pr-opened (fork PR #79) — stale doc file/component path refs in 5 docs (prisma schema path x5, landing route, admin route, notis agent templates, qr admin page)
 - 2026-09-24 issue #597 — pr-opened (fork PR #81) — validate/complete ICU plural categories per locale (new validator pass; completed 2 Serbian few branches in cityOverview)
+- 2026-10-02 issue #45 — pr-opened (fork PR) — party/meeting write routes returned 500 when withUserAuthorizedToEdit rejected; throw shared UnauthorizedError and pass ApiError through handleApiError so the documented 401 surfaces
 
 ## Mined gaps (discovered, not yet attempted)
 - 2026-09-09 trivial/minor-fix pass across whole repo (typos, dead links, stale command refs, wrong doc lines) — status: attempted
