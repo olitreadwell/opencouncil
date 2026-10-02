@@ -3,6 +3,7 @@ import { revalidatePath, revalidateTag } from 'next/cache'
 import { uploadFile } from '@/lib/s3'
 import { getPartiesForCity, createParty } from '@/lib/db/parties'
 import { withUserAuthorizedToEdit } from '@/lib/auth'
+import { ApiError, handleApiError } from '@/lib/api/errors'
 import { z } from 'zod'
 import { parseFormData } from '@/lib/api/form-data-parser'
 import { partyFormDataSchema } from '@/lib/zod-schemas/party'
@@ -52,6 +53,9 @@ export async function POST(request: Request, props: { params: Promise<{ cityId: 
     } catch (error) {
         if (error instanceof z.ZodError) {
             return NextResponse.json({ error: error.errors }, { status: 400 })
+        }
+        if (error instanceof ApiError) {
+            return handleApiError(error)
         }
         console.error('Error creating party:', error)
         return NextResponse.json({ error: 'Failed to create party' }, { status: 500 })
