@@ -39,6 +39,7 @@ ORDER BY viewname;
 SELECT
   COUNT(*) AS total_contributions,
   COUNT(speaker_person_id) AS with_speaker,
+  COUNT(speaker_name) AS with_raw_speaker_name,
   COUNT(speaker_party_id) AS with_party,
   COUNT(text) AS with_text
 FROM "SpeakerContributionSearchView";
@@ -47,6 +48,7 @@ FROM "SpeakerContributionSearchView";
 \echo '   Sample contributions (first 3):'
 SELECT
   id,
+  speaker_name,
   speaker_person_name,
   speaker_party_name,
   LEFT(text, 80) || CASE WHEN LENGTH(text) > 80 THEN '...' ELSE '' END AS text_preview
