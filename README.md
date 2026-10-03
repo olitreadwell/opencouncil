@@ -41,7 +41,7 @@ Next.js 14 (TypeScript) + PostgreSQL/PostGIS + Prisma. A separate [task server](
 
 ### Prerequisites
 
-- Node.js 18+ and npm
+- Node.js 24+ and npm
 - PostgreSQL 14+ with the postgis extension
 - Docker (optional, but recommended)
 - Nix (optional, recommended for the flake-based setup)
