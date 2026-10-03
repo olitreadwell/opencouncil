@@ -1,5 +1,5 @@
 # schemalabz/opencouncil context
-> refreshed 2026-10-02 | upstream default: main @ f9832f1e
+> refreshed 2026-10-03 | upstream default: main @ a878b6df
 
 ## Identity & policies
 - upstream: schemalabz/opencouncil, default branch main, TypeScript/Next.js (Prisma, Elasticsearch, Nix flake)
@@ -37,3 +37,4 @@
 
 ## Mined gaps (discovered, not yet attempted)
 - 2026-09-09 trivial/minor-fix pass across whole repo (typos, dead links, stale command refs, wrong doc lines) — status: attempted
+- 2026-10-03 trivial pass — pr-opened (fork PR #87) — retarget stale Elasticsearch README ToC anchors (#overview, #set-up-pgsync, #sync-data) to their real headings + README prerequisite Node.js 18+ -> 24+ (matches package.json engines); whole-repo anchor/URL/codespell sweep found only these
