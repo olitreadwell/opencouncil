@@ -129,7 +129,7 @@ export async function withUserAuthorizedToEdit({
     });
 
     if (!isAuthorized) {
-        throw new Error("Not authorized");
+        throw new UnauthorizedError("Not authorized");
     }
 
     return true;
