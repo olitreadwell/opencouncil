@@ -397,7 +397,7 @@ Do not narrate each step. Do not repeat what the diff already shows.
 ## Environment Setup
 
 Required services:
-- PostgreSQL 14+ with PostGIS extension
+- PostgreSQL 16+ with PostGIS extension
 - Elasticsearch instance
 - Task API server (separate backend)
 - S3-compatible storage (DigitalOcean Spaces)
