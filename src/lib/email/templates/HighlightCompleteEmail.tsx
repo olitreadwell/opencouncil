@@ -33,7 +33,7 @@ interface HighlightCompleteCopy {
  * A local table for consistency with the auth email rather than out of necessity:
  * this one renders from a plain route handler, which `next/headers` is fine in,
  * and `getTranslations({ locale })` short-circuits `getRequestLocale()` when given
- * a locale — `lib/mcp/data.ts` already relies on that. So a future third email
+ * a locale — `src/lib/mcp/data.ts` already relies on that. So a future third email
  * could legitimately live in `messages/` instead; only the auth email is forced
  * out of it by the proxy's module graph.
  */

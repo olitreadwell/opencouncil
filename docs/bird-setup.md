@@ -86,7 +86,7 @@ BIRD_SMS_CHANNEL_ID=<optional>
 BIRD_WEBHOOK_SECRET=<openssl-output-from-step-6>
 ```
 
-The template ids go beside them — one per shell in `src/agent/templates.ts`, listed in [`services/notis/README.md`](../services/notis/README.md). At this point Notis can send; **inbound** still requires the next two steps.
+The template ids go beside them — one per shell in `services/notis/src/agent/templates.ts`, listed in [`services/notis/README.md`](../services/notis/README.md). At this point Notis can send; **inbound** still requires the next two steps.
 
 ## Step 8: Expose the webhook locally with ngrok
 
