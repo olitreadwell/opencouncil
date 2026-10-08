@@ -4,7 +4,7 @@
  * of these by age, and keeps any other name its owner typed while the form
  * still asked for one.
  *
- * Kept out of db/mcpTokens.ts because that module is server-only, and the
+ * Kept out of src/lib/db/mcpTokens.ts because that module is server-only, and the
  * token manager runs on the client.
  */
 export const GENERATED_MCP_TOKEN_NAME = 'MCP address';

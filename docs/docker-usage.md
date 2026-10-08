@@ -85,7 +85,7 @@ To run any command inside the Docker container with the proper environment, use 
 ./exec.sh npx prisma studio
 
 # TypeScript scripts
-./exec.sh npx tsx scripts/find_duplicate_subjects.ts --city chania
+./exec.sh npx tsx scripts/find-municipal-committee.ts --city chania
 ./exec.sh tsx scripts/email_municipality.ts
 
 # NPM scripts

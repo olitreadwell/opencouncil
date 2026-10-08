@@ -1,6 +1,6 @@
 # Administrator Authentication
 
-OpenCouncil has entities like Cities, Parties and People (see db/schema.prisma).
+OpenCouncil has entities like Cities, Parties and People (see prisma/schema.prisma).
 
 Separately we also have User Accounts, which can belong to either citizens or administrators.
 We'll concern ourselves with citizen authentication and citizen authenticated feaures later.
@@ -29,12 +29,12 @@ If the user is not onboarded, they are kindly asked for these two things. When t
 then they are "onboarded", but /profile still lets them edit these things.
 
 /profile primarily shows them what they can administer:
-1. If they're a superadmin, they are told that that they can access /admin and are offered an option to go there.
+1. If they're a superadmin, they are told that they can access /admin and are offered an option to go there.
 2. If they administer one or more thing, they are told that they can administer that thing and are offered an option to go there.
 3. If they administer nothing, then they are thanked for signing up with something like:
-Ευχαριστούμε για την εγγαρφή σας!
-Αν είστε δημότης, δεν υπάρχουν ακόμα πολλά πράγματα που μπορείτε να κάνετε σαν συνεδεμένος χρήστης.
+Ευχαριστούμε για την εγγραφή σας!
+Αν είστε δημότης, δεν υπάρχουν ακόμα πολλά πράγματα που μπορείτε να κάνετε σαν συνδεδεμένος χρήστης.
 Αν είστε δημοτικός σύμβουλος ή υπάλληλος δήμου και θέλετε να επεξεργαστείτε κάτι στο OpenCouncil, τότε καλέστε μας στο {env.CONTACT_PHONE}.
 
 
-Importantly, src/lib/auth.js needs to be updated!
+Importantly, src/lib/auth.ts needs to be updated!

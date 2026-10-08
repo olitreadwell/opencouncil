@@ -8,7 +8,7 @@ import type { CityStatus, Prisma } from '@prisma/client';
  *
  * Type-only Prisma import, so this is safe in client components too.
  *
- * The raw-SQL twins live in `db/cities.ts` (`publicCityStatusSql`,
+ * The raw-SQL twins live in `src/lib/db/cities.ts` (`publicCityStatusSql`,
  * `outOfNetworkCityStatusSql`) — the compiler cannot see enum values inside a
  * template literal, so those must be changed in step with these.
  */
