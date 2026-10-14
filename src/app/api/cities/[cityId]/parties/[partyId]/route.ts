@@ -3,6 +3,7 @@ import { revalidatePath, revalidateTag } from 'next/cache'
 import { uploadFile } from '@/lib/s3'
 import { getParty, editParty, deleteParty } from '@/lib/db/parties'
 import { withUserAuthorizedToEdit } from '@/lib/auth'
+import { ApiError, handleApiError } from '@/lib/api/errors'
 import { z } from 'zod'
 import { parseFormData } from '@/lib/api/form-data-parser'
 import { partyFormDataSchema } from '@/lib/zod-schemas/party'
@@ -67,6 +68,9 @@ export async function PUT(
         if (error instanceof z.ZodError) {
             return NextResponse.json({ error: error.errors }, { status: 400 })
         }
+        if (error instanceof ApiError) {
+            return handleApiError(error)
+        }
         console.error('Error editing party:', error)
         return NextResponse.json({ error: 'Failed to edit party' }, { status: 500 })
     }
@@ -88,6 +92,9 @@ export async function DELETE(
         revalidatePath(`/${params.cityId}/parties`);
         return NextResponse.json({ message: 'Party deleted successfully' })
     } catch (error) {
+        if (error instanceof ApiError) {
+            return handleApiError(error)
+        }
         console.error('Error deleting party:', error)
         return NextResponse.json({ error: 'Failed to delete party' }, { status: 500 })
     }

@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { getMeetingDataCore } from '@/lib/getMeetingData';
 import { z } from 'zod';
 import { withUserAuthorizedToEdit } from '@/lib/auth';
+import { ApiError, handleApiError } from '@/lib/api/errors';
 import { meetingSchema } from '@/lib/zod-schemas/meeting';
 import { updateMeetingWithEffects } from '@/lib/meetingWrites';
 
@@ -57,6 +58,9 @@ export async function PUT(
         if (error instanceof z.ZodError) {
             console.error('Validation error:', error.errors);
             return NextResponse.json({ error: error.errors }, { status: 400 });
+        }
+        if (error instanceof ApiError) {
+            return handleApiError(error);
         }
         console.error('Failed to update meeting:', error);
         return NextResponse.json(
