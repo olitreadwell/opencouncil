@@ -900,6 +900,14 @@ function buildCoverageGate(queryText: string): QueryContainer {
                                                 minimum_should_match: SPEAKER_NAME_GATE_MINIMUM_SHOULD_MATCH
                                             }
                                         }
+                                    },
+                                    {
+                                        match: {
+                                            'speaker_contributions.speaker_name': {
+                                                query: text,
+                                                minimum_should_match: SPEAKER_NAME_GATE_MINIMUM_SHOULD_MATCH
+                                            }
+                                        }
                                     }
                                 ],
                                 minimum_should_match: 1
@@ -1035,6 +1043,22 @@ function buildLexicalShouldClauses(
                     query: {
                         match: {
                             'speaker_contributions.speaker_person_name': {
+                                query: text,
+                                minimum_should_match: minimumShouldMatch
+                            }
+                        }
+                    }
+                }
+            })),
+            FIELD_TIER.speakerName
+        ),
+        ...coverageClauses(
+            minimumShouldMatch => perSpelling(text => ({
+                nested: {
+                    path: 'speaker_contributions',
+                    query: {
+                        match: {
+                            'speaker_contributions.speaker_name': {
                                 query: text,
                                 minimum_should_match: minimumShouldMatch
                             }
