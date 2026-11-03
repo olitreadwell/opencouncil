@@ -26,6 +26,7 @@ jest.mock('@/lib/db/utils', () => ({ getFixTranscriptRequestBody: jest.fn() }));
 jest.mock('@/lib/tasks/tasks', () => ({ startTask: jest.fn() }));
 jest.mock('../speakerHints', () => ({ applySpeakerHints: (...args: unknown[]) => mockApplySpeakerHints(...args) }));
 
+import { MEDIA_FAILURE_RESPONSE_PREFIX } from '../mediaMetadata';
 import { handleFixTranscriptResult } from '../fixTranscriptInternal';
 
 const TASK_CREATED = new Date('2026-09-18T10:10:00Z');
@@ -54,7 +55,14 @@ describe('handleFixTranscriptResult', () => {
     expect(mockUtteranceEditCreate).toHaveBeenCalledWith({
       data: { utteranceId: 'u1', beforeText: 'Λάθος.', afterText: 'Διορθωμένο.', editedBy: 'task' },
     });
-    expect(mockApplySpeakerHints).toHaveBeenCalledWith('task-1', result.speakerHints);
+    expect(mockApplySpeakerHints).toHaveBeenCalledWith('task-1', result.speakerHints, []);
+  });
+
+  it('passes on the labels of speakers who are not on the roster', async () => {
+    const unlistedSpeakerHints = [{ speakerTagId: 't2', name: 'Παπαδόπουλος Γιώργος - κάτοικος', actionable: true, evidenceKind: 'named' as const, confidence: 90, evidence: 'e' }];
+    await handleFixTranscriptResult('task-1', { ...result, unlistedSpeakerHints });
+
+    expect(mockApplySpeakerHints).toHaveBeenCalledWith('task-1', result.speakerHints, unlistedSpeakerHints);
   });
 
   it('looks for a later transcribe or fixTranscript run of the same meeting whose result has arrived', async () => {
@@ -65,7 +73,7 @@ describe('handleFixTranscriptResult', () => {
     expect(mockTaskFindFirst.mock.calls[0][0].where).toEqual({
       cityId: 'city-1',
       councilMeetingId: 'meeting-1',
-      OR: [{ status: 'succeeded' }, { responseBody: { not: null } }],
+      OR: [{ status: 'succeeded' }, { responseBody: { not: null }, NOT: { responseBody: { startsWith: MEDIA_FAILURE_RESPONSE_PREFIX } } }],
       type: { in: ['transcribe', 'fixTranscript'] },
       createdAt: { gt: TASK_CREATED },
     });
