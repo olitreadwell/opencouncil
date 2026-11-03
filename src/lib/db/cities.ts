@@ -2,11 +2,12 @@
 import { City, CityStatus, CouncilMeeting, Prisma, Realm } from '@prisma/client';
 import { revalidateTag } from 'next/cache';
 import prisma from "./prisma";
+import { CITY_COUNT_SELECT, CITY_ORDER_BY } from './citiesAdmin';
 import { createCache } from "../cache";
-import { isUserAuthorizedToEdit, withUserAuthorizedToEdit, getCurrentUser } from "../auth";
+import { withUserAuthorizedToEdit, getCurrentUser } from "@/lib/auth";
 import { UnauthorizedError } from "../api/errors";
 import { getRealm } from "../realm.server";
-import { createCityDirect } from "./citiesAdmin";
+import { createCityDirect, updateCityGeometryDirect } from "./citiesAdmin";
 import { CUSTOMER_CITY_WHERE, OUT_OF_NETWORK_CITY_WHERE, PUBLIC_CITY_WHERE } from "../cityStatus";
 import {
     PETITION_DISPLAY_THRESHOLD,
@@ -37,24 +38,6 @@ export type CityWithCounts = City & {
     _count: CityCounts;
 };
 
-// Common configurations for database queries
-const CITY_COUNT_SELECT = {
-    select: {
-        persons: true,
-        parties: true,
-        councilMeetings: {
-            where: {
-                released: true
-            }
-        }
-    }
-};
-
-const CITY_ORDER_BY = [
-    // supported > demo > pending, by CityStatus declaration order
-    { status: 'desc' as const },
-    { name: 'asc' as const }
-];
 
 export async function deleteCity(id: string): Promise<void> {
     await withUserAuthorizedToEdit({});
@@ -104,12 +87,7 @@ export async function updateCityGeometry(
     geometry: GeoJSON.Polygon | GeoJSON.MultiPolygon
 ): Promise<void> {
     await withUserAuthorizedToEdit({ cityId: id });
-    await prisma.$executeRaw`
-        UPDATE "City"
-        SET geometry = ST_SetSRID(ST_GeomFromGeoJSON(${JSON.stringify(geometry)}), 4326),
-            "updatedAt" = NOW()
-        WHERE id = ${id}
-    `;
+    await updateCityGeometryDirect(id, geometry);
     // The geometry cache carries no TTL, so a redrawn boundary would otherwise
     // frame the old outline for good. The invalidation belongs to the writer,
     // not to one of its callers.
@@ -399,65 +377,6 @@ export async function getListedCitiesCached(realm: Realm): Promise<CityWithCount
     )();
 }
 
-export async function getFullCity(
-    cityId: string,
-    options?: CityGeometryOptions
-) {
-    const canEdit = await isUserAuthorizedToEdit({ cityId });
-    const city = await prisma.city.findUnique({
-        where: { id: cityId },
-        include: {
-            councilMeetings: {
-                where: {
-                    released: canEdit ? undefined : true
-                },
-                include: {
-                    subjects: {
-                        include: {
-                            highlights: true,
-                            location: true,
-                            topic: true,
-                            introducedBy: {
-                                include: {
-                                    roles: {
-                                        include: {
-                                            party: true
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    administrativeBody: true
-                }
-            },
-            parties: true,
-            persons: {
-                include: {
-                    speakerTags: true,
-                    roles: {
-                        include: {
-                            party: true,
-                            city: true,
-                            administrativeBody: true
-                        }
-                    }
-                }
-            },
-            administrators: {
-                include: {
-                    user: true
-                }
-            }
-        }
-    });
-    
-    if (!city) return null;
-    if (!options?.includeGeometry) return city;
-    
-    return await attachGeometryToCity(city);
-}
-
 export async function getAllCitiesMinimal(realm?: Realm): Promise<CityMinimalWithCounts[]> {
     try {
         const cities = await prisma.city.findMany({
@@ -646,41 +565,6 @@ export async function getCityIdContainingPoint([lng, lat]: [number, number]): Pr
         console.error('Error resolving city for point:', error);
         return null;
     }
-}
-
-/**
- * Check if a city can use the city creator tool.
- * Returns true if the city exists and has no existing data, false otherwise.
- */
-export async function canUseCityCreator(cityId: string): Promise<boolean> {
-    // Check if city exists
-    const city = await getCity(cityId);
-    if (!city) {
-        return false;
-    }
-
-    // Check if city has any existing data
-    const existingData = await prisma.city.findUnique({
-        where: { id: cityId },
-        include: {
-            parties: true,
-            persons: true,
-            councilMeetings: true,
-            roles: true,
-        },
-    });
-
-    if (existingData && (
-        existingData.parties.length > 0 ||
-        existingData.persons.length > 0 ||
-        existingData.councilMeetings.length > 0 ||
-        existingData.roles.length > 0
-    )) {
-        return false;
-    }
-
-    // City is eligible for city creator
-    return true;
 }
 
 /**

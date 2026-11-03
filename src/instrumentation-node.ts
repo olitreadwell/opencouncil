@@ -2,11 +2,36 @@
 // inside the `process.env.NEXT_RUNTIME === 'nodejs'` guard so the contents are
 // never bundled into the Edge runtime (which would warn about `process.exit`).
 
+import { totalmem } from 'os';
+import { getHeapStatistics } from 'v8';
 import { registerInitialCache } from '@fortedigital/nextjs-cache-handler/instrumentation';
 import CacheHandler from '../cache-handler.mjs';
 import prisma from '@/lib/db/prisma';
 
+const MB = 2 ** 20;
+// Without a cgroup limit, Node reports a sentinel near 2^63 or 2^64 bytes, not 0.
+const NO_LIMIT_BYTES = 2 ** 60;
+
 export async function runNodeInstrumentation() {
+  // `production:start` sets the V8 heap limit to 75% of `os.totalmem()`. On App
+  // Platform that is the instance memory, while the cgroup reports no limit, so
+  // Node's own `--max-old-space-size-percentage` would allow an unbounded heap.
+  // A heap limit above the memory gets the instance killed without a log line,
+  // and a limit that the working set reaches freezes it. Record what each
+  // instance got, before any await, so a stalled cache handler cannot hide it.
+  const heapLimitMb = Math.round(getHeapStatistics().heap_size_limit / MB);
+  const totalMb = Math.round(totalmem() / MB);
+  const containerBytes = process.constrainedMemory();
+  const container = containerBytes > 0 && containerBytes < NO_LIMIT_BYTES ? `${Math.round(containerBytes / MB)} MB` : 'no limit';
+  console.info(
+    `[instrumentation] V8 heap limit ${heapLimitMb} MB, container memory ${container}, total memory ${totalMb} MB`
+  );
+  if (heapLimitMb >= totalMb) {
+    console.warn(
+      `[instrumentation] V8 heap limit ${heapLimitMb} MB is not below the total memory ${totalMb} MB: the instance will be killed before V8 collects garbage hard`
+    );
+  }
+
   await registerInitialCache(CacheHandler);
 
   // Prisma boot probe.

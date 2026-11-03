@@ -1,35 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { z } from 'zod';
 import { getCouncilMeetingsForCity } from '@/lib/db/meetingsList';
 import { originalScheduledDates } from '@/lib/db/meetingLifecycle';
-import { withServiceOrUserAuth, getUnreleasedScope } from '@/lib/auth';
+import { withUserAuthorizedToEdit, getUnreleasedScope } from '@/lib/auth';
 import { ALL_UNRELEASED, NO_UNRELEASED, type UnreleasedScope } from '@/lib/unreleased';
 import { createMeetingWithEffects } from '@/lib/meetingWrites';
 import { handleApiError } from '@/lib/api/errors';
-import { getCityNameEnAndTimezone } from '@/lib/db/citiesAdmin';
-import { meetingSchema } from '@/lib/zod-schemas/meeting';
+import { getCityTimezone } from '@/lib/db/cityTimezone';
+import { meetingListQuerySchema, meetingSchema } from '@/lib/zod-schemas/meeting';
 import { hideLinks, toPublicApiMeeting } from '@/lib/meetingPublic';
-import { DEFAULT_TIMEZONE } from '@/lib/formatters/time';
-
-const getMeetingsQuerySchema = z.object({
-    limit: z.string()
-        .optional()
-        .transform((val) => val ? parseInt(val, 10) : undefined)
-        .refine((val) => val === undefined || (!isNaN(val) && val >= 1 && val <= 100), {
-            message: "Limit must be a number between 1 and 100"
-        }),
-    from: z.string()
-        .optional()
-        .refine((val) => !val || !isNaN(new Date(val).getTime()), { message: "Invalid 'from' date" })
-        .transform((val) => val ? new Date(val) : undefined),
-    to: z.string()
-        .optional()
-        .refine((val) => !val || !isNaN(new Date(val).getTime()), { message: "Invalid 'to' date" })
-        .transform((val) => val ? new Date(val) : undefined),
-    includeUnreleased: z.string()
-        .optional()
-        .transform((val) => val === 'true'),
-});
+import { resolveDateRange } from '@/lib/dates/dayBounds';
 
 export async function POST(request: NextRequest, props: { params: Promise<{ cityId: string }> }) {
     const params = await props.params;
@@ -40,12 +19,12 @@ export async function POST(request: NextRequest, props: { params: Promise<{ city
         // runs before the parse, so a caller without rights learns nothing
         // about the schema.
         const bodyId = typeof body?.administrativeBodyId === 'string' && body.administrativeBodyId ? body.administrativeBodyId : undefined;
-        await withServiceOrUserAuth(request, bodyId
+        await withUserAuthorizedToEdit(bodyId
             ? { cityId: params.cityId, administrativeBodyId: bodyId }
             : { cityId: params.cityId });
         const { processAgenda, ...input } = meetingSchema.parse(body);
 
-        // Auth was already verified by withServiceOrUserAuth above. The shared
+        // Auth was already verified by withUserAuthorizedToEdit above. The shared
         // write runs the lifecycle rules and does no auth of its own.
         const { meeting, processAgendaStatus } = await createMeetingWithEffects(params.cityId, { ...input, processAgenda });
 
@@ -54,9 +33,6 @@ export async function POST(request: NextRequest, props: { params: Promise<{ city
             ...(processAgenda && { processAgendaStatus }),
         }, { status: 201 });
     } catch (error) {
-        if (error instanceof z.ZodError) {
-            return NextResponse.json({ error: error.errors }, { status: 400 });
-        }
         return handleApiError(error, 'Failed to create meeting');
     }
 }
@@ -67,28 +43,28 @@ export async function GET(request: NextRequest, props: { params: Promise<{ cityI
         const { searchParams } = request.nextUrl;
         const queryParams = Object.fromEntries(searchParams.entries());
 
-        const { limit, from, to, includeUnreleased } = getMeetingsQuerySchema.parse(queryParams);
+        const { limit, from, to, includeUnreleased } = meetingListQuerySchema.parse(queryParams);
 
-        // includeUnreleased needs a service key or an editor of the city. A
-        // body admin is one: they get the drafts of their bodies and no other,
-        // so the meeting form can offer them the meeting that a new one replaces.
+        // includeUnreleased needs an editor of the city. A body admin is one:
+        // they get the drafts of their bodies and no other, so the meeting form
+        // can offer them the meeting that a new one replaces.
         let unreleased: UnreleasedScope = NO_UNRELEASED;
         if (includeUnreleased) {
             const scope = await getUnreleasedScope(params.cityId);
             if (scope.all || scope.bodyIds.length > 0) {
                 unreleased = scope;
             } else {
-                // No session with rights here: a service key passes, anyone else gets 401.
-                await withServiceOrUserAuth(request, { cityId: params.cityId });
+                // No session with rights here: 401 without a session, 403 with one.
+                await withUserAuthorizedToEdit({ cityId: params.cityId });
                 unreleased = ALL_UNRELEASED;
             }
         }
 
+        const timezone = await getCityTimezone(params.cityId);
         const meetings = await getCouncilMeetingsForCity(params.cityId, {
             unreleased,
             limit,
-            from,
-            to,
+            ...resolveDateRange({ from, to }, timezone),
         });
 
         // An editor gets the rows as they are, links included, for the admin
@@ -97,15 +73,10 @@ export async function GET(request: NextRequest, props: { params: Promise<{ cityI
         if (includeUnreleased) {
             return NextResponse.json(meetings);
         }
-        const city = await getCityNameEnAndTimezone(params.cityId);
-        const timezone = city?.timezone ?? DEFAULT_TIMEZONE;
         const dates = await originalScheduledDates(params.cityId, meetings);
         return NextResponse.json(meetings.map(meeting =>
             toPublicApiMeeting(hideLinks(meeting), { timezone, postponedFromDate: dates.get(meeting.id) ?? null })));
     } catch (error) {
-        if (error instanceof z.ZodError) {
-            return NextResponse.json({ error: error.errors }, { status: 400 });
-        }
         return handleApiError(error, 'Failed to fetch meetings');
     }
 }

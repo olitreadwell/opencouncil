@@ -9,28 +9,26 @@
 import "server-only";
 import { AdministrativeBodyType, Prisma, Realm } from '@prisma/client';
 import { revalidateTag, revalidatePath } from 'next/cache';
+import { after } from 'next/server';
 import prisma from "./prisma";
 import { withUserAuthorizedToEdit, isUserAuthorizedToEdit } from '../auth';
 import { buildDateFilter } from './reviews/dateFilters';
 import { formatDateAsMeetingId } from '../utils/meetingId';
 import { parseVideoId } from '@/lib/utils/youtube';
 import { landingSubjectsTag } from './subject';
-import { CUSTOMER_CITY_WHERE, PUBLIC_CITY_WHERE } from '../cityStatus';
+import { CUSTOMER_CITY_WHERE, publicMeetingWhere } from '../cityStatus';
 // Import from the cache leaf (see the note in subject.ts) to keep the barrel's heavy chain out.
 import { createCache } from '../cache/index';
 import { getCityRealm } from "./cityRealm";
 import { deleteMeetingRecord, setMeetingReleased } from "./meetingLifecycle";
 import { LifecycleRuleError, PUBLIC_RECORDING_WHERE, TAKES_PLACE_WHERE } from "@/lib/meetingLifecycleRules";
 import { hideLinks } from "@/lib/meetingPublic";
-import { DECISION_KIND_SELECT } from "@/lib/tasks/pollDecisionsBackoff";
+import { meetingWithAdminBodyInclude } from "./types/meeting";
+import { publicAdministrativeBodyRelation } from "./types/administrativeBody";
+import { notifySubscribersOnRelease } from "@/lib/notifications/meetingNotifications";
 // List reads and their payload types live in meetingsList.ts. Re-exported here
 // as types only, so callers of this module keep one import.
 export type { CouncilMeetingWithAdminBodyAndSubjects, CouncilMeetingWithSubjectPreview, MeetingListOptions } from './meetingsList';
-
-const meetingWithAdminBodyInclude = {
-    administrativeBody: true,
-    continuationOf: DECISION_KIND_SELECT.continuationOf,
-} satisfies Prisma.CouncilMeetingInclude;
 
 export type CouncilMeetingWithAdminBody = Prisma.CouncilMeetingGetPayload<{
     include: typeof meetingWithAdminBodyInclude
@@ -142,7 +140,7 @@ export async function findCouncilMeetingByYouTubeVideoId(videoId: string) {
 
 const upcomingMeetingInclude = {
     city: { select: { id: true, name: true, name_municipality: true, logoImage: true, timezone: true } },
-    administrativeBody: true,
+    administrativeBody: publicAdministrativeBodyRelation,
 } satisfies Prisma.CouncilMeetingInclude;
 
 export type UpcomingMeetingWithCity = Prisma.CouncilMeetingGetPayload<{
@@ -153,12 +151,10 @@ export async function getUpcomingMeetings(realm: Realm, { limit = 10 }: { limit?
     try {
         const meetings = await prisma.councilMeeting.findMany({
             where: {
-                // public visibility guard: never expose unreleased (draft) meetings
-                released: true,
+                ...publicMeetingWhere(realm),
                 dateTime: { gt: new Date() },
                 // A postponed or cancelled meeting is not coming up.
                 ...TAKES_PLACE_WHERE,
-                city: { ...PUBLIC_CITY_WHERE, realm },
             },
             orderBy: [{ dateTime: 'asc' }, { createdAt: 'asc' }],
             take: limit,
@@ -192,7 +188,11 @@ export async function toggleMeetingRelease(cityId: string, id: string, released:
     await withUserAuthorizedToEdit({ councilMeetingId: id, cityId: cityId });
     try {
         // The module also releases or hides the other meetings of a postponement.
-        const updatedMeeting = await setMeetingReleased(cityId, id, released);
+        const { meeting: updatedMeeting, changed } = await setMeetingReleased(cityId, id, released);
+        // The tasks create no notifications for an unreleased meeting: the
+        // release does. After the response: rendering one email per reader
+        // must not hold the admin's toggle.
+        if (released && changed) after(() => notifySubscribersOnRelease(cityId, id));
         // TODO: utilize api/cities/[cityId]/meetings/[meetingId] to edit the meeting
         revalidateTag(`city:${cityId}:meetings`, 'max');
         revalidatePath(`/${cityId}`, "layout");

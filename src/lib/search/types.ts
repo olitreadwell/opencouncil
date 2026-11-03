@@ -1,5 +1,6 @@
 import type { estypes } from '@elastic/elasticsearch';
-import { AdministrativeBody, AdministrativeBodyType, City, CouncilMeeting } from "@prisma/client";
+import { AdministrativeBodyType, City, CouncilMeeting } from "@prisma/client";
+import type { PublicAdministrativeBody } from "@/lib/db/types";
 import { MATCH_FIELDS } from "./constants";
 import { SubjectWithRelations } from "@/lib/db/subject";
 import { SegmentWithRelations } from "@/lib/db/speakerSegments";
@@ -74,6 +75,14 @@ export type SearchRequest = {
         start: string;
         end: string;
     };
+    /** The window to search when neither the caller nor the query text names a
+     *  period: the map's quick-range pill. Unlike `dateRange` it yields to a
+     *  period read out of the text, which the caller then shows as a derived
+     *  filter, so the pill never hides a period the reader typed. */
+    fallbackDateRange?: {
+        start: string;
+        end: string;
+    };
     /** A hard geographic filter: only subjects pinned within the radius match,
      *  and a subject without a location pin never matches. Places read out of
      *  the query text are not set here: the search keeps those to itself and
@@ -96,7 +105,7 @@ export type SearchResultLight = SubjectWithRelations & {
     matches?: SearchMatches;
     councilMeeting: CouncilMeeting & {
         city: City;
-        administrativeBody: AdministrativeBody | null;
+        administrativeBody: PublicAdministrativeBody | null;
     };
 };
 

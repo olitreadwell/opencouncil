@@ -2,7 +2,7 @@ import { memo, useState, useRef, useEffect, useMemo, useId } from 'react';
 import { useTranslations } from 'next-intl';
 import { SpeakerTag } from "@prisma/client";
 import { ImageOrInitials } from "../ImageOrInitials";
-import { cn, filterActiveRoles, getPartyFromRoles, relevanceScore, UNKNOWN_SPEAKER_LABEL } from "@/lib/utils";
+import { cn, filterActiveRoles, getPartyFromRoles, relevanceScore } from "@/lib/utils";
 import {
     Popover,
     PopoverContent,
@@ -20,6 +20,7 @@ import { useLocalizeText } from '@/hooks/useLocalizeText';
 import type { SpeakerEdit, SpeakerAssignmentScope } from '@/lib/db/speakerTags';
 
 interface PersonDisplayProps {
+    cityLanguage?: string;
     person?: PersonWithRelations;
     speakerTag?: SpeakerTag;
     segmentCount?: number;
@@ -51,7 +52,7 @@ const SUGGESTION_ICONS = { voiceprint: AudioLines, transcript: FileText, both: C
 const NO_PRESELECTION = 'no-preselection';
 
 // A simpler version of PersonBadge used in search results
-function PersonDisplay({ person, speakerTag, segmentCount, short = false, preferFullName = false, size = 'md', editable = false, onClick, nonInteractive = false, date, caption }: PersonDisplayProps) {
+function PersonDisplay({ cityLanguage, person, speakerTag, segmentCount, short = false, preferFullName = false, size = 'md', editable = false, onClick, nonInteractive = false, date, caption }: PersonDisplayProps) {
     const localize = useLocalizeText();
     const t = useTranslations('transcript.speakerPicker');
     const activeRoles = person ? filterActiveRoles(person.roles) : [];
@@ -123,6 +124,7 @@ function PersonDisplay({ person, speakerTag, segmentCount, short = false, prefer
                     <div className="mt-0.5 sm:mt-1.5">
                         <RoleDisplay
                             roles={activeRoles}
+                            cityLanguage={cityLanguage}
                             size={size === 'sm' ? 'sm' : 'md'}
                             layout="compact"
                             showIcons={false}
@@ -178,6 +180,7 @@ interface PersonBadgeProps extends PersonDisplayProps {
     allPeopleHeading?: string;
     /** When set, an editor sees this as an amber label on the badge (already localized, a few words). */
     warning?: string;
+    /** The label that the "unknown speaker" action gives. The action shows only when it is set. */
     nextUnknownLabel?: string;
     variant?: 'default' | 'inline';
     /** When true, the badge does not navigate or behave like a button (useful on the person's own page). */
@@ -188,6 +191,7 @@ interface PersonBadgeProps extends PersonDisplayProps {
 // segment header passes stable props, so a transcript-wide re-render skips
 // every badge whose speaker did not change.
 const PersonBadge = memo(function PersonBadge({
+    cityLanguage,
     person,
     speakerTag,
     segmentCount,
@@ -324,6 +328,7 @@ const PersonBadge = memo(function PersonBadge({
             } : undefined}
         >
             <PersonDisplay
+                cityLanguage={cityLanguage}
                 person={person}
                 speakerTag={speakerTag}
                 segmentCount={segmentCount}
@@ -406,6 +411,7 @@ const PersonBadge = memo(function PersonBadge({
                                                             )}
                                                         />
                                                         <PersonDisplay
+                                                            cityLanguage={cityLanguage}
                                                             person={suggested}
                                                             size="sm"
                                                             date={date}
@@ -429,16 +435,16 @@ const PersonBadge = memo(function PersonBadge({
                                         <CommandSeparator />
                                     </>
                                 )}
-                                {!searchQuery && (
+                                {!searchQuery && nextUnknownLabel && (
                                     <CommandGroup>
                                         <CommandItem
-                                            onSelect={() => handleSetLabel(nextUnknownLabel || UNKNOWN_SPEAKER_LABEL)}
+                                            onSelect={() => handleSetLabel(nextUnknownLabel)}
                                             className="flex items-center gap-2"
                                         >
                                             <div className="w-10 h-10 relative shrink-0 flex items-center justify-center bg-muted rounded-full">
                                                 <span className="text-xs font-medium">?</span>
                                             </div>
-                                            <span className="font-medium">{nextUnknownLabel || UNKNOWN_SPEAKER_LABEL}</span>
+                                            <span className="font-medium">{nextUnknownLabel}</span>
                                         </CommandItem>
                                     </CommandGroup>
                                 )}
@@ -458,6 +464,7 @@ const PersonBadge = memo(function PersonBadge({
                                                     )}
                                                 />
                                                 <PersonDisplay
+                                                    cityLanguage={cityLanguage}
                                                     person={p}
                                                     size="sm"
                                                     date={date}

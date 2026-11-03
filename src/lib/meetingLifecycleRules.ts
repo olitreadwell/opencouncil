@@ -34,29 +34,33 @@ export interface LifecycleContext {
     continuations: Array<{ administrativeBodyId: string | null; dateTime: Date }>;
 }
 
-export type LifecycleRuleCode =
-    | 'greekRealmOnly'
-    | 'councilOnlyKind'
-    | 'bodyMissing'
-    | 'postponedFromMissing'
-    | 'postponedFromNotPostponed'
-    | 'postponedFromTaken'
-    | 'postponedFromOtherBody'
-    | 'postponedToEarlier'
-    | 'postponedToOtherBody'
-    | 'postponementCycle'
-    | 'postponedMeetingIsLinked'
-    | 'continuationMissing'
-    | 'continuationTargetIsPart'
-    | 'continuationHasParts'
-    | 'continuationOtherBody'
-    | 'continuationNotLater'
-    | 'continuationOwnsNothing'
-    | 'partsOtherBody'
-    | 'partsNotLater'
-    | 'chainTooLong'
-    | 'laterMeetingReleased'
-    | 'hasDependents';
+/** The rules that a meeting write can break. The API answers the code of the rule in a 422. */
+export const LIFECYCLE_RULE_CODES = [
+    'greekRealmOnly',
+    'councilOnlyKind',
+    'bodyMissing',
+    'postponedFromMissing',
+    'postponedFromNotPostponed',
+    'postponedFromTaken',
+    'postponedFromOtherBody',
+    'postponedToEarlier',
+    'postponedToOtherBody',
+    'postponementCycle',
+    'postponedMeetingIsLinked',
+    'continuationMissing',
+    'continuationTargetIsPart',
+    'continuationHasParts',
+    'continuationOtherBody',
+    'continuationNotLater',
+    'continuationOwnsNothing',
+    'partsOtherBody',
+    'partsNotLater',
+    'chainTooLong',
+    'laterMeetingReleased',
+    'hasDependents',
+] as const;
+
+export type LifecycleRuleCode = (typeof LIFECYCLE_RULE_CODES)[number];
 
 export class LifecycleRuleError extends Error {
     constructor(readonly code: LifecycleRuleCode, message: string) {
@@ -102,12 +106,11 @@ export const SCHEDULE_STATUSES = {
 } as const satisfies Record<MeetingScheduleStatus, { takesPlace: boolean }>;
 
 export const MEETING_FORMATS = {
-    inPerson: { publicRecording: true, showsPlace: true, namedInFacts: false, offeredInForm: true },
-    remote: { publicRecording: true, showsPlace: false, namedInFacts: true, offeredInForm: true },
-    hybrid: { publicRecording: true, showsPlace: true, namedInFacts: true, offeredInForm: true },
-    // Offered in no form yet: the by-circulation page is a follow-up.
-    byCirculation: { publicRecording: false, showsPlace: false, namedInFacts: false, offeredInForm: false },
-} as const satisfies Record<MeetingFormat, FormatRules & { offeredInForm: boolean }>;
+    inPerson: { publicRecording: true, showsPlace: true, namedInFacts: false },
+    remote: { publicRecording: true, showsPlace: false, namedInFacts: true },
+    hybrid: { publicRecording: true, showsPlace: true, namedInFacts: true },
+    byCirculation: { publicRecording: false, showsPlace: false, namedInFacts: false },
+} as const satisfies Record<MeetingFormat, FormatRules>;
 
 /**
  * A null format: nobody has stated it yet, and the meeting is expected as
@@ -169,7 +172,6 @@ function keysWhere<K extends string, V>(table: Record<K, V>, test: (value: V) =>
 }
 
 export const TAKES_PLACE_STATUSES = keysWhere(SCHEDULE_STATUSES, (status) => status.takesPlace);
-export const OFFERED_FORMATS = keysWhere(MEETING_FORMATS, (format) => format.offeredInForm);
 export const COUNCIL_ONLY_KINDS: ReadonlySet<MeetingKind> = new Set(keysWhere(MEETING_KINDS, (kind) => kind.councilOnly));
 export const NO_DECISION_KINDS = keysWhere(MEETING_KINDS, (kind) => !kind.takesDecisions);
 

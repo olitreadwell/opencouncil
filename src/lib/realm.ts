@@ -8,6 +8,12 @@ import type { Country } from '@/lib/apiTypes';
 const OFFICE_PHONE = '+30 211 198 0212';
 
 /**
+ * The locale that is never foreign on any realm's host. Every realm serves it,
+ * and the realms without a catalog of their own make it their default.
+ */
+const SHARED_LOCALE = 'en';
+
+/**
  * Realm (tenant) configuration. A single deployment serves all domains off one
  * database; the realm a request belongs to is resolved from its Host header (see
  * `realmForHost`). This is the single source of truth mapping each realm to its
@@ -30,27 +36,74 @@ const OFFICE_PHONE = '+30 211 198 0212';
  */
 export type RealmStage = 'active' | 'pending';
 
+const REALM_DEFAULTS = {
+    defaultLocale: SHARED_LOCALE,
+    contactPhone: OFFICE_PHONE,
+    stage: 'pending',
+} as const;
+
 export const REALMS = {
-    greece: { domain: 'opencouncil.gr', defaultLocale: 'el', country: 'GR', contactPhone: OFFICE_PHONE, stage: 'active' },
-    france: { domain: 'opencouncil.fr', defaultLocale: 'fr', country: 'FR', contactPhone: OFFICE_PHONE, stage: 'pending' },
-    cyprus: { domain: 'opencouncil.cy', defaultLocale: 'el', country: 'CY', contactPhone: OFFICE_PHONE, stage: 'pending' },
+    greece: { ...REALM_DEFAULTS, domain: 'opencouncil.gr', defaultLocale: 'el', country: 'GR', stage: 'active' },
+    france: { ...REALM_DEFAULTS, domain: 'opencouncil.fr', defaultLocale: 'fr', country: 'FR' },
+    cyprus: { ...REALM_DEFAULTS, domain: 'opencouncil.cy', defaultLocale: 'el', country: 'CY' },
     // Serbian is digraphic: `sr` (Cyrillic) is the default, `sr-Latn` is the
     // realm-exclusive Latin variant reachable via the script switcher.
     // The Serbian number is a domestic toll-free line, so it is shown and
     // dialled in its national form rather than as +381.
     serbia: {
+        ...REALM_DEFAULTS,
         domain: 'opencouncil.rs',
         defaultLocale: 'sr',
         extraLocales: ['sr-Latn'],
         country: 'RS',
         contactPhone: '0800 301167',
-        stage: 'pending',
     },
+    // These realms have no UI catalog in their own language yet, so they
+    // serve the English one.
+    austria: { ...REALM_DEFAULTS, domain: 'opencouncil.at', country: 'AT' },
+    belgium: { ...REALM_DEFAULTS, domain: 'opencouncil.be', country: 'BE' },
+    finland: { ...REALM_DEFAULTS, domain: 'opencouncil.fi', country: 'FI' },
+    germany: { ...REALM_DEFAULTS, domain: 'opencouncil.de', country: 'DE' },
+    italy: { ...REALM_DEFAULTS, domain: 'opencouncil.it', country: 'IT' },
+    netherlands: { ...REALM_DEFAULTS, domain: 'opencouncil.nl', country: 'NL' },
+    poland: { ...REALM_DEFAULTS, domain: 'opencouncil.pl', country: 'PL' },
+    portugal: { ...REALM_DEFAULTS, domain: 'pt.opencouncil.eu', country: 'PT' },
+    spain: { ...REALM_DEFAULTS, domain: 'opencouncil.es', country: 'ES' },
+    bosnia: { ...REALM_DEFAULTS, domain: 'ba.opencouncil.eu', country: 'BA' },
+    andorra: { ...REALM_DEFAULTS, domain: 'ad.opencouncil.eu', country: 'AD' },
+    albania: { ...REALM_DEFAULTS, domain: 'al.opencouncil.eu', country: 'AL' },
+    bulgaria: { ...REALM_DEFAULTS, domain: 'bg.opencouncil.eu', country: 'BG' },
+    switzerland: { ...REALM_DEFAULTS, domain: 'ch.opencouncil.eu', country: 'CH' },
+    czechia: { ...REALM_DEFAULTS, domain: 'cz.opencouncil.eu', country: 'CZ' },
+    denmark: { ...REALM_DEFAULTS, domain: 'dk.opencouncil.eu', country: 'DK' },
+    estonia: { ...REALM_DEFAULTS, domain: 'ee.opencouncil.eu', country: 'EE' },
+    united_kingdom: { ...REALM_DEFAULTS, domain: 'gb.opencouncil.eu', country: 'GB' },
+    croatia: { ...REALM_DEFAULTS, domain: 'hr.opencouncil.eu', country: 'HR' },
+    hungary: { ...REALM_DEFAULTS, domain: 'hu.opencouncil.eu', country: 'HU' },
+    ireland: { ...REALM_DEFAULTS, domain: 'ie.opencouncil.eu', country: 'IE' },
+    iceland: { ...REALM_DEFAULTS, domain: 'is.opencouncil.eu', country: 'IS' },
+    liechtenstein: { ...REALM_DEFAULTS, domain: 'li.opencouncil.eu', country: 'LI' },
+    lithuania: { ...REALM_DEFAULTS, domain: 'lt.opencouncil.eu', country: 'LT' },
+    luxembourg: { ...REALM_DEFAULTS, domain: 'lu.opencouncil.eu', country: 'LU' },
+    latvia: { ...REALM_DEFAULTS, domain: 'lv.opencouncil.eu', country: 'LV' },
+    monaco: { ...REALM_DEFAULTS, domain: 'mc.opencouncil.eu', country: 'MC' },
+    moldova: { ...REALM_DEFAULTS, domain: 'md.opencouncil.eu', country: 'MD' },
+    montenegro: { ...REALM_DEFAULTS, domain: 'me.opencouncil.eu', country: 'ME' },
+    north_macedonia: { ...REALM_DEFAULTS, domain: 'mk.opencouncil.eu', country: 'MK' },
+    malta: { ...REALM_DEFAULTS, domain: 'mt.opencouncil.eu', country: 'MT' },
+    norway: { ...REALM_DEFAULTS, domain: 'no.opencouncil.eu', country: 'NO' },
+    romania: { ...REALM_DEFAULTS, domain: 'ro.opencouncil.eu', country: 'RO' },
+    sweden: { ...REALM_DEFAULTS, domain: 'se.opencouncil.eu', country: 'SE' },
+    slovenia: { ...REALM_DEFAULTS, domain: 'si.opencouncil.eu', country: 'SI' },
+    slovakia: { ...REALM_DEFAULTS, domain: 'sk.opencouncil.eu', country: 'SK' },
+    san_marino: { ...REALM_DEFAULTS, domain: 'sm.opencouncil.eu', country: 'SM' },
+    ukraine: { ...REALM_DEFAULTS, domain: 'ua.opencouncil.eu', country: 'UA' },
+    kosovo: { ...REALM_DEFAULTS, domain: 'xk.opencouncil.eu', country: 'XK' },
 } as const satisfies Record<
     Realm,
     {
         domain: string;
-        defaultLocale: 'el' | 'fr' | 'sr';
+        defaultLocale: 'el' | 'fr' | 'sr' | typeof SHARED_LOCALE;
         country: Country;
         extraLocales?: readonly string[];
         contactPhone: string;
@@ -85,6 +138,45 @@ const REALM_DEFAULT_MAP_VIEW: Record<Realm, { center: [number, number]; zoom: nu
     france: { center: [2.4, 46.6], zoom: 5 },        // metropolitan France
     cyprus: { center: [33.2, 35.0], zoom: 8 },       // island of Cyprus
     serbia: { center: [20.457, 44.817], zoom: 6 },   // Belgrade
+    austria: { center: [13.33, 47.6], zoom: 6 },
+    belgium: { center: [4.47, 50.5], zoom: 7 },
+    finland: { center: [26.0, 64.0], zoom: 4 },
+    germany: { center: [10.45, 51.16], zoom: 5 },
+    italy: { center: [12.5, 42.5], zoom: 5 },
+    netherlands: { center: [5.3, 52.2], zoom: 7 },
+    poland: { center: [19.4, 52.1], zoom: 5 },
+    portugal: { center: [-8.2, 39.6], zoom: 6 },     // mainland Portugal
+    bosnia: { center: [17.8, 44.1], zoom: 7 },
+    andorra: { center: [1.6, 42.5], zoom: 10 },
+    albania: { center: [20.0, 41.2], zoom: 7 },
+    bulgaria: { center: [25.5, 42.7], zoom: 6 },
+    switzerland: { center: [8.2, 46.8], zoom: 7 },
+    czechia: { center: [15.5, 49.8], zoom: 6 },
+    denmark: { center: [10.0, 56.0], zoom: 6 },
+    estonia: { center: [25.5, 58.6], zoom: 6 },
+    united_kingdom: { center: [-3.0, 54.5], zoom: 5 },
+    croatia: { center: [16.4, 45.1], zoom: 6 },
+    hungary: { center: [19.5, 47.2], zoom: 6 },
+    ireland: { center: [-8.0, 53.3], zoom: 6 },
+    iceland: { center: [-19.0, 65.0], zoom: 5 },
+    liechtenstein: { center: [9.55, 47.16], zoom: 11 },
+    lithuania: { center: [24.0, 55.2], zoom: 6 },
+    luxembourg: { center: [6.1, 49.8], zoom: 9 },
+    latvia: { center: [24.6, 56.9], zoom: 6 },
+    monaco: { center: [7.42, 43.74], zoom: 13 },
+    moldova: { center: [28.4, 47.0], zoom: 7 },
+    montenegro: { center: [19.3, 42.7], zoom: 8 },
+    north_macedonia: { center: [21.7, 41.6], zoom: 7 },
+    malta: { center: [14.4, 35.9], zoom: 10 },
+    norway: { center: [12.0, 65.0], zoom: 4 },
+    romania: { center: [25.0, 45.9], zoom: 6 },
+    sweden: { center: [16.0, 63.0], zoom: 4 },
+    slovenia: { center: [14.9, 46.1], zoom: 8 },
+    slovakia: { center: [19.5, 48.7], zoom: 7 },
+    san_marino: { center: [12.46, 43.94], zoom: 11 },
+    ukraine: { center: [31.2, 49.0], zoom: 5 },
+    kosovo: { center: [20.9, 42.6], zoom: 8 },
+    spain: { center: [-3.7, 40.4], zoom: 5 },        // mainland Spain
 };
 
 const hostMatchesDomain = (host: string, domain: string): boolean =>
@@ -218,8 +310,8 @@ export function effectiveRealm(host: string | null | undefined, overrideCookie: 
  * Derives each realm's foreign locales: locales belonging to other realms
  * (their default plus any `extraLocales`, e.g. `sr-Latn` on serbia) that the
  * realm doesn't own itself (e.g. `fr` on opencouncil.gr). The proxy 301s their
- * URL prefixes to the unprefixed URL; `en` is shared by all realms, belongs to
- * none, and is never foreign.
+ * URL prefixes to the unprefixed URL; `SHARED_LOCALE` (`en`) is never foreign,
+ * even where a realm makes it its default.
  *
  * Filtered by locale rather than by realm: realms may share a default locale,
  * and a realm's own locales are never foreign on its host no matter which
@@ -238,7 +330,7 @@ export function computeForeignLocales<R extends string>(
         .flatMap(ownLocales);
     const entries = (Object.keys(realms) as R[]).map((realm) => {
         const own = new Set(ownLocales(realms[realm]));
-        return [realm, [...new Set(allLocales.filter((locale) => !own.has(locale)))]];
+        return [realm, [...new Set(allLocales.filter((locale) => !own.has(locale) && locale !== SHARED_LOCALE))]];
     });
     return Object.fromEntries(entries) as Record<R, string[]>;
 }
@@ -262,7 +354,7 @@ export function getRealmBaseUrl(realm: Realm): string {
 /**
  * Base URL for resolving a page's relative metadata URLs — today only the
  * `/api/og` images, since canonicals and hreflang are built absolute by
- * `buildCanonicalAlternates`.
+ * `withCanonicalUrl`.
  *
  * On a realm's production apex this is the canonical realm URL, so
  * opencouncil.gr and opencouncil.fr each unfurl their own images. On a preview

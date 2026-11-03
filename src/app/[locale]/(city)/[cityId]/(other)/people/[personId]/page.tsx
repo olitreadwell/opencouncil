@@ -1,7 +1,7 @@
 "use server";
 import { getPerson } from "@/lib/db/people";
 import { getPartiesForCity } from "@/lib/db/parties";
-import { getAdministrativeBodiesForCity } from "@/lib/db/administrativeBodies";
+import { getPublicAdministrativeBodiesForCity } from "@/lib/db/administrativeBodies";
 import { getDistinctTopicsForSpeakerContributions } from "@/lib/db/contributions";
 import { notFound } from "next/navigation";
 import Person from "@/components/persons/Person";
@@ -9,7 +9,7 @@ import { getCity } from "@/lib/db/cities";
 import { getStatisticsFor } from "@/lib/statistics";
 import { getUnreleasedScope, getRoleLimitForCity } from "@/lib/auth";
 import { Metadata } from "next";
-import { buildCanonicalAlternates } from '@/lib/utils/hreflang';
+import { withCanonicalUrl } from '@/lib/utils/hreflang';
 import { getLocalizedName } from "@/lib/formatters/name";
 import { getOgLocale } from '@/i18n/config';
 import { buildOgImageUrl } from '@/lib/og/locale';
@@ -49,7 +49,7 @@ export async function generateMetadata(
     // Generate OG image URL
     const ogImageUrl = buildOgImageUrl(params.locale, { cityId: params.cityId, personId: params.personId });
 
-    return {
+    return withCanonicalUrl(`/${params.cityId}/people/${params.personId}`, {
         title: `${personName} | ${cityName} | OpenCouncil`,
         description,
         keywords: [
@@ -85,14 +85,13 @@ export async function generateMetadata(
             description,
             images: [ogImageUrl],
         },
-        alternates: await buildCanonicalAlternates(`/${params.cityId}/people/${params.personId}`),
         other: {
             'person:name': person.name,
             'person:city': city.name,
             'person:party': currentParty?.name || '',
             'person:hasImage': person.image ? 'true' : 'false',
         }
-    };
+    });
 }
 
 export default async function PersonPage(
@@ -108,7 +107,7 @@ export default async function PersonPage(
         getPerson(params.personId),
         getCity(params.cityId),
         getPartiesForCity(params.cityId),
-        getAdministrativeBodiesForCity(params.cityId),
+        getPublicAdministrativeBodiesForCity(params.cityId),
         getStatisticsFor({ personId: params.personId, cityId: params.cityId, unreleased }, ['topic']),
         getDistinctTopicsForSpeakerContributions(params.personId),
     ]);

@@ -4,12 +4,13 @@ import { CouncilMeeting, SpeakerSegment } from "@prisma/client";
 import { Utterance as ApiUtterance } from "../apiTypes";
 import prisma from "../db/prisma";
 import { withUserAuthorizedToEdit } from "../auth";
-import { buildUnknownSpeakerLabel } from "../utils";
+import { buildUnknownSpeakerLabel } from "@/lib/utils/unknownSpeakerLabel";
 import { requestTranscribeInternal, deleteExistingSpeakerData } from "./transcribeInternal";
 import { requestFixTranscriptInternal } from "./fixTranscriptInternal";
 import { autoTriggerTask } from "./autoTrigger";
 import { meetingLabelInCity } from '@/lib/meetingName';
 import { ConflictError, NotFoundError } from '@/lib/api/errors';
+import { webUrl } from '@/lib/zod-schemas/primitives';
 import { PipelineBusyError, TaskAlreadyExistsError, taskScope } from './types';
 
 // Full-precision doubles are near-incompressible and inflate the meeting page
@@ -27,8 +28,15 @@ export async function requestTranscribe(youtubeUrl: string, councilMeetingId: st
 } = {}): Promise<{ ok: true } | { ok: false; message: string }> {
     await withUserAuthorizedToEdit(taskScope({ type: 'transcribe', cityId, councilMeetingId }));
 
+    // The URL reaches yt-dlp on the task server and the public meeting page,
+    // so the same rule as the REST and MCP paths applies: http(s) only.
+    const mediaUrl = webUrl().safeParse(youtubeUrl);
+    if (!mediaUrl.success) {
+        return { ok: false, message: 'The media URL must start with http:// or https://' };
+    }
+
     try {
-        await requestTranscribeInternal(youtubeUrl, councilMeetingId, cityId, options);
+        await requestTranscribeInternal(mediaUrl.data, councilMeetingId, cityId, options);
         return { ok: true };
     } catch (error) {
         // Every refusal that an admin can act on comes back as a value:
@@ -57,6 +65,7 @@ export async function handleTranscribeResult(taskId: string, response: Transcrib
                         select: {
                             name_en: true,
                             timezone: true,
+                            realm: true,
                         }
                     },
                     administrativeBody: { select: { name: true, name_en: true } },
@@ -119,7 +128,7 @@ export async function handleTranscribeResult(taskId: string, response: Transcrib
         const speakerTags = new Map<number, string>();
         let identifiedSpeakersCount = 0;
         let unknownCounter = 1;
-        const nextUnknownLabel = () => buildUnknownSpeakerLabel(unknownCounter++);
+        const nextUnknownLabel = () => buildUnknownSpeakerLabel(unknownCounter++, task.councilMeeting.city.realm);
 
         // Process speaker identification results
         if (response.transcript.transcription.speakers && response.transcript.transcription.speakers.length > 0) {

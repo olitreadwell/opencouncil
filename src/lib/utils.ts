@@ -39,13 +39,8 @@ export const IS_DEV = process.env.NODE_ENV === 'development';
 
 export const SUBJECT_POINT_COLOR = '#E57373'; // A nice red color that contrasts with the blue city polygons
 
-export const UNKNOWN_SPEAKER_LABEL = "Άγνωστος Ομιλητής";
-
 /** The grey for speakers without a party — one value across transcript borders, search results and the playback bar. */
 export const UNKNOWN_SPEAKER_COLOR = '#D3D3D3';
-
-export const buildUnknownSpeakerLabel = (index: number) =>
-  `${UNKNOWN_SPEAKER_LABEL} ${index}`;
 
 export function subjectToMapFeature(subject: SubjectWithRelations) {
   if (!subject.location?.coordinates) return null;
@@ -361,6 +356,21 @@ export function normalizeText(text: string): string {
     .replace(/ϋ/g, 'υ')
     .replace(/ΐ/g, 'ι')
     .replace(/ΰ/g, 'υ');
+}
+
+/**
+ * The words of a list search, normalized. A list search needs every word, so
+ * "μαρια παπα" finds "Μαρία Παπαδοπούλου" in either order. The meetings tab
+ * searches on the server and the people and parties tabs in the browser; both
+ * read the words here, so the two agree.
+ */
+export function searchTerms(query: string): string[] {
+  return normalizeText(query).split(/\s+/).filter(Boolean);
+}
+
+/** Whether a normalized text holds every term. */
+export function matchesEveryTerm(normalizedText: string, terms: string[]): boolean {
+  return terms.every(term => normalizedText.includes(term));
 }
 
 /**

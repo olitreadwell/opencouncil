@@ -17,7 +17,8 @@ import { getSubjectsForMeeting, extractUtteranceIdsFromContributions } from "./s
 import { DiscussionStatus, Subject as DbSubject } from "@prisma/client";
 import { getPartyFromRoles } from "../utils";
 import { roleWithRelationsInclude } from "./types";
-import { categorizeSubjectsForUpsert } from "./subject-helpers";
+import { agendaDescriptionsByRowId, categorizeSubjectsForUpsert } from "./subject-helpers";
+import { getLatestProcessAgendaSubjects } from "./tasksInternal";
 import { getRealmCountry } from "@/lib/realm";
 import { getCityRealm } from "./cityRealm";
 import { getRoleTitles } from "@/i18n/roleTitles";
@@ -142,6 +143,11 @@ let getAgendaItemIndex = (subject: DbSubject): number | "BEFORE_AGENDA" | "OUT_O
 export async function getSummarizeRequestBody(councilMeetingId: string, cityId: string, requestedSubjects: string[], additionalInstructions?: string, { force = false }: { force?: boolean } = {}): Promise<Omit<SummarizeRequest, 'callbackUrl'>> {
     const baseRequest = await getRequestOnTranscriptRequestBody(councilMeetingId, cityId);
     const existingSubjects = await getSubjectsForMeeting(cityId, councilMeetingId);
+    // A summarize that already succeeded runs again only with force, and its rows then hold the previous summary.
+    // Without force, the rows still hold the text that processAgenda wrote.
+    const agendaDescriptions = force
+        ? agendaDescriptionsByRowId(await getLatestProcessAgendaSubjects(cityId, councilMeetingId), existingSubjects)
+        : new Map<string, string>();
     return {
         ...baseRequest,
         requestedSubjects,
@@ -153,7 +159,7 @@ export async function getSummarizeRequestBody(councilMeetingId: string, cityId: 
             // The row's own id, so the result names the row it updates (issue 366).
             id: s.id,
             name: s.name,
-            description: s.description,
+            description: agendaDescriptions.get(s.id) ?? s.description,
             introducedByPersonId: s.introducedBy?.id || null,
             topicLabel: s.topic?.name || null,
             location: s.location && s.location.coordinates ? {
@@ -339,12 +345,12 @@ async function linkDiscussedInReferences(
  */
 async function applyUtteranceDiscussionStatusesInTx(
     tx: PrismaTxClient,
-    statuses: SummarizeResult['utteranceDiscussionStatuses'],
+    statuses: NonNullable<SummarizeResult['utteranceDiscussionStatuses']>,
     subjectIdMap: Map<string, string>
 ): Promise<number> {
     // Keep the last entry per utterance; the response can repeat one. Entries carrying a
     // status outside the enum are dropped here rather than allowed to abort the transaction.
-    const deduped = new Map<string, SummarizeResult['utteranceDiscussionStatuses'][number]>();
+    const deduped = new Map<string, NonNullable<SummarizeResult['utteranceDiscussionStatuses']>[number]>();
     let unknownStatuses = 0;
     for (const status of statuses) {
         if (!VALID_DISCUSSION_STATUSES.has(status.status)) {
@@ -404,6 +410,8 @@ export async function saveSubjectsForMeeting(
     subjects: Subject[],
     cityId: string,
     councilMeetingId: string,
+    /** When given, these replace every discussion tag in the meeting, even
+     *  when empty. `undefined` leaves the existing tags alone. */
     utteranceDiscussionStatuses?: SummarizeResult['utteranceDiscussionStatuses'],
     /** `pruneUnmatched` deletes existing agenda subjects that the incoming set
      *  does not account for. The agenda is authoritative, so processAgenda
@@ -499,6 +507,8 @@ export async function saveSubjectsForMeeting(
                         ? incoming.agendaItemIndex
                         : null,
                     description: incoming.description,
+                    // undefined leaves the stored outcome alone; null clears it.
+                    outcome: incoming.outcome,
                     // undefined leaves the stored title alone; null clears it.
                     agendaItemTitle: incoming.agendaItemTitle,
                     // undefined leaves the stored section alone (summarize); null
@@ -572,6 +582,7 @@ export async function saveSubjectsForMeeting(
                 data: {
                     name: subject.name,
                     description: subject.description,
+                    outcome: subject.outcome,
                     agendaItemTitle: subject.agendaItemTitle,
                     agendaSectionIndex: subject.agendaSection?.index,
                     agendaSectionTitle: subject.agendaSection?.title,
@@ -625,8 +636,16 @@ export async function saveSubjectsForMeeting(
 
         // Inside the transaction on purpose: the tags must commit with their subjects, or the
         // search index never learns about them. See applyUtteranceDiscussionStatusesInTx.
-        if (utteranceDiscussionStatuses && utteranceDiscussionStatuses.length > 0) {
-            await applyUtteranceDiscussionStatusesInTx(tx, utteranceDiscussionStatuses, subjectIdMap);
+        // The response tags only some utterances, so the others must lose the tags of the
+        // previous run. The reset is in this transaction so that a failure keeps the old tags.
+        if (utteranceDiscussionStatuses) {
+            await tx.utterance.updateMany({
+                where: { speakerSegment: { meetingId: councilMeetingId, cityId } },
+                data: { discussionStatus: null, discussionSubjectId: null }
+            });
+            if (utteranceDiscussionStatuses.length > 0) {
+                await applyUtteranceDiscussionStatusesInTx(tx, utteranceDiscussionStatuses, subjectIdMap);
+            }
         }
     }, { timeout: 60000 });
 

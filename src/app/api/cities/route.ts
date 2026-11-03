@@ -1,46 +1,27 @@
 import { NextResponse, NextRequest } from 'next/server'
 import { revalidateTag } from 'next/cache'
-import { z } from 'zod'
 import { createCity, getCities, updateCityGeometry } from '@/lib/db/cities'
 import { parseBoundaryInput } from '@/lib/utils/geojson'
-import { getAllCitiesAsServiceKey } from '@/lib/db/citiesAdmin'
 import { uploadFile } from '@/lib/s3'
-import { isUserAuthorizedToEdit, validateBearerAuth } from '@/lib/auth'
-import { createCityFormDataSchema } from '@/lib/zod-schemas/city'
-import { parseFormData } from '@/lib/api/form-data-parser'
-import { handleApiError } from '@/lib/api/errors'
-import { ALLOWED_LOGO_CONTENT_TYPES } from '@/types/upload'
-
-const getCitiesQuerySchema = z.object({
-    includeUnlisted: z.string()
-        .optional()
-        .transform((val) => val === 'true')
-        .default('false')
-});
+import { isUserAuthorizedToEdit, getCurrentUser } from '@/lib/auth'
+import { citiesListQuerySchema, createCityFormDataSchema } from '@/lib/zod-schemas/city'
+import { parseFormData, readFormData } from '@/lib/api/form-data-parser'
+import { handleApiError, notAuthorizedErrorResponse } from '@/lib/api/errors'
 
 export async function GET(req: NextRequest) {
     try {
         const { searchParams } = req.nextUrl;
-        const { includeUnlisted } = getCitiesQuerySchema.parse(
+        const { includeUnlisted } = citiesListQuerySchema.parse(
             Object.fromEntries(searchParams.entries())
         );
 
-        // Bearer auth: validate up front and dispatch to a non-server-action helper
-        // for the superadmin-equivalent view. NEVER pass an "asSuperAdmin"-style flag
-        // into a "use server" function — clients could call the server action directly.
-        const bearer = await validateBearerAuth(req);
-
-        const cities = bearer && includeUnlisted
-            ? await getAllCitiesAsServiceKey()
-            : await getCities({ includeNonPublic: includeUnlisted });
+        // getCities answers by the session. With includeUnlisted: 401 with no
+        // session, every city for a superadmin, the public ones plus the
+        // administered ones for a city admin. Without it: the public list.
+        const cities = await getCities({ includeNonPublic: includeUnlisted });
 
         return NextResponse.json(cities);
     } catch (error) {
-        // Preserve the legacy `{ error: ZodIssue[] }` shape for ZodError specifically;
-        // every other error goes through the standard handler.
-        if (error instanceof z.ZodError) {
-            return NextResponse.json({ error: error.errors }, { status: 400 });
-        }
         return handleApiError(error, 'An unexpected error occurred');
     }
 }
@@ -48,12 +29,12 @@ export async function GET(req: NextRequest) {
 export async function POST(request: Request) {
     const authorizedToEdit = await isUserAuthorizedToEdit({})
     if (!authorizedToEdit) {
-        return new NextResponse("Unauthorized", { status: 401 });
+        return notAuthorizedErrorResponse(Boolean(await getCurrentUser()));
     }
 
     try {
-        const formData = await request.formData();
-        const data = await parseFormData(formData, createCityFormDataSchema);
+        const formData = await readFormData(request);
+        const data = parseFormData(formData, createCityFormDataSchema);
 
         // Boundary paste: validate before any side effects (logo upload, insert).
         let boundary: ReturnType<typeof parseBoundaryInput> | null = null;
@@ -62,13 +43,6 @@ export async function POST(request: Request) {
             if (!boundary.ok) {
                 return NextResponse.json({ error: `Invalid boundary GeoJSON: ${boundary.error}` }, { status: 400 });
             }
-        }
-
-        if (!ALLOWED_LOGO_CONTENT_TYPES.includes(data.logoImage.type)) {
-            return NextResponse.json(
-                { error: `Logo must be one of: ${ALLOWED_LOGO_CONTENT_TYPES.join(', ')}` },
-                { status: 400 }
-            );
         }
 
         const result = await uploadFile(data.logoImage, {
@@ -109,13 +83,6 @@ export async function POST(request: Request) {
 
         return NextResponse.json(city);
     } catch (error) {
-        if (error instanceof z.ZodError) {
-            return NextResponse.json(
-                { error: error.errors },
-                { status: 400 }
-            );
-        }
-        console.error('Error creating city:', error);
-        return NextResponse.json({ error: 'Failed to create city' }, { status: 500 });
+        return handleApiError(error, 'Failed to create city');
     }
 }

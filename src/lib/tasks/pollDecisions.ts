@@ -1,7 +1,7 @@
 "use server";
 
 import { PollDecisionsRequest, PollDecisionsResult, PollDecisionsMatch, ExtractedDecisionData } from "@/lib/apiTypes";
-import { isDecisionConventions } from "@/lib/decisionConventions";
+import { parseDecisionConventions } from "@/lib/decisionConventions";
 import { renderConventionsText, conventionsGlossaryEn } from "@/lib/decisionConventionsText";
 import { storeDecisionFacts } from "@/lib/db/decisionFacts";
 import { deriveAndPersist } from "@/lib/derivation/persist";
@@ -10,34 +10,55 @@ import { startTask } from "./tasks";
 import { after } from "next/server";
 import prisma from "@/lib/db/prisma";
 import { Prisma } from "@prisma/client";
+import * as z from "zod";
 import { TAKES_PLACE_WHERE, takesPlace } from "@/lib/meetingLifecycleRules";
 
 import { sortSubjectsByDiscussionOrder } from "@/lib/minutes/builders";
 
+import { AWAITING_DECISIONS_MEETING_WHERE, decisionPollCandidateWhere } from "@/lib/db/decisionEligibility";
+import { isCustomer } from "@/lib/cityStatus";
 import { upsertDecision, deleteDecision, getDecisionForSubject, DECISION_ELIGIBLE_SUBJECT_WHERE } from "@/lib/db/decisions";
 export { getDecisionForSubject };
 import { getCurrentUser, withUserAuthorizedToEdit } from "@/lib/auth";
 import { getPeopleForMeeting } from "@/lib/db/people";
 import { deriveWindowDays } from "./decisionWindow";
 import { localCalendarDate } from "@/lib/formatters/time";
+import { dayBounds } from "@/lib/dates/dayBounds";
 import { applyCandidateConflictResolution, getUnresolvedCandidatesForMeeting } from "@/lib/db/decisionCandidates";
 import { isRoleActiveAt, isMayorRole } from "@/lib/utils/roles";
-import { shouldSkipPolling, getBackoffState, getPollableMeetingDateRange, TAKES_DECISIONS_WHERE, pendingPollTaskId, takesNoDecisions, type BackoffTier } from "./pollDecisionsBackoff";
+import { shouldSkipPolling, getBackoffState, TAKES_DECISIONS_WHERE, pendingPollTaskId, takesNoDecisions, type BackoffTier } from "./pollDecisionsBackoff";
 import { orderForPolling } from "./pollableMeetings";
 import { sendPollDecisionsBatchStartedAlert, sendPollDecisionsBatchCompletedAlert } from "@/lib/discord";
 import { agendaItemTitleOrName, isRecordSubject } from "@/lib/utils/subjects";
+import { normalizeAda } from "@/lib/utils/ada";
 
 /** A manual poll either starts, or finds one already running for the meeting. */
 export type PollStart =
     | { status: 'started'; taskId: string }
     | { status: 'alreadyRunning'; taskId: string };
 
+// A Server Action has no runtime types. The ADAs reach the Diavgeia client on
+// the task server, so only a value in Diavgeia's own ADA form passes.
+const adaSchema = z.string().transform((value, ctx) => {
+    const ada = normalizeAda(value);
+    if (ada === null) {
+        ctx.addIssue({ code: 'custom', message: 'must be a Diavgeia ADA' });
+        return z.NEVER;
+    }
+    return ada;
+});
+const pollOptionsSchema = z.object({
+    forceExtract: z.boolean().optional(),
+    lookupAdas: z.array(adaSchema).max(50).optional(),
+}).optional();
+
 export async function requestPollDecisions(
     cityId: string,
     councilMeetingId: string,
-    options?: { forceExtract?: boolean; lookupAdas?: string[] },
+    rawOptions?: { forceExtract?: boolean; lookupAdas?: string[] },
 ): Promise<PollStart> {
     await withUserAuthorizedToEdit({ cityId });
+    const options = pollOptionsSchema.parse(rawOptions);
 
     // The plain poll stays city-admin: a manual link starts extraction
     // automatically through this path. Cache-busting re-extraction is a
@@ -181,13 +202,13 @@ export async function pollDecisionsForMeeting(
     // window — mostly neighbouring meetings' decisions, which is the point —
     // plus this meeting's own open candidates. The window misses those whose
     // issue date precedes the meeting or whose publication came late; the task
-    // fetches them by their ΑΔΑ.
+    // fetches them by their ΑΔΑ. The window names days in the city's zone.
     const ownOpen = { councilMeetingId, decisionId: null, dismissedAt: null };
     const known = await prisma.decisionCandidate.findMany({
         where: {
             cityId,
             OR: [
-                { publishDate: { gte: new Date(windowFromDate), lte: new Date(`${windowToDate}T23:59:59Z`) } },
+                { publishDate: { gte: dayBounds(windowFromDate, cityTz).start, lte: dayBounds(windowToDate, cityTz).end } },
                 ownOpen,
             ],
         },
@@ -195,9 +216,9 @@ export async function pollDecisionsForMeeting(
     });
 
     // The extractor is told the body's conventions as sentences; the glossary lives in messages/en/admin.json.
-    const conventionsValue = councilMeeting.administrativeBody?.decisionConventions;
-    const conventionsText = isDecisionConventions(conventionsValue)
-        ? renderConventionsText(conventionsValue, conventionsGlossaryEn)
+    const conventions = parseDecisionConventions(councilMeeting.administrativeBody?.decisionConventions);
+    const conventionsText = conventions
+        ? renderConventionsText(conventions, conventionsGlossaryEn)
         : null;
     // No conventions record, no extraction: the poll only links the body's
     // decisions. A page read without the hints keeps that reading, because the
@@ -251,31 +272,10 @@ export async function pollDecisionsForMeeting(
     return startTask('pollDecisions', body, councilMeetingId, cityId, { silent: options?.silent });
 }
 
-// A meeting still waiting on decisions: a decision-eligible subject without
-// one, and not a meeting that takes no decisions (see takesNoDecisions). What the cron and
-// follow-up polls both require before polling a meeting. A postponed or
-// cancelled meeting took no decisions on its date.
-const AWAITING_DECISIONS_MEETING_WHERE = {
-    ...TAKES_DECISIONS_WHERE,
-    ...TAKES_PLACE_WHERE,
-    subjects: { some: { ...DECISION_ELIGIBLE_SUBJECT_WHERE, decision: null } },
-} satisfies Prisma.CouncilMeetingWhereInput;
-
-/**
- * The candidates of the decision-polling cron: meetings in the pollable date
- * window, in cities with a diavgeiaUid, with at least one decision-eligible
- * subject that has no decision yet.
- */
+/** The candidates of the decision-polling cron: see decisionPollCandidateWhere. */
 export async function findDecisionPollCandidates() {
-    // Meetings that take no decisions are excluded — see takesNoDecisions().
     return prisma.councilMeeting.findMany({
-        where: {
-            ...AWAITING_DECISIONS_MEETING_WHERE,
-            dateTime: getPollableMeetingDateRange(),
-            city: {
-                diavgeiaUid: { not: null },
-            },
-        },
+        where: decisionPollCandidateWhere(),
         select: {
             id: true,
             cityId: true,
@@ -287,7 +287,7 @@ export async function findDecisionPollCandidates() {
 }
 
 /**
- * Polls decisions for recent meetings across all cities with Diavgeia configured.
+ * Polls decisions for recent meetings across the supported cities with Diavgeia configured.
  * Called by the cron endpoint. Finds meetings in the pollable date window
  * (see getPollableMeetingDateRange) that still have subjects without linked
  * decisions, and dispatches pollDecisions tasks for them.
@@ -474,7 +474,9 @@ export async function requestPollDecisionForSubject(subjectId: string): Promise<
 
 /**
  * Returns polling history and current backoff state for a specific meeting.
- * Used by the meeting decisions page to show polling status.
+ * Used by the meeting decisions page to show polling status. A city that is not
+ * supported has no backoff state: the cron does not poll it (CUSTOMER_CITY_WHERE),
+ * so its meetings show their manual polls and no next automatic poll.
  */
 export async function getPollingHistoryForMeeting(
     cityId: string,
@@ -518,6 +520,19 @@ export async function getPollingHistoryForMeeting(
             lastPollAt: null,
             currentTier: null,
             currentTierLabel: null,
+            nextPollEligible: null,
+            pendingTaskId,
+        };
+    }
+
+    const city = await prisma.city.findUnique({ where: { id: cityId }, select: { status: true } });
+    if (!city || !isCustomer(city.status)) {
+        return {
+            totalPolls,
+            firstPollAt: firstPollAt.toISOString(),
+            lastPollAt: lastPollAt.toISOString(),
+            currentTier: null,
+            currentTierLabel: 'No automatic polls: the city is not supported',
             nextPollEligible: null,
             pendingTaskId,
         };
@@ -1115,6 +1130,7 @@ export async function handlePollDecisionsResult(taskId: string, result: PollDeci
                         data: {
                             excerpt: decision.excerpt || null,
                             references: decision.references || null,
+                            summary: decision.summary || null,
                             // A decision with no ΑΔΑ carries the number its clerk
                             // typed from the document; the reading only fills a gap.
                             ...(extractedDecisionNumber && (existingDecision.ada || !existingDecision.decisionNumber)

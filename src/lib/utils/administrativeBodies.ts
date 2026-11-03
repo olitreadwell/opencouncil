@@ -1,11 +1,11 @@
 import { PersonWithRelations } from '../db/people';
-import { AdministrativeBody, AdministrativeBodyType } from '@prisma/client';
+import { AdministrativeBodyType } from '@prisma/client';
 import type { PublicAdministrativeBody } from '@/lib/db/types';
 import { hasCityLevelRole, isRoleActive } from './roles';
 
 /** Minimal type for meetings - only what we need for extracting admin bodies */
 type MeetingWithAdminBody = {
-    administrativeBody: AdministrativeBody | null;
+    administrativeBody: PublicAdministrativeBody | null;
 };
 
 /** Canonical ordering for admin body types */
@@ -121,19 +121,6 @@ export function getBodiesOfTypeFromPeople(
     type: AdministrativeBodyType
 ): { value: string; label: string }[] {
     return getBodiesOfType(people.flatMap(p => p.roles.map(r => r.administrativeBody)), type);
-}
-
-/**
- * Filter a meeting by selected admin body types.
- * Empty selectedTypes = show all.
- */
-export function filterMeetingByAdminBodyTypes(
-    meeting: MeetingWithAdminBody,
-    selectedTypes: AdministrativeBodyType[]
-): boolean {
-    if (selectedTypes.length === 0) return true;
-    if (!meeting.administrativeBody) return false;
-    return selectedTypes.includes(meeting.administrativeBody.type);
 }
 
 /**

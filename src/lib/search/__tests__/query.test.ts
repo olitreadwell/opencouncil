@@ -20,10 +20,12 @@ const NO_EXTRACTED_FILTERS: ExtractedFilters = {
 type BoolQuery = estypes.QueryDslBoolQuery;
 
 // `match` accepts a shorthand value as well as the full object form, so narrow
-// to the object form before reading minimum_should_match off it.
+// to the object form before reading minimum_should_match off it. A multi_match
+// carries it directly.
 function minimumShouldMatchOf(
     clause: QueryContainer | undefined
 ): string | number | undefined {
+    if (clause?.multi_match) return clause.multi_match.minimum_should_match;
     const match = Object.values(clause?.match ?? {})[0];
     return typeof match === 'object' ? match.minimum_should_match : undefined;
 }
@@ -77,8 +79,15 @@ function nestedClauseOn(
         should,
         (inner) =>
             inner.nested?.path === 'speaker_contributions' &&
-            inner.nested.query?.match?.[field] !== undefined
+            matchedFields(inner.nested.query).includes(field)
     );
+}
+
+// The fields a match or multi_match clause searches. The speaker-name clauses
+// are a multi_match over SPEAKER_NAME_FIELDS, the transcript clause a match.
+function matchedFields(query: QueryContainer | undefined): string[] {
+    if (query?.multi_match) return (query.multi_match.fields as string[] | undefined) ?? [];
+    return Object.keys(query?.match ?? {});
 }
 
 // Total tier base each field contributes to a document that matches it. A field
@@ -94,8 +103,8 @@ function tierBaseByField(should: QueryContainer[]): Record<string, number> {
         const { inner, base } = unflatten(clause);
         if (!inner) continue;
         if (inner.nested) {
-            const field = Object.keys(inner.nested.query?.match ?? {})[0] ?? '';
-            add(field.endsWith('speaker_person_name') ? 'speakerName' : 'transcript', base);
+            const fields = matchedFields(inner.nested.query);
+            add(fields.some(f => f.endsWith('speaker_person_name')) ? 'speakerName' : 'transcript', base);
             continue;
         }
         if (inner.match_phrase) {
@@ -128,6 +137,7 @@ function queryTextsOf(clause: QueryContainer | undefined): string[] {
         return (clause.bool.should as QueryContainer[]).flatMap(queryTextsOf);
     }
     if (clause.combined_fields) return [clause.combined_fields.query];
+    if (clause.multi_match) return [String(clause.multi_match.query)];
     const leaf = clause.match ?? clause.match_phrase;
     if (!leaf) return [];
     return Object.values(leaf).map((options) =>
@@ -135,19 +145,27 @@ function queryTextsOf(clause: QueryContainer | undefined): string[] {
     );
 }
 
-function findPersonFilter(
-    filters: QueryContainer[]
+function findIntroducedOrSpokeFilter(
+    filters: QueryContainer[],
+    introducedByField: string
 ): QueryContainer | undefined {
-    // The person filter is the bool/should clause referencing introduced_by_person_id.
     // Use a structural lookup (not a JSON substring match) so the tests can't pass
     // vacuously if key ordering or the serialised shape changes.
     return filters.find(
         (f) =>
             Array.isArray(f.bool?.should) &&
             (f.bool!.should as QueryContainer[]).some(
-                (c) => c.terms?.['introduced_by_person_id'] !== undefined
+                (c) => c.terms?.[introducedByField] !== undefined
             )
     );
+}
+
+function findPersonFilter(filters: QueryContainer[]): QueryContainer | undefined {
+    return findIntroducedOrSpokeFilter(filters, 'introduced_by_person_id');
+}
+
+function findPartyFilter(filters: QueryContainer[]): QueryContainer | undefined {
+    return findIntroducedOrSpokeFilter(filters, 'introduced_by_party_id');
 }
 
 describe('buildFilters person filter', () => {
@@ -208,9 +226,11 @@ describe('buildFilters person filter', () => {
 
         const filters = buildFilters(request);
 
-        expect(findPersonFilter(filters)).toBeDefined();
-        const partyFilter = filters.find((f) => f.terms?.['introduced_by_party_id']);
-        expect(partyFilter?.terms?.['introduced_by_party_id']).toEqual(['party1']);
+        const personFilter = findPersonFilter(filters);
+        const partyFilter = findPartyFilter(filters);
+        expect(personFilter).toBeDefined();
+        expect(partyFilter).toBeDefined();
+        expect(partyFilter).not.toBe(personFilter);
     });
 
     it('omits the person filter entirely when no personIds are given', () => {
@@ -229,6 +249,51 @@ describe('buildFilters person filter', () => {
         expect(findPersonFilter(filters)).toBeUndefined();
     });
 });
+
+describe('buildFilters party filter', () => {
+    // The search page adds the person's party to every person filter, so an
+    // introducer-only party clause cut a person's results to the subjects their
+    // party introduced.
+    it('OR-combines introduced-by-party and a speaker of the party', () => {
+        const request: SearchRequest = { query: 'roads', partyIds: ['party1'] };
+
+        const filters = buildFilters(request);
+        const partyFilter = findPartyFilter(filters);
+
+        expect(partyFilter).toBeDefined();
+
+        const bool = partyFilter!.bool as BoolQuery;
+        const should = (bool.should ?? []) as QueryContainer[];
+
+        expect(bool.minimum_should_match).toBe(1);
+        expect(should).toHaveLength(2);
+
+        const introducedBy = should.find((c) => c.terms?.['introduced_by_party_id']);
+        expect(introducedBy?.terms?.['introduced_by_party_id']).toEqual(['party1']);
+
+        const spokeIn = should.find((c) => c.nested);
+        expect(spokeIn?.nested?.path).toBe('speaker_contributions');
+        expect(
+            (spokeIn?.nested?.query as QueryContainer).terms?.[
+                'speaker_contributions.speaker_party_id'
+            ]
+        ).toEqual(['party1']);
+    });
+
+    it('does not leave an introducer-only party clause at the top level', () => {
+        const request: SearchRequest = { query: 'roads', partyIds: ['party1'] };
+
+        const filters = buildFilters(request);
+
+        expect(filters.filter((f) => f.terms?.['introduced_by_party_id'])).toHaveLength(0);
+    });
+
+    it('omits the party filter when partyIds is empty or absent', () => {
+        expect(findPartyFilter(buildFilters({ query: 'roads' }))).toBeUndefined();
+        expect(findPartyFilter(buildFilters({ query: 'roads', partyIds: [] }))).toBeUndefined();
+    });
+});
+
 
 // The scored query is a single bool (no rank fusion) — see the RRF regression
 // note on the semantic describe block. Unwraps the ranking function_score and
@@ -493,11 +558,12 @@ describe('buildSearchQuery speaker-name clause', () => {
     it('matches the speakers of a subject, in the weakest tier of the query', () => {
         const clause = speakerNameClause('Χάρης Δούκας');
 
-        expect(clause?.inner?.nested?.query?.match?.['speaker_contributions.speaker_person_name'])
-            .toEqual({
-                query: 'Χάρης Δούκας',
-                minimum_should_match: '2<75%',
-            });
+        expect(clause?.inner?.nested?.query?.multi_match).toEqual({
+            query: 'Χάρης Δούκας',
+            fields: ['speaker_contributions.speaker_person_name', 'speaker_contributions.speaker_name'],
+            type: 'best_fields',
+            minimum_should_match: '2<75%',
+        });
 
         // Weakest tier in the query, under the transcript's: a person-name
         // query leads with the subjects the person introduced, and the ones
@@ -527,6 +593,18 @@ describe('buildSearchQuery speaker-name clause', () => {
 
         expect(speaker?.inner).not.toBe(transcript?.inner);
         expect(speaker!.base!).not.toBe(transcript!.base!);
+    });
+
+    // A speaker with no Person record is known only by the contribution's
+    // speaker_name. The same clause and tier serve both names, so an unlinked
+    // speaker ranks where a linked one does.
+    it('matches the name of a speaker with no person record in the same clause', () => {
+        const should = scoredShouldClauses('Γεώργιος Παπαδόπουλος');
+        const linked = nestedClauseOn(should, 'speaker_contributions.speaker_person_name');
+        const unlinked = nestedClauseOn(should, 'speaker_contributions.speaker_name');
+
+        expect(unlinked).toBeDefined();
+        expect(unlinked?.inner).toBe(linked?.inner);
     });
 });
 
@@ -576,16 +654,16 @@ describe('buildSearchQuery semantic fallback (dis_max)', () => {
         const params = script.params as Record<string, number>;
         // A raw similarity, not a normalized one: minmax maps the best hit of
         // every query to 1.0, so a cutoff on it could never empty the results.
-        // 0.934 sits mid-way between the measured off-topic ceiling (0.9319, a
-        // keyboard mash) and the measured paraphrase floor ([0.936, 0.940)) —
-        // see DEFAULT_SEMANTIC_MIN_SCORE.
-        expect(params.cutoff).toBe(0.934);
+        // 0.78 admits no junk query and loses one paraphrase on the measured
+        // bands of jina-embeddings-v5-text-small — see DEFAULT_SCORE_PROFILE
+        // in profile.ts.
+        expect(params.cutoff).toBe(0.78);
         // base sits inside the flattened description band (~24-30, where weak
         // stem-coincidence matches like bar licenses matching "ζώα χωρίς
         // ιδιοκτήτη" via ζω/ιδιοκτητ land) and the mapped ceiling (~34) stays
         // below the flattened name band (~58+) — see SEMANTIC_MAPPED_BASE.
         expect(params.base).toBe(26);
-        expect(params.scale).toBe(320);
+        expect(params.scale).toBe(66);
         expect(clause.boost_mode).toBe('replace');
         // min_score sees the mapped score: raw below the cutoff maps below
         // base and is dropped, keeping zero results for off-topic queries.
@@ -1179,10 +1257,11 @@ describe('buildSearchQuery cross-field coverage', () => {
             const nested = gateAlternatives(query)
                 .map(c => c.nested?.query?.bool?.should as QueryContainer[])
                 .find(Boolean);
-            return nested?.find(c => c.match?.['speaker_contributions.speaker_person_name']);
+            return nested?.find(c => matchedFields(c).includes('speaker_contributions.speaker_person_name'));
         };
 
         expect(minimumShouldMatchOf(speakerGate('Ιωάννης Μαλτέζος υδρονομείς'))).toBe('100%');
+        expect(matchedFields(speakerGate('Ιωάννης Μαλτέζος υδρονομείς'))).toContain('speaker_contributions.speaker_name');
         // The transcript alternative keeps the ordinary threshold: a contribution
         // covering 2 of 3 terms is a real coverage claim, a name is not.
         const transcript = gateAlternatives('Ιωάννης Μαλτέζος υδρονομείς')
@@ -1202,10 +1281,9 @@ describe('buildSearchQuery cross-field coverage', () => {
         const speaker = clauses
             .map(c => c.nested?.query?.bool?.should as QueryContainer[])
             .find(Boolean)
-            ?.find(c => c.match?.['speaker_contributions.speaker_person_name']);
+            ?.find(c => matchedFields(c).includes('speaker_contributions.speaker_person_name'));
 
-        expect(speaker?.match?.['speaker_contributions.speaker_person_name'])
-            .toMatchObject({ query: 'Χάρης Δούκας', minimum_should_match: '100%' });
+        expect(speaker?.multi_match).toMatchObject({ query: 'Χάρης Δούκας', minimum_should_match: '100%' });
     });
 
     it('keeps the gate out of the scoring path', () => {

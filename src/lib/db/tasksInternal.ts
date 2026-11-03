@@ -9,6 +9,7 @@ import "server-only";
 import type { Prisma, TaskStatus } from '@prisma/client';
 import prisma from "./prisma";
 import { TASK_CONFIG } from '@/lib/tasks/types';
+import type { ProcessAgendaResult, Subject } from '@/lib/apiTypes';
 
 /** The meeting a task belongs to, as named by the callback route's path. */
 export type TaskStatusScope = Pick<TaskStatus, 'cityId' | 'councilMeetingId'>;
@@ -122,4 +123,47 @@ export async function getTasksForMeetingDirect(cityId: string, councilMeetingId:
     const errorById = new Map(errors.map(row => [row.id, row.failureReason]));
 
     return rows.map(row => ({ ...row, error: errorById.get(row.id) ?? null }));
+}
+
+/**
+ * The subjects of the newest succeeded processAgenda result for a meeting, by
+ * createdAt. A replay of an older run writes its subjects again but leaves the
+ * newer run as the newest one, so the two can differ until processAgenda runs
+ * again.
+ *
+ * No user gate: the callers of getSummarizeRequestBody authorize first.
+ * requestSummarize and batchRerunTask check the user, and the MCP admin tools
+ * check a token before they call startMeetingTask.
+ */
+export async function getLatestProcessAgendaSubjects(cityId: string, councilMeetingId: string): Promise<Subject[]> {
+    const task = await prisma.taskStatus.findFirst({
+        where: { cityId, councilMeetingId, type: 'processAgenda', status: 'succeeded', responseBody: { not: null } },
+        orderBy: { createdAt: 'desc' },
+        select: { responseBody: true },
+    });
+    if (!task?.responseBody) return [];
+    const result = JSON.parse(task.responseBody) as Partial<ProcessAgendaResult>;
+    return Array.isArray(result.subjects) ? result.subjects : [];
+}
+
+/**
+ * When each of the given task types last succeeded for a meeting. Only a
+ * succeeded task counts: a claimed one is still writing its results, and its
+ * callback decides about notifications itself once it succeeds.
+ */
+export async function getLastSucceededTaskTimes<T extends string>(
+    cityId: string,
+    councilMeetingId: string,
+    types: readonly T[],
+): Promise<Partial<Record<T, Date>>> {
+    const rows = await prisma.taskStatus.groupBy({
+        by: ['type'],
+        where: { cityId, councilMeetingId, status: 'succeeded', type: { in: [...types] } },
+        _max: { updatedAt: true },
+    });
+    const times: Partial<Record<T, Date>> = {};
+    for (const row of rows) {
+        if (row._max.updatedAt) times[row.type as T] = row._max.updatedAt;
+    }
+    return times;
 }

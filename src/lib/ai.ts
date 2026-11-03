@@ -17,8 +17,6 @@ export interface AIConfig {
     model?: string;
     logPrompts?: boolean;
     promptsDir?: string;
-    enableWebSearch?: boolean;
-    webSearchMaxUses?: number;
     maxContinuationAttempts?: number;
 }
 
@@ -29,8 +27,6 @@ const DEFAULT_CONFIG: AIConfig = {
     model: "claude-sonnet-4-5-20250929",
     logPrompts: IS_DEV,
     promptsDir: path.join(process.cwd(), 'logs', 'prompts'),
-    enableWebSearch: false,
-    webSearchMaxUses: 10,
     maxContinuationAttempts: 3
 };
 
@@ -229,17 +225,6 @@ export async function aiChat<T>(
                 temperature: mergedConfig.temperature,
             };
 
-            // Add web search tool if enabled
-            if (mergedConfig.enableWebSearch) {
-                requestConfig.tools = [
-                    {
-                        type: "web_search_20250305",
-                        name: "web_search",
-                        max_uses: mergedConfig.webSearchMaxUses!
-                    }
-                ];
-            }
-
             response = await anthropic.messages.create(requestConfig);
         } catch (e) {
             console.error(`Error in aiChat: ${e}`);
@@ -253,7 +238,6 @@ export async function aiChat<T>(
         logResponseToFile(response, mergedConfig, {
             systemPrompt: systemPrompt.substring(0, 100) + '...',
             userPrompt: userPrompt.substring(0, 100) + '...',
-            enableWebSearch: mergedConfig.enableWebSearch
         });
 
         if (!response.content || response.content.length === 0) {
@@ -272,7 +256,7 @@ export async function aiChat<T>(
             console.log(`[AI Debug] Usage:`, response.usage);
         }
 
-        // Find the final text response (may be multiple blocks with web search)
+        // Find the final text response
         const textBlocks = response.content.filter(block => block.type === "text");
         if (textBlocks.length === 0) {
             throw new Error("No text response found in Claude's response. Content types: " +
@@ -322,12 +306,14 @@ export async function aiChat<T>(
                     cache_read_input_tokens: (response.usage.cache_read_input_tokens || 0) + (response2.usage.cache_read_input_tokens || 0),
                     server_tool_use: response.usage.server_tool_use || null,
                     service_tier: response.usage.service_tier || null,
-                    // Required from @anthropic-ai/sdk 0.120. These describe a
-                    // single response, so a summed Usage carries the first
-                    // response's values rather than a meaningless total.
+                    // Required from @anthropic-ai/sdk 0.120 (speed from 0.135).
+                    // These describe a single response, so a summed Usage
+                    // carries the first response's values rather than a
+                    // meaningless total.
                     cache_creation: response.usage.cache_creation || null,
                     inference_geo: response.usage.inference_geo || null,
-                    output_tokens_details: response.usage.output_tokens_details || null
+                    output_tokens_details: response.usage.output_tokens_details || null,
+                    speed: response.usage.speed || null
                 },
                 result: response2.result
             }

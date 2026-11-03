@@ -82,7 +82,8 @@
     },
     "subject": {
         "view": "Погледај тему",
-        "discussionMinutes": "{min}′ расправе"
+        "discussionMinutes": "{min}′ расправе",
+        "loadingDescription": "Учитавање целог описа…"
     },
     "municipality": {
         "subjects": "Теме",
@@ -147,6 +148,13 @@
         "6m": "Последњих 6 месеци",
         "12m": "Последњих 12 месеци",
         "all": "Све време"
+    },
+    "datesPill": {
+        "from": "од {date}",
+        "to": "до {date}",
+        "between": "{from} – {to}",
+        "setInFilters": "Датуми постављени у филтерима",
+        "clear": "Уклони датуме"
     },
     "bodyType": {
         "council": "Скупштина",

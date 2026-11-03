@@ -1,4 +1,4 @@
-import type { CityStatus, Prisma } from '@prisma/client';
+import type { CityStatus, Prisma, Realm } from '@prisma/client';
 
 /**
  * Predicates over `City.status`, so the meaning of each state lives in one place
@@ -23,7 +23,8 @@ export function isPublic(status: CityStatus): boolean {
 
 /**
  * A customer municipality. Gates the official-support badge, the customer-facing
- * counts on the marketing pages, and the internal ops lists (reviews, uploads).
+ * counts on the marketing pages, the internal ops lists (reviews, uploads), and
+ * the paid work that the crons start on their own (`CUSTOMER_CITY_WHERE`).
  */
 export function isCustomer(status: CityStatus): boolean {
     return status === 'supported';
@@ -51,6 +52,25 @@ export const PUBLIC_CITY_WHERE = {
     status: { in: ['demo', 'supported'] },
 } satisfies Prisma.CityWhereInput;
 
+/**
+ * A meeting the public may see on `realm`'s domain: released, of a public city of that realm.
+ * Spread it into a CouncilMeeting where-clause, or use it as a nested `councilMeeting` filter.
+ * The realm is part of the rule: a city id is not a secret, and city pages are tenant-isolated.
+ * `null` spans every realm, for a caller that serves no single domain (the image backfill); it
+ * is a required argument so that a request path cannot drop its realm by omission.
+ */
+export function publicMeetingWhere(realm: Realm | null) {
+    return {
+        released: true,
+        city: realm ? { ...PUBLIC_CITY_WHERE, realm } : PUBLIC_CITY_WHERE,
+    } satisfies Prisma.CouncilMeetingWhereInput;
+}
+
+/**
+ * Spread into a City where-clause, or into a nested `city: { … }` filter. The crons
+ * that start paid tasks on their own (decision polling, livestream matching) take only
+ * these cities: an admin can still start the same work by hand for any city.
+ */
 export const CUSTOMER_CITY_WHERE = {
     status: 'supported',
 } satisfies Prisma.CityWhereInput;

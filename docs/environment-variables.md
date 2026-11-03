@@ -107,7 +107,11 @@ In development, the QuickLogin tool signs you in as a seeded [test user](#test-u
 When a send fails, the dev server console shows `[auth][error] Error: Resend error (<status>): <Resend's response>`. Resend's message names the cause.
 
 #### Sign in with Google
-Create an OAuth 2.0 client of type "Web application" in the Google Cloud Console. The client needs two settings for each realm in `REALMS` (`src/lib/realm.ts`), because the button shows on every realm apex: an authorized redirect URI, `https://<realm domain>/api/auth/callback/google`, and the realm domain in the authorized domains of the OAuth consent screen. Today that is `opencouncil.gr`, `opencouncil.fr`, `opencouncil.cy` and `opencouncil.rs`. A new realm needs its two entries before its readers see the button. For development add `http://localhost:3000/api/auth/callback/google`.
+Create an OAuth 2.0 client of type "Web application" in the Google Cloud Console.
+Use the canonical domains defined in [`REALMS`](../src/lib/realm.ts) as the source of truth. For each domain, add an authorized redirect URI: `https://<realm domain>/api/auth/callback/google`.
+Add each top private domain to the OAuth consent screen's authorized domains once (country subdomains of `opencouncil.eu` share that authorized domain).
+Route each domain to this deployment and configure its redirect URI before enabling Google sign-in there.
+For development, add `http://localhost:3000/api/auth/callback/google`.
 
 The button appears on the host that `NEXTAUTH_URL` names and on every realm apex. One deployment serves every realm, and next-auth rewrites each request to the origin of `NEXTAUTH_URL`. The auth route therefore sends the Google sign-in and its callback on another realm apex through Auth.js core with the request's own host (`realmOAuthUrl`), so the sign-in finishes on the domain it started on. A preview names its own host in `NEXTAUTH_URL`, so it works once `https://pr-<N>.opencouncil.dev/api/auth/callback/google` is in the client's redirect URIs.
 
@@ -177,14 +181,16 @@ The Google Calendar integration uses OAuth 2.0 authentication with a Google acco
 |----------|-------------|----------|---------|
 | `NEXT_PUBLIC_CONTACT_EMAIL` | Public contact email. | No | - |
 | `NEXT_PUBLIC_CONTACT_ADDRESS` | Public contact address. | No | - |
+| `NEXT_PUBLIC_BUILD_COMMIT_SHA` | The commit the build carries. `/api/health` publishes it, and a Discord alert names it. Previews set it from the head commit of the pull request. An App Platform app sets it in its spec from `${opencouncil.COMMIT_HASH}`, with a scope that includes build time, so that the value matches the code that was built. A deployment that does not set it reports a null commit. | No | - |
 
 ### Development Configuration
 | Variable | Description | Required | Default |
 |----------|-------------|----------|---------|
-| `DEV_TEST_CITY_ID` | The city ID used for creating development test users. | No | `chania` |
 | `DEV_EMAIL_OVERRIDE` | Email address that receives outgoing email instead of the real recipients. See [Email Testing in Development](#email-testing-in-development) for which emails it redirects. | No | - |
-| `SEED_DATA_URL` | URL to fetch seed data from if local file doesn't exist. | No | [link](https://raw.githubusercontent.com/schemalabz/opencouncil-seed-data/refs/heads/main/seed_data.json) |
-| `SEED_DATA_PATH` | Path to local seed data file. | No | `./prisma/seed_data.json` |
+| `SEED_ARTIFACT_URL` | Base URL of the published seed artifact, or a local artifact directory, for `npm run seed`. | No | `https://github.com/schemalabz/opencouncil-seed-data/releases/latest/download` |
+| `SEED_PG_BIN` | Directory of the PostgreSQL tools that the seed commands use. `npm run seed` takes the 16 client tools (`pg_restore`, `psql`) from it. `npm run seed-pipeline` takes a server with PostGIS from it for `produce` and `verify`. When it is not set, `npm run seed` uses `PATH`. | No | |
+| `SEED_DATA_URL` | Legacy JSON seeder only: URL to fetch `prisma/seed.ts` data from if the local file doesn't exist. | No | [link](https://raw.githubusercontent.com/schemalabz/opencouncil-seed-data/refs/heads/main/seed_data.json) |
+| `SEED_DATA_PATH` | Legacy JSON seeder only: path to the local data file of `prisma/seed.ts`. | No | `./prisma/seed_data.json` |
 
 ### Docker Port Configuration
 | Variable | Description | Required | Default |
@@ -214,7 +220,7 @@ The mock data system provides:
 - Realistic streaming behavior
 
 ### Test Users
-When `NODE_ENV=development`, the application includes a QuickLogin development tool that allows switching between different user accounts for testing authorization scenarios. The test users are automatically created during database seeding and are focused on the city specified by `DEV_TEST_CITY_ID`.
+When `NODE_ENV=development`, the application includes a QuickLogin development tool that allows switching between different user accounts for testing authorization scenarios. The seeding process creates the test users, and `npm run seed -- fixtures` creates them on a restored database. The city admin administers every supported city.
 
 ### Development Mode
 When `NODE_ENV=development`:

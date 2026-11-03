@@ -21,6 +21,7 @@ const prismaStub = {
     updateMany: (...args: unknown[]) => mockUpdateMany(...args),
   },
 };
+jest.mock('@/lib/notifications/meetingNotifications', () => ({ notifySubscribersOfTask: jest.fn() }));
 jest.mock('../../db/prisma', () => ({ __esModule: true, default: prismaStub }));
 jest.mock('@/env.mjs', () => ({ env: { NEXTAUTH_URL: 'http://test', NEXTAUTH_SECRET: 'test-secret', TASK_API_URL: 'http://test', TASK_API_KEY: 'key' } }));
 jest.mock('next/cache', () => ({ revalidateTag: jest.fn() }));
@@ -373,6 +374,33 @@ describe('handleTaskUpdate — discordAlertMode gating', () => {
     );
 
     expect(sendTaskAdminAlert).not.toHaveBeenCalled();
+  });
+
+  it('leaves the success alert of processAgenda to its result handler, and keeps its failure alert', async () => {
+    const task = {
+      id: 'task-1',
+      type: 'processAgenda',
+      cityId: CITY_ID,
+      councilMeetingId: MEETING_ID,
+      councilMeeting: { city: { name_en: 'City' }, name_en: 'Meeting' },
+    };
+    mockFindUnique.mockResolvedValue(task);
+    mockUpdate.mockResolvedValue({ ...task, status: 'succeeded' });
+
+    await handleTaskUpdate(
+      'task-1',
+      { status: 'success', result: { subjects: [] }, stage: '', progressPercent: 100, version: 1 },
+      mockProcessResult,
+    );
+    expect(sendTaskAdminAlert).not.toHaveBeenCalled();
+
+    mockUpdate.mockResolvedValue({ ...task, status: 'failed' });
+    await handleTaskUpdate(
+      'task-1',
+      { status: 'error', error: 'some error', stage: '', progressPercent: 0, version: 1 },
+      mockProcessResult,
+    );
+    expect(sendTaskAdminAlert).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed', taskType: 'processAgenda' }));
   });
 
   it('suppresses Discord alert for pollDecisions failure (discordAlertMode: none)', async () => {

@@ -60,6 +60,7 @@
         "adminBodyType_community": "Communities",
         "allPeople": "All",
         "allBodies": "All",
+        "pagination": "Pages",
         "backToHome": "Back to home",
         "loadingError": "Loading error",
         "all": "All",
@@ -102,6 +103,9 @@
         }
     },
     "Footer": {
+        "selectCountry": "Select country",
+        "searchCountry": "Search countries",
+        "noCountries": "No countries found.",
         "tagline": "Built with respect and appreciation for local government.",
         "companyDescription": "OpenCouncil is a company of <link>Schema Labs</link>, a non-profit that builds technology to strengthen democracy.",
         "linksHeading": "Links",
@@ -175,10 +179,7 @@
         "realmDescription": "The tenant group this city belongs to.",
         "language": "Language",
         "selectLanguage": "Select the language",
-        "languageDescription": "The content language of this city (metadata only; does not change the UI locale).",
-        "languageGreek": "Greek",
-        "languageFrench": "French",
-        "languageSerbian": "Serbian",
+        "languageDescription": "The language the council speaks in its meetings. It sets the language of the transcription and the summaries; it does not change the UI language.",
         "adminSettings": "Admin Settings",
         "status": "Status",
         "selectStatus": "Select status",
@@ -773,6 +774,23 @@
         "adminPerson": "Manage Member",
         "adminBody": "Manage Body"
     },
+    "ReportForm": {
+        "title": "Create Progress Report",
+        "city": "Municipality",
+        "selectCity": "Select a municipality",
+        "searchCity": "Search municipalities...",
+        "noCityFound": "No municipality found.",
+        "contractReference": "Contract Number",
+        "contractReferencePlaceholder": "e.g. 25SYMV01234567",
+        "period": "Period",
+        "halfYear": "Half-year {number}",
+        "months": "{count, plural, one {# month} other {# months}}",
+        "generating": "Generating...",
+        "generate": "Create Report (.docx)",
+        "success": "Report created successfully",
+        "error": "Error",
+        "failed": "Failed to generate report"
+    },
     "OfferForm": {
         "recipientName": "Recipient",
         "recipientNameDescription": "The name of the organization that will receive the offer",
@@ -1079,6 +1097,7 @@
         "noContributions": "No speaker contributions",
         "unknownSpeaker": "Unknown speaker",
         "noStatements": "No speaker statements",
+        "noStatementsByCirculation": "In a meeting by circulation, the members vote in writing, without a debate. So there are no statements.",
         "transcript": "Transcript",
         "noSummary": "No automatic summary available for this statement",
         "viewMap": "View map",
@@ -1153,7 +1172,6 @@
     },
     "CouncilMeeting": {
         "items": "{count, plural, =0 {No meetings} =1 {1 meeting} other {# meetings}}",
-        "itemsCapped": "The {count} most recent",
         "pages": {
             "overview": "Overview",
             "map": "Map",

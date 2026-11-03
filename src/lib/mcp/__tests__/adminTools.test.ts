@@ -3,57 +3,31 @@
 // The handlers are stubs: this file tests what the SDK hands to them, after
 // it validates a call with the input schema of the tool.
 jest.mock('../adminData', () => ({
-    mcpCreateAgendaUploadUrl: jest.fn().mockResolvedValue({}),
+    mcpCompleteUpload: jest.fn().mockResolvedValue({}),
+    mcpCreateUploadUrl: jest.fn().mockResolvedValue({}),
     mcpCreateCity: jest.fn().mockResolvedValue({}),
     mcpCreateMeeting: jest.fn(),
     mcpPopulateCity: jest.fn().mockResolvedValue({}),
+    mcpPublishCityDemo: jest.fn().mockResolvedValue({}),
+    mcpSetCityBoundary: jest.fn().mockResolvedValue({}),
     mcpStartTask: jest.fn(),
     mcpUpdateMeeting: jest.fn(),
 }));
 // auth.ts reaches Prisma, and through it env.mjs, which jest does not transform.
 jest.mock('../../db/prisma', () => ({ __esModule: true, default: {} }));
 
-import { InMemoryTransport, LATEST_PROTOCOL_VERSION, McpServer, type JSONRPCMessage } from '@modelcontextprotocol/server';
+import { McpServer } from '@modelcontextprotocol/server';
 import { registerAdminTools } from '../adminTools';
-import { mcpCreateAgendaUploadUrl, mcpCreateCity, mcpPopulateCity } from '../adminData';
+import {
+    mcpCompleteUpload, mcpCreateCity, mcpCreateMeeting, mcpCreateUploadUrl, mcpPopulateCity, mcpPublishCityDemo, mcpSetCityBoundary, mcpStartTask, mcpUpdateMeeting,
+} from '@/lib/mcp/adminData';
+import { connectInMemory } from './inMemoryClient';
 
-type Response = { id: number; result?: Record<string, unknown>; error?: { message: string } };
-type CallResult = { isError?: boolean; content: { text: string }[] };
-
-/**
- * A real McpServer with the tools of a superadmin, and a client end that
- * sends raw JSON-RPC. Only the handlers are stubs.
- */
-async function connect() {
+/** A real McpServer with the tools of a superadmin. Only the handlers are stubs. */
+function connect() {
     const server = new McpServer({ name: 'test', version: '0.0.0' });
     registerAdminTools(server, { superadmin: true, cityIds: new Set(), bodyIds: new Set() });
-    const [client, serverEnd] = InMemoryTransport.createLinkedPair();
-    const pending = new Map<number, (response: Response) => void>();
-    client.onmessage = (message: JSONRPCMessage) => {
-        const response = message as unknown as Response;
-        pending.get(response.id)?.(response);
-    };
-    await server.connect(serverEnd);
-    await client.start();
-
-    let nextId = 1;
-    const request = (method: string, params: Record<string, unknown>) => new Promise<Response>(resolve => {
-        const id = nextId++;
-        pending.set(id, resolve);
-        void client.send({ jsonrpc: '2.0', id, method, params });
-    });
-    await request('initialize', {
-        protocolVersion: LATEST_PROTOCOL_VERSION,
-        capabilities: {},
-        clientInfo: { name: 'jest', version: '0.0.0' },
-    });
-    await client.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
-
-    const call = async (name: string, args: Record<string, unknown>) =>
-        (await request('tools/call', { name, arguments: args })).result as CallResult;
-    const listTools = async () =>
-        (await request('tools/list', {})).result?.tools as { name: string; inputSchema: Record<string, unknown> }[];
-    return { call, listTools, close: () => server.close() };
+    return connectInMemory(server);
 }
 
 const COUNCIL = {
@@ -62,7 +36,6 @@ const COUNCIL = {
     administrativeBodies: [{ name: 'Δημοτικό Συμβούλιο', name_en: 'Municipal Council', type: 'council' }],
     people: [{
         name: 'Άννα Αλεξίου', name_en: 'Anna Alexiou', name_short: 'Α. Αλεξίου', name_short_en: 'A. Alexiou',
-        partyName: 'Κόμμα',
         roles: [{
             type: 'adminBody', administrativeBodyName: 'Δημοτικό Συμβούλιο',
             startDate: '2024-01-01', endDate: '2028-12-31', electedOrder: 2,
@@ -83,12 +56,11 @@ beforeEach(async () => {
 afterEach(() => mcp.close());
 
 describe('populate_city through the SDK', () => {
-    it('hands the role dates, the elected order and the party of a person to the handler', async () => {
+    it('hands the role dates and the elected order to the handler', async () => {
         const result = await mcp.call('populate_city', COUNCIL);
         expect(result.isError).toBeFalsy();
 
         const data = (mcpPopulateCity as jest.Mock).mock.calls[0][1];
-        expect(data.people[0].partyName).toBe('Κόμμα');
         expect(data.people[0].roles[0]).toMatchObject({
             startDate: new Date('2024-01-01'),
             endDate: new Date('2028-12-31'),
@@ -96,7 +68,15 @@ describe('populate_city through the SDK', () => {
         });
     });
 
-    it('refuses a role that ends before it starts, as the City Creator does', async () => {
+    it('refuses a role that names a party which is not in the call, before the handler runs', async () => {
+        const people = [{ ...COUNCIL.people[0], roles: [{ type: 'party', partyName: 'Άλλο Κόμμα' }] }];
+        const result = await mcp.call('populate_city', { ...COUNCIL, people });
+        expect(result.isError).toBe(true);
+        expect(JSON.stringify(result.content)).toContain('unknown party \\"Άλλο Κόμμα\\"');
+        expect(mcpPopulateCity).not.toHaveBeenCalled();
+    });
+
+    it('refuses a role that ends before it starts', async () => {
         const people = [{ ...COUNCIL.people[0], roles: [{ ...COUNCIL.people[0].roles[0], startDate: '2028-01-01', endDate: '2024-01-01' }] }];
         const result = await mcp.call('populate_city', { ...COUNCIL, people });
         expect(result.isError).toBe(true);
@@ -114,10 +94,38 @@ describe('populate_city through the SDK', () => {
         const tool = (await mcp.listTools()).find(t => t.name === 'populate_city');
         const text = JSON.stringify(tool?.inputSchema);
         expect(tool?.inputSchema.type).toBe('object');
-        for (const field of ['startDate', 'endDate', 'electedOrder', 'administrativeBodyName']) {
+        for (const field of ['startDate', 'endDate', 'electedOrder', 'administrativeBodyName', 'diavgeiaUnitIds', 'youtubeChannelUrl']) {
             expect(text).toContain(`"${field}"`);
         }
         expect(text).not.toContain('$ref');
+    });
+});
+
+describe('set_city_boundary through the SDK', () => {
+    it('passes the GeoJSON text without introducing a separate geometry schema', async () => {
+        const geojson = JSON.stringify({ type: 'FeatureCollection', features: [] });
+        const result = await mcp.call('set_city_boundary', { cityId: 'sarajevo', geojson });
+        expect(result.isError).not.toBe(true);
+        expect(mcpSetCityBoundary).toHaveBeenCalledWith(null, { cityId: 'sarajevo', geojson });
+    });
+
+    it('refuses a missing boundary before invoking the handler', async () => {
+        const result = await mcp.call('set_city_boundary', { cityId: 'sarajevo' });
+        expect(result.isError).toBe(true);
+        expect(mcpSetCityBoundary).not.toHaveBeenCalled();
+    });
+});
+
+describe('publish_city_demo through the SDK', () => {
+    it('accepts a city id without exposing arbitrary city or meeting edits', async () => {
+        const mcp = await connect();
+        try {
+            const result = await mcp.call('publish_city_demo', { cityId: 'mannheim', status: 'supported', released: true });
+            expect(result.isError).not.toBe(true);
+            expect(mcpPublishCityDemo).toHaveBeenCalledWith(null, { cityId: 'mannheim' });
+        } finally {
+            await mcp.close();
+        }
     });
 });
 
@@ -142,27 +150,72 @@ describe('create_city through the SDK', () => {
     });
 });
 
-describe('create_agenda_upload_url through the SDK', () => {
+describe('create_upload_url through the SDK', () => {
+    const AGENDA = { cityId: 'chania', kind: 'agenda', identifier: '2026-10-15', format: 'pdf', sizeBytes: 300000 };
+
     it('refuses an identifier that is not a file name slug', async () => {
-        const result = await mcp.call('create_agenda_upload_url', { cityId: 'chania', identifier: '15/10/2026' });
+        const result = await mcp.call('create_upload_url', { ...AGENDA, identifier: '15/10/2026' });
         expect(result.isError).toBe(true);
-        expect(mcpCreateAgendaUploadUrl).not.toHaveBeenCalled();
+        expect(mcpCreateUploadUrl).not.toHaveBeenCalled();
     });
 
-    it('refuses a format other than pdf and docx', async () => {
-        const result = await mcp.call('create_agenda_upload_url', { cityId: 'chania', identifier: '2026-10-15', format: 'doc' });
-        expect(result.isError).toBe(true);
-        expect(mcpCreateAgendaUploadUrl).not.toHaveBeenCalled();
+    it('refuses a kind that no MCP tool reads, and a format that no kind takes', async () => {
+        expect((await mcp.call('create_upload_url', { ...AGENDA, kind: 'decision' })).isError).toBe(true);
+        expect((await mcp.call('create_upload_url', { ...AGENDA, format: 'doc' })).isError).toBe(true);
+        expect(mcpCreateUploadUrl).not.toHaveBeenCalled();
     });
 
-    it('fills in the pdf format and hands the city and the identifier to the handler', async () => {
-        const result = await mcp.call('create_agenda_upload_url', { cityId: 'chania', identifier: '2026-10-15' });
+    it('refuses a size that is not a whole positive number of bytes', async () => {
+        expect((await mcp.call('create_upload_url', { ...AGENDA, sizeBytes: 0 })).isError).toBe(true);
+        expect((await mcp.call('create_upload_url', { ...AGENDA, sizeBytes: 1.5 })).isError).toBe(true);
+        const { sizeBytes: _omitted, ...withoutSize } = AGENDA;
+        expect((await mcp.call('create_upload_url', withoutSize)).isError).toBe(true);
+        expect(mcpCreateUploadUrl).not.toHaveBeenCalled();
+    });
+
+    it('hands a valid call to the handler', async () => {
+        const result = await mcp.call('create_upload_url', { ...AGENDA, kind: 'recording', format: 'mp4', sizeBytes: 12300000000 });
         expect(result.isError).toBeFalsy();
-        expect(mcpCreateAgendaUploadUrl).toHaveBeenCalledWith(null, { cityId: 'chania', identifier: '2026-10-15', format: 'pdf' });
+        expect(mcpCreateUploadUrl).toHaveBeenCalledWith(null, { ...AGENDA, kind: 'recording', format: 'mp4', sizeBytes: 12300000000 });
+    });
+});
+
+describe('complete_upload through the SDK', () => {
+    const ARGS = { cityId: 'chania', key: 'uploads/chania_2026-10-15_recording_0a1b2c3d.mp4', uploadId: 'u1', token: 't', sizeBytes: 2000000000 };
+
+    it('refuses a call without the completion fields', async () => {
+        const { token: _omitted, ...withoutToken } = ARGS;
+        expect((await mcp.call('complete_upload', withoutToken)).isError).toBe(true);
+        expect(mcpCompleteUpload).not.toHaveBeenCalled();
     });
 
-    it('forwards a docx format', async () => {
-        await mcp.call('create_agenda_upload_url', { cityId: 'chania', identifier: '2026-10-15', format: 'docx' });
-        expect(mcpCreateAgendaUploadUrl).toHaveBeenCalledWith(null, expect.objectContaining({ format: 'docx' }));
+    it('hands a valid call to the handler', async () => {
+        expect((await mcp.call('complete_upload', ARGS)).isError).toBeFalsy();
+        expect(mcpCompleteUpload).toHaveBeenCalledWith(null, ARGS);
+    });
+});
+
+describe('link inputs take http(s) only', () => {
+    const MEETING = { cityId: 'chania', dateTime: '2026-10-05T18:00:00+03:00' };
+    const cases: [string, string, Record<string, unknown>, jest.Mock][] = [
+        ['create_meeting', 'youtubeUrl', MEETING, mcpCreateMeeting as jest.Mock],
+        ['create_meeting', 'agendaUrl', MEETING, mcpCreateMeeting as jest.Mock],
+        ['update_meeting', 'youtubeUrl', { cityId: 'chania', meetingId: 'm1' }, mcpUpdateMeeting as jest.Mock],
+        ['update_meeting', 'agendaUrl', { cityId: 'chania', meetingId: 'm1' }, mcpUpdateMeeting as jest.Mock],
+        ['start_task', 'videoUrl', { cityId: 'chania', meetingId: 'm1', type: 'transcribe' }, mcpStartTask as jest.Mock],
+        ['start_task', 'agendaUrl', { cityId: 'chania', meetingId: 'm1', type: 'processAgenda' }, mcpStartTask as jest.Mock],
+    ];
+
+    it.each(cases)('%s refuses a javascript: %s', async (tool, field, args, handler) => {
+        const result = await mcp.call(tool, { ...args, [field]: 'javascript:alert(1)' });
+        expect(result.isError).toBe(true);
+        expect(handler).not.toHaveBeenCalled();
+    });
+
+    it.each(cases)('%s takes an https %s', async (tool, field, args, handler) => {
+        handler.mockResolvedValue({});
+        const result = await mcp.call(tool, { ...args, [field]: 'https://example.com/file' });
+        expect(result.isError).toBeFalsy();
+        expect(handler).toHaveBeenCalledWith(null, expect.objectContaining({ [field]: 'https://example.com/file' }));
     });
 });

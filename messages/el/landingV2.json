@@ -82,7 +82,8 @@
   },
   "subject": {
     "view": "Προβολή θέματος",
-    "discussionMinutes": "{min}′ συζήτηση"
+    "discussionMinutes": "{min}′ συζήτηση",
+    "loadingDescription": "Φόρτωση ολόκληρης της περιγραφής…"
   },
   "municipality": {
     "subjects": "Θέματα",
@@ -147,6 +148,13 @@
     "6m": "Τελευταίοι 6 μήνες",
     "12m": "Τελευταίοι 12 μήνες",
     "all": "Όλο το διάστημα"
+  },
+  "datesPill": {
+    "from": "από {date}",
+    "to": "έως {date}",
+    "between": "{from} – {to}",
+    "setInFilters": "Ημερομηνίες από τα φίλτρα",
+    "clear": "Αφαίρεση ημερομηνιών"
   },
   "bodyType": {
     "council": "Συμβούλιο",

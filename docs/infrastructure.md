@@ -33,7 +33,7 @@ graph TB
 
     subgraph preview_droplet ["Preview Droplet (NixOS · nix-openclaw)"]
         app_preview["🌐 PR Previews<br/><i>pr-N.opencouncil.dev</i>"]
-        db_preview[("🗄️ Isolated DB<br/><i>migration PRs only</i>")]
+        db_preview[("🗄️ Isolated DB<br/><i>every app PR</i>")]
     end
 
     subgraph local ["Local Development"]
@@ -61,8 +61,7 @@ graph TB
     app_staging <-->|"API + callbacks"| tasks_staging
     tasks_staging --- spaces
     tasks_staging --- external
-    app_preview --- db_staging
-    app_preview -.- db_preview
+    app_preview --- db_preview
 
     app_local --- db_local
     app_local -.- db_dev
@@ -94,7 +93,7 @@ graph TB
 
 **Production & Staging** are deployed via [DigitalOcean App Platform](https://www.digitalocean.com/products/app-platform). Both environments are configured to auto-deploy when their respective branches are pushed — `production` for opencouncil.gr, `main` for staging.opencouncil.gr. No CI/CD workflow in this repo; App Platform handles the build and deploy.
 
-**PR Previews** are deployed to a NixOS droplet managed by [nix-openclaw](https://github.com/schemalabz/nix-openclaw), via GitHub Actions workflows in this repo (`.github/workflows/preview-deploy.yml` and `preview-cleanup.yml`). The workflow builds the app with Nix, pushes to Cachix, then SSHs into the droplet to create the preview. PRs that include Prisma migrations get an isolated PostgreSQL instance on the droplet itself (instead of the shared staging DB), seeded via [opencouncil-seed-data](https://github.com/schemalabz/opencouncil-seed-data) — the same seed script contributors use locally. See [guides/preview-deployments.md](./guides/preview-deployments.md) for the full setup.
+**PR Previews** are deployed to a NixOS droplet managed by [nix-openclaw](https://github.com/schemalabz/nix-openclaw), via GitHub Actions workflows in this repo (`.github/workflows/preview-deploy.yml` and `preview-cleanup.yml`). The workflow builds the app with Nix, pushes to Cachix, then SSHs into the droplet to create the preview. Every app preview gets a PostgreSQL cluster on the droplet. The packaged seed command loads the verified subset from [opencouncil-seed-data](https://github.com/schemalabz/opencouncil-seed-data/releases). Preview startup always uses its generated local database URL. See [guides/preview-deployments.md](./guides/preview-deployments.md) for the full setup.
 
 **Tasks Server** (opencouncil-tasks) runs on a DigitalOcean droplet — both the production (`:3005`) and staging (`:3006`) instances run on the same machine. Deployed manually via SSH from the opencouncil-tasks repo.
 
@@ -118,6 +117,21 @@ Two repositories, connected via callbacks:
 | **opencouncil-tasks** | Heavy processing (transcription, AI, media) | Express, Node.js |
 
 The app queues a task in the database and sends a request to the tasks server. The tasks server does the work (calling external APIs) and POSTs results back to the app via a callback URL. See [task-architecture.md](./task-architecture.md) for details. For the full meeting processing pipeline, see [guides/meeting-lifecycle.md](./guides/meeting-lifecycle.md).
+
+## File Storage
+
+The app stores the files that people upload in the `townhalls-gr` Spaces bucket: agendas, recordings, decisions that are not on Diavgeia, logos and images. The preview server's environment also names `townhalls-gr`, so a test upload on a preview writes to the production bucket.
+
+A meeting file (an agenda, a recording or a decision) goes from the client straight to the bucket, with URLs that the app signs:
+- `UPLOAD_KINDS` in `src/types/upload.ts` lists the kinds, the formats that the task server reads for each, and their size limits. An agenda is a PDF or a .docx of at most 20 MiB. A decision is a PDF of at most 20 MiB. A recording is an mp4 or a .mov of at most 40 GiB.
+- `startUpload()` in `src/lib/uploads.ts` names the file `uploads/{cityId}_{body}_{meeting}_{kind}_{random}.{ext}` and signs the upload. A file of at most 1 GiB goes up in one PUT. The PUT sends `x-amz-acl: public-read`, which makes the file public. A bigger file goes up in parts of 1 GiB, and `completeUpload()` joins them after the client sends every part. Each signed URL binds the size of its file or part, so the bucket refuses a PUT of another size (403).
+- The browser calls `POST /api/upload/start` and `POST /api/upload/complete` from the link-or-file field. An MCP client calls `create_upload_url` and `complete_upload`.
+
+The browser sends its PUTs to the bucket from the page's origin, so the bucket's CORS rules must allow that origin. On 2026-10-29 the rules of `townhalls-gr` allowed `https://opencouncil.gr`, `https://staging.opencouncil.gr`, `https://opencouncil.rs`, `https://opencouncil.fr` and `http://localhost:3000`. A browser upload from a preview or from the domain of another realm fails until its origin is added. The `opencouncil-previews` bucket has no CORS rules, so a browser cannot upload to it.
+
+A multipart upload that a client starts and never completes keeps its parts in the bucket, and they are billed. A lifecycle rule with `AbortIncompleteMultipartUpload` on the bucket removes them.
+
+`uploadFile()` in `src/lib/s3.ts` stores logos and images that the server receives in a form. It names each file with a random UUID.
 
 ## Backups
 

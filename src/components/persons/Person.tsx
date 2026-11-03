@@ -1,7 +1,8 @@
 "use client";
 import { useLocale, useTranslations } from 'next-intl';
 import { captureEvent } from '@/lib/analytics/capture';
-import { City, Party, AdministrativeBody, Topic } from '@prisma/client';
+import { City, Party, Topic } from '@prisma/client';
+import type { PublicAdministrativeBody } from '@/lib/db/types';
 import { Button } from '../ui/button';
 import FormSheet from '../FormSheet';
 import PersonForm from './PersonForm';
@@ -48,7 +49,7 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
     city: City,
     person: PersonWithRelations,
     parties: Party[],
-    administrativeBodies: AdministrativeBody[],
+    administrativeBodies: PublicAdministrativeBody[],
     statistics: Statistics,
     contributionTopics: Topic[],
     /**
@@ -76,7 +77,7 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
     const { data: session } = useSession();
     const isSuperAdmin = session?.user?.isSuperAdmin ?? false;
     const locale = useLocale();
-    const roleTitles = useRoleTitles();
+    const roleTitles = useRoleTitles(city.language);
     const activeRoles = filterActiveRoles(person.roles as RoleWithRelations[]);
     const personParty = getPartyFromRoles(person.roles);
     const speakingMinutes = Math.round((statistics?.speakingSeconds ?? 0) / 60);
@@ -110,15 +111,15 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
             try {
                 setIsLoadingContributions(true);
                 setContributions([]);
-                const { results, totalCount } = await getLatestContributionsForSpeaker(
+                const { results, total } = await getLatestContributionsForSpeaker(
                     person.id,
                     1,
                     5,
                     selectedTopicId,
                 );
                 setContributions(results);
-                setTotalCount(totalCount);
-                if (!selectedTopicId) setCareerCount(totalCount);
+                setTotalCount(total);
+                if (!selectedTopicId) setCareerCount(total);
                 setPage(1);
             } catch (error) {
                 console.error('Error fetching contributions:', error);
@@ -384,6 +385,7 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
                                         transition={{ delay: 0.1 * index }}
                                     >
                                         <ContributionCard
+                                            cityLanguage={city.language}
                                             contribution={contribution}
                                             subjectId={contribution.subject.id}
                                             meeting={{

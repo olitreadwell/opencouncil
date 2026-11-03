@@ -60,6 +60,7 @@
         "adminBodyType_community": "Заједнице",
         "allPeople": "Сви",
         "allBodies": "Сва",
+        "pagination": "Странице",
         "backToHome": "Назад на почетну",
         "loadingError": "Грешка при учитавању",
         "all": "Све",
@@ -102,6 +103,9 @@
         }
     },
     "Footer": {
+        "selectCountry": "Изаберите земљу",
+        "searchCountry": "Претражите земље",
+        "noCountries": "Ниједна земља није пронађена.",
         "tagline": "Изграђено са поштовањем и уважавањем локалне самоуправе.",
         "companyDescription": "OpenCouncil је компанија у оквиру организације <link>Schema Labs</link>, непрофитне организације која развија технологију за јачање демократије.",
         "linksHeading": "Везе",
@@ -175,10 +179,7 @@
         "realmDescription": "Тенантска група којој овај град припада.",
         "language": "Језик",
         "selectLanguage": "Изаберите језик",
-        "languageDescription": "Језик садржаја овог града (само метаподаци; не мења језик интерфејса).",
-        "languageGreek": "Грчки",
-        "languageFrench": "Француски",
-        "languageSerbian": "Српски",
+        "languageDescription": "Језик на којем веће одржава седнице. Одређује језик транскрипције и резимеа; не мења језик интерфејса.",
         "adminSettings": "Администраторска подешавања",
         "status": "Статус",
         "selectStatus": "Изаберите статус",
@@ -773,6 +774,23 @@
         "adminPerson": "Управљај чланом",
         "adminBody": "Управљај органом"
     },
+    "ReportForm": {
+        "title": "Креирање извештаја о напретку",
+        "city": "Општина",
+        "selectCity": "Изаберите општину",
+        "searchCity": "Претражите општине...",
+        "noCityFound": "Општина није пронађена.",
+        "contractReference": "Број уговора",
+        "contractReferencePlaceholder": "нпр. 25SYMV01234567",
+        "period": "Период",
+        "halfYear": "{number}. полугодиште",
+        "months": "{count, plural, one {# месец} few {# месеца} other {# месеци}}",
+        "generating": "Креирање...",
+        "generate": "Креирај извештај (.docx)",
+        "success": "Извештај је успешно креиран",
+        "error": "Грешка",
+        "failed": "Креирање извештаја није успело"
+    },
     "OfferForm": {
         "recipientName": "Прималац",
         "recipientNameDescription": "Назив организације која ће примити понуду",
@@ -1079,6 +1097,7 @@
         "noContributions": "Нема учешћа говорника",
         "unknownSpeaker": "Непознат говорник",
         "noStatements": "Нема изјава говорника",
+        "noStatementsByCirculation": "На седници писаним изјашњавањем чланови гласају писмено, без расправе. Зато нема изјава.",
         "transcript": "Транскрипт",
         "noSummary": "За ову изјаву није доступан аутоматски сажетак",
         "viewMap": "Прикажи мапу",
@@ -1153,7 +1172,6 @@
     },
     "CouncilMeeting": {
         "items": "{count, plural, =0 {Нема седница} one {# седница} few {# седнице} other {# седница}}",
-        "itemsCapped": "Најновијих {count}",
         "pages": {
             "overview": "Преглед",
             "map": "Мапа",

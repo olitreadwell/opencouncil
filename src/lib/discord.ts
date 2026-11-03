@@ -104,6 +104,8 @@ export async function sendTaskAdminAlert(data: {
     cityId: string;
     meetingId: string;
     error?: string;
+    /** What the task's result held, shown after the meeting. */
+    details?: { name: string; value: string; inline?: boolean }[];
 }): Promise<void> {
     const config = TASK_STATUS_CONFIG[data.status];
 
@@ -129,6 +131,7 @@ export async function sendTaskAdminAlert(data: {
                 value: data.meetingName,
                 inline: false,
             },
+            ...(data.details ?? []).map((detail) => ({ ...detail, value: truncateField(detail.value), inline: detail.inline ?? false })),
             {
                 name: 'Task ID',
                 value: `\`${data.taskId}\``,
@@ -361,6 +364,40 @@ export async function sendNotificationsCreatedAdminAlert(data: {
             {
                 name: 'Links',
                 value: `[View Meeting](${meetingPageUrl}) | [Manage Notifications](${adminNotificationsUrl})`,
+                inline: false,
+            },
+        ],
+    });
+}
+
+/**
+ * Send admin alert when the app failed to create the notifications of a meeting
+ * by itself (after a task, or on its release). Nothing retries them: an admin
+ * creates them from the meeting's admin panel. It takes ids only, because the
+ * failure may be the read of the meeting itself.
+ */
+export async function sendNotificationsFailedAdminAlert(data: {
+    cityId: string;
+    meetingId: string;
+    /** The notification type, or `release` when the release path failed before it chose one. */
+    notificationType: string;
+    error: string;
+}): Promise<void> {
+    const meetingAdminUrl = await meetingUrl(data, '/admin');
+
+    await sendAdminAlert({
+        title: `❌ Notifications Not Created - ${data.cityId}`,
+        description: `${data.notificationType} notifications for ${data.meetingId} failed. Create them from the admin panel.`,
+        color: 0xe74c3c, // Red
+        fields: [
+            {
+                name: 'Error',
+                value: truncateField(data.error),
+                inline: false,
+            },
+            {
+                name: 'Admin Panel',
+                value: `[Open Meeting Admin](${meetingAdminUrl})`,
                 inline: false,
             },
         ],

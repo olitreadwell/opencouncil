@@ -70,6 +70,41 @@ enum CityLanguage {
   el
   fr
   sr
+  de
+  nl
+  it
+  pl
+  pt
+  es
+  fi
+  ca
+  sv
+  gl
+  bs
+  en
+  cy
+  ga
+  da
+  no
+  is
+  et
+  lv
+  lt
+  cs
+  sk
+  hu
+  sl
+  hr
+  ro
+  bg
+  mk
+  mt
+  lb
+  uk
+  ru
+  tr
+  sq
+  eu
 }
 
 // Tenant/grouping a city belongs to (e.g. the Greek vs. French deployment).
@@ -78,6 +113,45 @@ enum Realm {
   france
   cyprus
   serbia
+  austria
+  belgium
+  finland
+  germany
+  italy
+  netherlands
+  poland
+  portugal
+  spain
+  bosnia
+  andorra
+  albania
+  bulgaria
+  switzerland
+  czechia
+  denmark
+  estonia
+  united_kingdom
+  croatia
+  hungary
+  ireland
+  iceland
+  liechtenstein
+  lithuania
+  luxembourg
+  latvia
+  monaco
+  moldova
+  montenegro
+  north_macedonia
+  malta
+  norway
+  romania
+  sweden
+  slovenia
+  slovakia
+  san_marino
+  ukraine
+  kosovo
 }
 
 /// Where a city stands with us. Collapses the old (status, officialSupport) pair:
@@ -632,6 +706,11 @@ model Subject {
   id        String   @id  @default(cuid())
   name      String
   description String
+  // What the body decided, in one or two plain sentences read off the transcript.
+  // summarize writes it on the day of the transcript, so the Πίνακας αποφάσεων has
+  // a summary before the decision document arrives. No reference links. Null when
+  // the transcript shows no outcome, or on subjects summarized before the field.
+  outcome   String?
 
   cityId String
   councilMeetingId String
@@ -721,6 +800,10 @@ model Decision {
   // Fields extracted from the actual decision PDF content
   excerpt    String?   @db.Text  // Decision body text (markdown) — "ΑΠΟΦΑΣΙΖΕΙ…"
   references String?   @db.Text  // Legal bases from "αφού έλαβε υπόψη" section (markdown)
+  // One or two plain sentences of what the document decides, written by the extractor
+  // with the excerpt. The Πίνακας αποφάσεων prints it over Subject.outcome, because the
+  // document is the official record. Cleared with the extraction.
+  summary    String?   @db.Text
 
   /// What this document states about its vote and the audit of one reading. The
   /// phrase is the document's statement; the outcome is never stored, it is a count
@@ -1110,6 +1193,11 @@ model User {
   /// the notis_fanout_targets view carries it on every row.
   notifyByPhone        Boolean  @default(true)
   isSuperAdmin  Boolean         @default(false)
+  /// A machine account: a service holds it, it never signs in, and its MCP
+  /// tokens carry its rights like a person's (#590). Its address is on the
+  /// reserved domain of src/lib/auth/machineAccounts.ts. The queries that
+  /// mean "people" (recipients, stats, the operator picker) exclude it.
+  isMachine     Boolean         @default(false)
   accounts      Account[]
   sessions      Session[]
   Authenticator Authenticator[]
@@ -1135,7 +1223,6 @@ model User {
   subjectAttendance SubjectAttendance[]
   subjectVotes SubjectVote[]
   meetingAttendance MeetingAttendance[]
-  serviceApiKeys ServiceApiKey[]
   mcpTokens UserMcpToken[]
   searchQueries SearchQuery[]
 
@@ -1266,22 +1353,9 @@ model Administers {
   @@unique([userId, cityId, partyId, personId, administrativeBodyId])
 }
 
-model ServiceApiKey {
-  id          String    @id @default(cuid())
-  name        String    // Display name (e.g. "Sentinel")
-  hashedKey   String    @unique // SHA-256 hash of the API key
-  keyPrefix   String    // First 10 chars for display (e.g. "sk_a1b2c3d")
-  createdAt   DateTime  @default(now())
-  lastUsedAt  DateTime?
-  revokedAt   DateTime?
-
-  createdBy   User      @relation(fields: [createdById], references: [id])
-  createdById String
-}
-
-// Personal access token for the MCP server. Unlike ServiceApiKey (superadmin,
-// service-level), an MCP token acts as the owning user: highlight creation is
-// attributed to them and limited by their per-city permissions.
+// Personal access token for the MCP server. An MCP token acts as the owning
+// user: highlight creation is attributed to them and limited by their
+// per-city permissions.
 model UserMcpToken {
   id         String    @id @default(cuid())
   name       String    @default("MCP token")

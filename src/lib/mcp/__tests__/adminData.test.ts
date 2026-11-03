@@ -28,8 +28,8 @@ jest.mock('../../db/prisma', () => ({
 // Collaborators that do the writes. Each one reaches far into the app (the
 // session, Discord, the calendar), and none of that is under test here.
 jest.mock('../../cache/afterResponse', () => ({ revalidateAfterResponse: jest.fn() }));
-jest.mock('../../db/cities', () => ({ canUseCityCreator: jest.fn(), getCity: jest.fn() }));
-jest.mock('../../db/citiesAdmin', () => ({ createCityDirect: jest.fn() }));
+jest.mock('../../db/subject', () => ({ landingSubjectsTag: (realm: string) => `realm:${realm}:landing-subjects` }));
+jest.mock('../../db/citiesAdmin', () => ({ createCityDirect: jest.fn(), countCitiesByRealmAndStatus: jest.fn(), publishCityDemoDirect: jest.fn(), updateCityGeometryDirect: jest.fn() }));
 jest.mock('../../meetingWrites', () => ({ createMeetingWithEffects: jest.fn(), updateMeetingWithEffects: jest.fn() }));
 jest.mock('../realmGuards', () => ({
     assertCitiesInRealm: jest.fn(),
@@ -38,32 +38,31 @@ jest.mock('../realmGuards', () => ({
 }));
 jest.mock('../gate', () => ({ requireVisibleMeeting: jest.fn() }));
 jest.mock('../../tasks/startMeetingTask', () => ({ startMeetingTask: jest.fn() }));
-// s3.ts builds its client from env.mjs at import time.
-jest.mock('../../s3', () => ({
-    generatePresignedUrl: jest.fn(),
-    constructPublicUrl: jest.fn((bucket: string, key: string) => `https://${bucket}.test/${key}`),
-}));
-jest.mock('@/env.mjs', () => ({ env: { DO_SPACES_BUCKET: 'bucket' } }));
+// The upload service signs against the bucket; its own tests cover it.
+jest.mock('../../uploads', () => ({ startUpload: jest.fn(), completeUpload: jest.fn() }));
 
 import { Prisma, Realm } from '@prisma/client';
 import {
-    mcpCreateAgendaUploadUrl, mcpCreateCity, mcpCreateMeeting, mcpPopulateCity, mcpStartTask, mcpUpdateMeeting,
+    mcpCompleteUpload, mcpCreateCity, mcpCreateMeeting, mcpCreateUploadUrl, mcpListRealms, mcpPopulateCity, mcpPublishCityDemo, mcpSetCityBoundary, mcpStartTask,
+    mcpUpdateMeeting,
 } from '../adminData';
 import type { McpAdminAccess } from '../adminAccess';
 import { mcpRealmStore, requestContext } from '../realm-context';
 import { cityPopulationSchema, type CityPopulationInput } from '../../zod-schemas/cityPopulation';
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError, UnauthorizedError } from '../../api/errors';
-import { createCityDirect } from '../../db/citiesAdmin';
+import { countCitiesByRealmAndStatus, createCityDirect, publishCityDemoDirect, updateCityGeometryDirect } from '../../db/citiesAdmin';
+import { revalidateAfterResponse } from '../../cache/afterResponse';
 import { populateCity } from '../../db/cityPopulate';
 import { createMeetingWithEffects, updateMeetingWithEffects } from '../../meetingWrites';
 import { requireRealmCity } from '../realmGuards';
 import { requireVisibleMeeting } from '../gate';
 import { startMeetingTask } from '../../tasks/startMeetingTask';
-import { generatePresignedUrl } from '../../s3';
+import { completeUpload, startUpload } from '../../uploads';
 import * as cityPopulate from '../../db/cityPopulate';
 
-const ADMIN_TOKEN = { type: 'user', userId: 'u1' } as const;
-const SERVICE = { type: 'service', keyName: 'bot' } as const;
+const ADMIN_TOKEN = { userId: 'u1' } as const;
+// The token of a superadmin account; the route resolved its access.
+const SUPERADMIN_TOKEN = { userId: 'bot' } as const;
 
 const asCityAdmin = (...cityIds: string[]) =>
     mockUserFindUnique.mockResolvedValue({ isSuperAdmin: false, administers: cityIds.map(cityId => ({ cityId })) });
@@ -75,6 +74,8 @@ const asBodyAdmin = (bodyId: string, cityId: string) =>
     });
 
 const SUPERADMIN: McpAdminAccess = { superadmin: true, cityIds: new Set(), bodyIds: new Set() };
+// Outside a request scope the guards read the rights from the database.
+const asSuperadmin = () => mockUserFindUnique.mockResolvedValue({ isSuperAdmin: true, administers: [] });
 
 // The bodies of argos, and its meetings: m1 is the council's, m2 the
 // committee's, m3 has no body. requireVisibleMeeting is mocked, so it answers
@@ -86,7 +87,7 @@ const MEETINGS: Record<string, { administrativeBodyId: string | null }> = {
 
 // A request scope with the access the route handler would have resolved.
 const inRealm = <T>(realm: Realm, fn: () => Promise<T>, adminAccess: McpAdminAccess = SUPERADMIN) =>
-    mcpRealmStore.run(requestContext(realm, null, SERVICE, { adminAccess }), fn);
+    mcpRealmStore.run(requestContext(realm, null, SUPERADMIN_TOKEN, { adminAccess }), fn);
 
 
 const MEETING = { cityId: 'argos', dateTime: '2026-10-05T18:00:00+03:00', processAgenda: false };
@@ -101,7 +102,8 @@ beforeEach(() => {
     mockMeetingFindUnique.mockImplementation(({ where }: { where: { cityId_id: { id: string } } }) =>
         Promise.resolve(MEETINGS[where.cityId_id.id] ?? null));
     (requireVisibleMeeting as jest.Mock).mockImplementation((_cityId: string, meetingId: string) =>
-        Promise.resolve({ released: false, administrativeBodyId: MEETINGS[meetingId]?.administrativeBodyId ?? null, editor: true }));
+        Promise.resolve({ released: false, administrativeBodyId: MEETINGS[meetingId]?.administrativeBodyId ?? null, editor: true, locale: 'el' }));
+    (requireRealmCity as jest.Mock).mockResolvedValue('greece');
 });
 
 describe('meeting tools authorize before they write', () => {
@@ -140,6 +142,36 @@ describe('meeting tools authorize before they write', () => {
         expect((createMeetingWithEffects as jest.Mock).mock.calls[0][1]).not.toHaveProperty('name_en');
         expect(result.name).toBe('Δημοτικό Συμβούλιο · Τακτική Συνεδρίαση · 05/10/2026');
         expect(result.title).toBe('Τακτική Συνεδρίαση');
+        // A draft notifies nobody: the agent must not promise the user an email.
+        expect(result.next).toMatch(/no subscriber is notified until it is released/);
+    });
+
+    it('names a new meeting in the UI language of the realm of its city', async () => {
+        asCityAdmin('krakow');
+        (requireRealmCity as jest.Mock).mockResolvedValue('poland');
+        mockCityFindUnique.mockResolvedValue({ timezone: 'Europe/Warsaw' });
+        (createMeetingWithEffects as jest.Mock).mockResolvedValue({ meeting: {
+            id: 'oct20_2026', cityId: 'krakow', name: null, name_en: null, kind: null, urgent: false,
+            dateTime: new Date('2026-10-20T15:00:00Z'), released: false,
+            administrativeBody: { name: 'Rada Miasta Krakowa', name_en: 'Kraków City Council' },
+        } });
+        const result = await mcpCreateMeeting(ADMIN_TOKEN, { cityId: 'krakow', dateTime: '2026-10-20T17:00:00+02:00', processAgenda: false });
+        expect(result.name).toBe('Kraków City Council · Meeting 20/10/2026');
+        expect(result.title).toBe('Meeting 20/10/2026');
+    });
+
+    it('names an updated meeting in the locale that the gate gives', async () => {
+        asCityAdmin('krakow');
+        (requireVisibleMeeting as jest.Mock).mockResolvedValue({ released: false, administrativeBodyId: null, editor: true, locale: 'en' });
+        (updateMeetingWithEffects as jest.Mock).mockResolvedValue({
+            id: 'm1', cityId: 'krakow', name: null, name_en: null, kind: 'ordinary', urgent: false,
+            dateTime: new Date('2026-10-20T15:00:00Z'), youtubeUrl: null, agendaUrl: null, released: false,
+            administrativeBody: { name: 'Rada Miasta Krakowa', name_en: 'Kraków City Council' },
+        });
+        mockCityFindUnique.mockResolvedValue({ timezone: 'Europe/Warsaw' });
+        const result = await mcpUpdateMeeting(ADMIN_TOKEN, { cityId: 'krakow', meetingId: 'm1', sessionNumber: 3 });
+        expect(result.name).toBe(result.name_en);
+        expect(result.name).toMatch(/^Kraków City Council · /);
     });
 
     it('returns the derived names after an update', async () => {
@@ -200,8 +232,8 @@ describe('an administrator of one body', () => {
     });
 
     it('starts a task on a meeting of their body, and not on another meeting', async () => {
-        await expect(mcpStartTask(ADMIN_TOKEN, { cityId: 'argos', meetingId: 'm1', type: 'transcribe' })).resolves.toMatchObject({ id: 't1' });
-        await expect(mcpStartTask(ADMIN_TOKEN, { cityId: 'argos', meetingId: 'm2', type: 'transcribe' })).rejects.toThrow(ForbiddenError);
+        await expect(mcpStartTask(ADMIN_TOKEN, { cityId: 'argos', meetingId: 'm1', type: 'transcribe', force: false })).resolves.toMatchObject({ id: 't1' });
+        await expect(mcpStartTask(ADMIN_TOKEN, { cityId: 'argos', meetingId: 'm2', type: 'transcribe', force: false })).rejects.toThrow(ForbiddenError);
         expect(startMeetingTask).toHaveBeenCalledTimes(1);
     });
 
@@ -241,22 +273,128 @@ describe('create_city', () => {
 
     it('creates a pending city in the realm of the connector, in the language of that realm', async () => {
         (createCityDirect as jest.Mock).mockImplementation(async data => data);
-        await inRealm(Realm.france, () => mcpCreateCity(SERVICE, CITY));
+        await inRealm(Realm.france, () => mcpCreateCity(SUPERADMIN_TOKEN, CITY));
         expect(createCityDirect).toHaveBeenCalledWith(expect.objectContaining({
             id: 'lyon', realm: 'france', language: 'fr', status: 'pending', logoImage: null,
         }));
     });
 
+    it('asks for the language on a realm that serves the English UI', async () => {
+        await expect(inRealm(Realm.germany, () => mcpCreateCity(SUPERADMIN_TOKEN, CITY))).rejects.toThrow(BadRequestError);
+        expect(createCityDirect).not.toHaveBeenCalled();
+    });
+
+    it('creates the city in the realm a superadmin names, with a link on that realm\'s domain', async () => {
+        (createCityDirect as jest.Mock).mockImplementation(async data => data);
+        const result = await inRealm(Realm.greece, () =>
+            mcpCreateCity(SUPERADMIN_TOKEN, { ...CITY, id: 'krakow', realm: Realm.poland, language: 'pl' }));
+        expect(createCityDirect).toHaveBeenCalledWith(expect.objectContaining({ id: 'krakow', realm: 'poland', language: 'pl' }));
+        expect(result.url).toBe('https://opencouncil.pl/krakow');
+    });
+
+    it('names the realm when it has no default language', async () => {
+        await expect(inRealm(Realm.greece, () => mcpCreateCity(SUPERADMIN_TOKEN, { ...CITY, realm: Realm.spain })))
+            .rejects.toThrow('The spain realm has no default content language.');
+    });
+
+    it('creates the city on such a realm in the language it is given', async () => {
+        (createCityDirect as jest.Mock).mockImplementation(async data => data);
+        await inRealm(Realm.belgium, () => mcpCreateCity(SUPERADMIN_TOKEN, { ...CITY, language: 'fr' }));
+        expect(createCityDirect).toHaveBeenCalledWith(expect.objectContaining({ realm: 'belgium', language: 'fr' }));
+    });
+
     it('reports a taken id as a conflict, from the unique index', async () => {
+        asSuperadmin();
         (createCityDirect as jest.Mock).mockRejectedValue(
             new Prisma.PrismaClientKnownRequestError('taken', { code: 'P2002', clientVersion: 'test' })
         );
-        await expect(mcpCreateCity(SERVICE, CITY)).rejects.toThrow(ConflictError);
+        await expect(mcpCreateCity(SUPERADMIN_TOKEN, CITY)).rejects.toThrow(ConflictError);
     });
 
     it('lets any other database error through as is', async () => {
+        asSuperadmin();
         (createCityDirect as jest.Mock).mockRejectedValue(new Error('connection lost'));
-        await expect(mcpCreateCity(SERVICE, CITY)).rejects.toThrow('connection lost');
+        await expect(mcpCreateCity(SUPERADMIN_TOKEN, CITY)).rejects.toThrow('connection lost');
+    });
+});
+
+describe('publish_city_demo', () => {
+    it('promotes across realms, invalidates discovery and returns the city realm URL', async () => {
+        (publishCityDemoDirect as jest.Mock).mockResolvedValue({ id: 'mannheim', status: 'demo', realm: 'germany' });
+        const result = await inRealm(Realm.greece, () => mcpPublishCityDemo(SUPERADMIN_TOKEN, { cityId: 'mannheim' }));
+        expect(requireRealmCity).toHaveBeenCalledWith('mannheim');
+        expect(publishCityDemoDirect).toHaveBeenCalledWith('mannheim');
+        expect(result).toMatchObject({ id: 'mannheim', status: 'demo', realm: 'germany', url: 'https://opencouncil.de/mannheim' });
+        expect(revalidateAfterResponse).toHaveBeenCalledWith({ blockingTags: ['city', 'cities:all', 'city:mannheim', 'realm:germany:landing-subjects'] });
+    });
+
+    it.each([null, ADMIN_TOKEN])('refuses callers without superadmin rights before writing (%j)', async identity => {
+        await expect(mcpPublishCityDemo(identity, { cityId: 'mannheim' })).rejects.toThrow();
+        expect(publishCityDemoDirect).not.toHaveBeenCalled();
+    });
+
+    it('reports a missing or ineligible city instead of changing official support', async () => {
+        asSuperadmin();
+        (publishCityDemoDirect as jest.Mock).mockRejectedValue(new Prisma.PrismaClientKnownRequestError('no eligible city', { code: 'P2025', clientVersion: 'test' }));
+        await expect(mcpPublishCityDemo(SUPERADMIN_TOKEN, { cityId: 'mannheim' })).rejects.toThrow(ConflictError);
+    });
+});
+
+describe('set_city_boundary', () => {
+    const polygon = { type: 'Polygon', coordinates: [[[18.3, 43.8], [18.4, 43.8], [18.4, 43.9]]] };
+
+    it('normalizes an exported collection through the existing parser and refreshes discovery', async () => {
+        (requireRealmCity as jest.Mock).mockResolvedValue('bosnia');
+        const result = await inRealm(Realm.greece, () => mcpSetCityBoundary(SUPERADMIN_TOKEN, {
+            cityId: 'sarajevo', geojson: JSON.stringify({ type: 'FeatureCollection', features: [{ type: 'Feature', properties: { source: 'official' }, geometry: polygon }] }),
+        }));
+        expect(updateCityGeometryDirect).toHaveBeenCalledWith('sarajevo', {
+            ...polygon, coordinates: [[[18.3, 43.8], [18.4, 43.8], [18.4, 43.9], [18.3, 43.8]]],
+        });
+        expect(result).toMatchObject({ cityId: 'sarajevo', realm: 'bosnia', geometryType: 'Polygon', polygonCount: 1, url: 'https://ba.opencouncil.eu/sarajevo/map' });
+        expect(revalidateAfterResponse).toHaveBeenCalledWith({ blockingTags: ['city', 'cities:all', 'city:sarajevo', 'realm:bosnia:landing-subjects'] });
+        expect(revalidateAfterResponse).toHaveBeenCalledWith({ blockingTags: ['city:sarajevo:geometry'] });
+    });
+
+    it.each([
+        '{', JSON.stringify({ type: 'Point', coordinates: [18.3, 43.8] }),
+        JSON.stringify({ type: 'Polygon', coordinates: [[[500000, 4000000], [500100, 4000000], [500000, 4000100]]] }),
+    ])('refuses malformed, non-polygonal or projected coordinates before writing', async geojson => {
+        asSuperadmin();
+        await expect(mcpSetCityBoundary(SUPERADMIN_TOKEN, { cityId: 'sarajevo', geojson })).rejects.toThrow(BadRequestError);
+        expect(updateCityGeometryDirect).not.toHaveBeenCalled();
+    });
+
+    it('does not invalidate caches or report success when the database rejects the boundary', async () => {
+        asSuperadmin();
+        (updateCityGeometryDirect as jest.Mock).mockRejectedValueOnce(new Error('Invalid geometry'));
+        await expect(mcpSetCityBoundary(SUPERADMIN_TOKEN, { cityId: 'sarajevo', geojson: JSON.stringify(polygon) })).rejects.toThrow('Invalid geometry');
+        expect(revalidateAfterResponse).not.toHaveBeenCalled();
+    });
+});
+
+describe('list_realms', () => {
+    it('lists every realm with its domain, site language, stage and cities per status', async () => {
+        (countCitiesByRealmAndStatus as jest.Mock).mockResolvedValue([
+            { realm: 'greece', status: 'supported', _count: { _all: 13 } },
+            { realm: 'poland', status: 'pending', _count: { _all: 1 } },
+        ]);
+        const { realms } = await inRealm(Realm.greece, () => mcpListRealms(SUPERADMIN_TOKEN));
+
+        expect(realms).toHaveLength(Object.values(Realm).length);
+        expect(realms.find((r) => r.realm === 'bosnia')).toMatchObject({
+            country: 'BA', domain: 'ba.opencouncil.eu', uiLanguage: 'en', stage: 'pending',
+        });
+        expect(realms.find((r) => r.realm === 'greece')).toMatchObject({ domain: 'opencouncil.gr', thisConnection: true, cities: { supported: 13, pending: 0 } });
+        expect(realms.find((r) => r.realm === 'poland')).toMatchObject({
+            country: 'PL', countryName: 'Poland', domain: 'opencouncil.pl', uiLanguage: 'en', stage: 'pending',
+            thisConnection: false, cities: { supported: 0, demo: 0, pending: 1 },
+        });
+    });
+
+    it('is refused to a city administrator', async () => {
+        asCityAdmin('athens');
+        await expect(mcpListRealms(ADMIN_TOKEN)).rejects.toThrow(ForbiddenError);
     });
 });
 
@@ -272,29 +410,23 @@ describe('populate_city', () => {
         people: [person(roles)],
     });
 
-    it('rejects a role that names a party which is not in the call', async () => {
-        const populate = jest.spyOn(cityPopulate, 'populateCity');
-        const data = parsed([{ type: 'party', partyName: 'Αλλο Κόμμα' }]);
-        await expect(mcpPopulateCity(SERVICE, data)).rejects.toThrow(/unknown party "Αλλο Κόμμα"/);
-        expect(populate).not.toHaveBeenCalled();
-    });
-
     it('saves a call whose roles all resolve', async () => {
+        asSuperadmin();
         const populate = jest.spyOn(cityPopulate, 'populateCity')
             .mockResolvedValue({ partiesCount: 1, peopleCount: 1, rolesCount: 2, adminBodiesCount: 1 });
         const data = parsed([
             { type: 'party', partyName: 'Κόμμα' },
             { type: 'adminBody', administrativeBodyName: 'Δημοτικό Συμβούλιο' },
         ]);
-        await expect(mcpPopulateCity(SERVICE, data)).resolves.toMatchObject({ cityId: 'lyon', rolesCount: 2 });
-        expect(populate).toHaveBeenCalledWith('lyon', data);
+        await expect(mcpPopulateCity(SUPERADMIN_TOKEN, data)).resolves.toMatchObject({ cityId: 'lyon', rolesCount: 2 });
+        expect(populate).toHaveBeenCalledWith(data);
     });
 });
 
 describe('start_task', () => {
     it('is refused for a city that the caller does not administer', async () => {
         asCityAdmin('athens');
-        await expect(mcpStartTask(ADMIN_TOKEN, { cityId: 'argos', meetingId: 'm1', type: 'transcribe' })).rejects.toThrow(ForbiddenError);
+        await expect(mcpStartTask(ADMIN_TOKEN, { cityId: 'argos', meetingId: 'm1', type: 'transcribe', force: false })).rejects.toThrow(ForbiddenError);
         expect(startMeetingTask).not.toHaveBeenCalled();
     });
 
@@ -309,47 +441,74 @@ describe('start_task', () => {
         expect(result).toMatchObject({ id: 't1', type: 'transcribe', status: 'pending', startedAt: '2026-09-23T10:00:00.000Z', meetingId: 'm1' });
         expect(result).not.toHaveProperty('finishedAt');
         expect(result.next).toMatch(/get_meeting/);
+        // transcribe notifies nobody, so the result says nothing about notifications.
+        expect(result).not.toHaveProperty('notifications');
+    });
+
+    it('tells the agent, without a read after the start, when processAgenda and summarize notify', async () => {
+        asCityAdmin('argos');
+        (startMeetingTask as jest.Mock).mockResolvedValue({
+            id: 't2', type: 'processAgenda', status: 'pending', stage: null, percentComplete: null,
+            createdAt: new Date('2026-09-23T10:00:00Z'), updatedAt: new Date('2026-09-23T10:00:00Z'), version: null,
+        });
+
+        const result = await mcpStartTask(ADMIN_TOKEN, { cityId: 'argos', meetingId: 'm1', type: 'processAgenda', force: false });
+
+        expect(result).toMatchObject({ id: 't2', status: 'pending' });
+        expect(result.notifications).toMatch(/only for a released meeting that is still news/);
+        expect(result.notifications).toMatch(/get_meeting/);
     });
 });
 
-describe('create_agenda_upload_url', () => {
-    it('signs a readable key under uploads/ and answers with the public URL and the PUT headers', async () => {
-        asCityAdmin('argos');
-        (generatePresignedUrl as jest.Mock).mockResolvedValue('https://bucket.test/signed');
-        const result = await mcpCreateAgendaUploadUrl(ADMIN_TOKEN, { cityId: 'argos', identifier: '2026-10-15', format: 'pdf' });
+describe('create_upload_url', () => {
+    const PLAN = {
+        key: 'uploads/argos_2026-10-15_agenda_0a1b2c3d.pdf', publicUrl: 'https://bucket.test/k', method: 'PUT',
+        headers: { 'Content-Type': 'application/pdf', 'x-amz-acl': 'public-read' }, partSize: 300_000,
+        parts: [{ partNumber: 1, uploadUrl: 'https://bucket.test/put' }], expiresIn: 300, completion: null,
+    };
 
-        const key = (generatePresignedUrl as jest.Mock).mock.calls[0][0];
-        expect(key).toMatch(/^uploads\/argos_2026-10-15_agenda_[0-9a-f]{8}\.pdf$/);
-        expect(generatePresignedUrl).toHaveBeenCalledWith(key, 'application/pdf', 300);
-        expect(result).toMatchObject({
-            uploadUrl: 'https://bucket.test/signed',
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/pdf', 'x-amz-acl': 'public-read' },
-            expiresIn: 300,
-            publicUrl: `https://bucket.test/${key}`,
+    it('starts the upload under the city, the identifier and the kind, and answers with the plan', async () => {
+        asCityAdmin('argos');
+        (startUpload as jest.Mock).mockResolvedValue(PLAN);
+        const result = await mcpCreateUploadUrl(ADMIN_TOKEN, {
+            cityId: 'argos', kind: 'agenda', identifier: '2026-10-15', format: 'pdf', sizeBytes: 300_000,
         });
-        expect(result.next).toMatch(/create_meeting/);
+
+        expect(startUpload).toHaveBeenCalledWith({ cityId: 'argos', kind: 'agenda', identifier: '2026-10-15' }, 'pdf', 300_000);
+        expect(result).toMatchObject(PLAN);
+        expect(result.next).toMatch(/exactly these headers/);
+        expect(result.next).toMatch(/agendaUrl to create_meeting/);
     });
 
-    it('gives each call its own key', async () => {
+    it('tells how to send the parts and to complete them, when the file goes up in parts', async () => {
         asCityAdmin('argos');
-        (generatePresignedUrl as jest.Mock).mockResolvedValue('https://bucket.test/signed');
-        const args = { cityId: 'argos', identifier: '2026-10-15', format: 'pdf' as const };
-        const first = await mcpCreateAgendaUploadUrl(ADMIN_TOKEN, args);
-        const second = await mcpCreateAgendaUploadUrl(ADMIN_TOKEN, args);
-        expect(first.publicUrl).not.toBe(second.publicUrl);
+        (startUpload as jest.Mock).mockResolvedValue({ ...PLAN, headers: {}, completion: { uploadId: 'u1', token: 't' } });
+        const result = await mcpCreateUploadUrl(ADMIN_TOKEN, {
+            cityId: 'argos', kind: 'recording', identifier: '2026-10-15', format: 'mp4', sizeBytes: 12_300_000_000,
+        });
+
+        expect(result.next).toMatch(/split -b <partSize>/);
+        expect(result.next).toMatch(/complete_upload/);
+        expect(result.next).toMatch(/youtubeUrl/);
+    });
+});
+
+describe('complete_upload', () => {
+    const ARGS = { cityId: 'argos', key: 'uploads/argos_2026-10-15_recording_0a1b2c3d.mp4', uploadId: 'u1', token: 't', sizeBytes: 2e9 };
+
+    it('completes an upload of the city', async () => {
+        asCityAdmin('argos');
+        (completeUpload as jest.Mock).mockResolvedValue({ key: ARGS.key, publicUrl: 'https://bucket.test/k', sizeBytes: 2e9 });
+        const result = await mcpCompleteUpload(ADMIN_TOKEN, ARGS);
+
+        expect(completeUpload).toHaveBeenCalledWith(ARGS);
+        expect(result).toMatchObject({ publicUrl: 'https://bucket.test/k', sizeBytes: 2e9 });
     });
 
-    it('names a .docx file by its extension and signs its content type', async () => {
-        asCityAdmin('argos');
-        (generatePresignedUrl as jest.Mock).mockResolvedValue('https://bucket.test/signed');
-        const result = await mcpCreateAgendaUploadUrl(ADMIN_TOKEN, { cityId: 'argos', identifier: '2026-10-15', format: 'docx' });
-
-        const key = (generatePresignedUrl as jest.Mock).mock.calls[0][0];
-        expect(key).toMatch(/^uploads\/argos_2026-10-15_agenda_[0-9a-f]{8}\.docx$/);
-        const docx = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-        expect(generatePresignedUrl).toHaveBeenCalledWith(key, docx, 300);
-        expect(result.headers['Content-Type']).toBe(docx);
+    it('refuses a key of another city, even to an admin of both', async () => {
+        asCityAdmin('argos', 'athens');
+        await expect(mcpCompleteUpload(ADMIN_TOKEN, { ...ARGS, cityId: 'athens' })).rejects.toThrow(BadRequestError);
+        expect(completeUpload).not.toHaveBeenCalled();
     });
 });
 
@@ -370,16 +529,24 @@ describe('permission matrix', () => {
     const cityScoped = {
         create_meeting: (id: McpIdentityArg) => mcpCreateMeeting(id, MEETING),
         update_meeting: (id: McpIdentityArg) => mcpUpdateMeeting(id, { cityId: 'argos', meetingId: 'm1', sessionNumber: 4 }),
-        start_task: (id: McpIdentityArg) => mcpStartTask(id, { cityId: 'argos', meetingId: 'm1', type: 'transcribe' }),
-        create_agenda_upload_url: (id: McpIdentityArg) => mcpCreateAgendaUploadUrl(id, { cityId: 'argos', identifier: '2026-10-15', format: 'pdf' }),
+        start_task: (id: McpIdentityArg) => mcpStartTask(id, { cityId: 'argos', meetingId: 'm1', type: 'transcribe', force: false }),
+        create_upload_url: (id: McpIdentityArg) => mcpCreateUploadUrl(id, {
+            cityId: 'argos', kind: 'agenda', identifier: '2026-10-15', format: 'pdf', sizeBytes: 1000,
+        }),
+        complete_upload: (id: McpIdentityArg) => mcpCompleteUpload(id, {
+            cityId: 'argos', key: 'uploads/argos_x_recording_0a1b2c3d.mp4', uploadId: 'u1', token: 't', sizeBytes: 2e9,
+        }),
     };
     const superadminOnly = {
         create_city: (id: McpIdentityArg) => mcpCreateCity(id, CITY),
         populate_city: (id: McpIdentityArg) => mcpPopulateCity(id, COUNCIL),
+        publish_city_demo: (id: McpIdentityArg) => mcpPublishCityDemo(id, { cityId: 'argos' }),
+        set_city_boundary: (id: McpIdentityArg) => mcpSetCityBoundary(id, { cityId: 'argos', geojson: '{}' }),
     };
     type McpIdentityArg = Parameters<typeof mcpCreateMeeting>[0];
     const writes = () => [
-        createMeetingWithEffects, updateMeetingWithEffects, startMeetingTask, createCityDirect, populateCity, generatePresignedUrl,
+        createMeetingWithEffects, updateMeetingWithEffects, startMeetingTask, createCityDirect, populateCity, publishCityDemoDirect, updateCityGeometryDirect, startUpload,
+        completeUpload,
     ].map(fn => (fn as jest.Mock).mock.calls.length).reduce((a, b) => a + b, 0);
 
     const all = { ...cityScoped, ...superadminOnly };

@@ -1,7 +1,7 @@
 import 'server-only';
 import type { Prisma, Realm } from '@prisma/client';
 import prisma from '@/lib/db/prisma';
-import { PUBLIC_CITY_WHERE } from '@/lib/cityStatus';
+import { publicMeetingWhere } from '@/lib/cityStatus';
 
 /** The columns that `transcriptIsPublic` reads. */
 export const transcriptGateSelect = {
@@ -38,6 +38,19 @@ type TranscriptGateFields = Pick<PublicMeeting, 'taskStatuses'> & {
 export const transcriptIsPublic = (meeting: TranscriptGateFields) =>
     meeting.administrativeBody?.showUnreviewedTranscript !== false || meeting.taskStatuses.length > 0;
 
+/**
+ * `transcriptIsPublic` for one meeting, read by its ids. The meeting page reads
+ * it alongside the meeting: the public body that the page receives does not
+ * carry the setting. False when the meeting does not exist.
+ */
+export async function meetingTranscriptIsPublic(cityId: string, meetingId: string): Promise<boolean> {
+    const meeting = await prisma.councilMeeting.findUnique({
+        where: { cityId_id: { cityId, id: meetingId } },
+        select: transcriptGateSelect,
+    });
+    return meeting !== null && transcriptIsPublic(meeting);
+}
+
 /** `transcriptIsPublic` as a database filter, for a released meeting. */
 export const TRANSCRIPT_PUBLIC_WHERE = {
     released: true,
@@ -50,13 +63,13 @@ export const TRANSCRIPT_PUBLIC_WHERE = {
 
 export async function getPublicMeeting(cityId: string, meetingId: string, realm: Realm) {
     return prisma.councilMeeting.findFirst({
-        where: { cityId, id: meetingId, released: true, city: { ...PUBLIC_CITY_WHERE, realm } }, select: publicMeetingSelect,
+        where: { cityId, id: meetingId, ...publicMeetingWhere(realm) }, select: publicMeetingSelect,
     });
 }
 
 export async function getPublicSubject(cityId: string, meetingId: string, subjectId: string, realm: Realm) {
     return prisma.subject.findFirst({
-        where: { id: subjectId, cityId, councilMeetingId: meetingId, councilMeeting: { released: true, city: { ...PUBLIC_CITY_WHERE, realm } } },
+        where: { id: subjectId, cityId, councilMeetingId: meetingId, councilMeeting: publicMeetingWhere(realm) },
         select: publicSubjectSelect,
     });
 }

@@ -3,7 +3,7 @@
 // buildSearchQuery: which filters the search ran with, and whether the model
 // was consulted at all.
 jest.mock('@/env.mjs', () => ({ env: { ELASTICSEARCH_URL: 'http://es.test', ELASTICSEARCH_API_KEY: 'k', ELASTICSEARCH_INDEX: 'subjects-test' } }));
-jest.mock('@elastic/elasticsearch', () => ({ Client: jest.fn().mockImplementation(() => ({ search: jest.fn() })) }));
+jest.mock('@elastic/elasticsearch', () => ({ Client: jest.fn().mockImplementation(() => ({ search: jest.fn(), indices: { getMapping: jest.fn() } })) }));
 jest.mock('@/lib/db/prisma', () => ({
     __esModule: true,
     default: { subject: { findMany: jest.fn().mockResolvedValue([]) }, speakerSegment: { findMany: jest.fn().mockResolvedValue([]) }, $queryRaw: jest.fn().mockResolvedValue([]) },
@@ -25,6 +25,7 @@ jest.mock('@/lib/db/cities', () => ({
     getListedCitiesCached: jest.fn(),
     filterCityIdsByRealm: jest.fn(),
 }));
+jest.mock('@/lib/db/cityTimezone', () => ({ getCityTimezone: jest.fn() }));
 jest.mock('../filters', () => ({
     ...jest.requireActual('../filters'),
     extractFilters: jest.fn(),
@@ -40,6 +41,7 @@ jest.mock('../related', () => ({
 }));
 
 import { Client } from '@elastic/elasticsearch';
+import { resetIndexProfileCache } from '../profile';
 import prisma from '@/lib/db/prisma';
 import { getCities, getListedCitiesCached, filterCityIdsByRealm } from '@/lib/db/cities';
 import { sendErrorAdminAlert } from '@/lib/discord-core';
@@ -47,6 +49,7 @@ import { extractFilters, processFilters, NO_EXTRACTED_FILTERS } from '../filters
 import { buildSearchQuery } from '../query';
 import { buildRelatedSubjectsQuery } from '../related';
 import { createCache } from '@/lib/cache/index';
+import { getCityTimezone } from '@/lib/db/cityTimezone';
 import { searchInRealm, searchSubjectsInRealm, searchRelatedSubjectsInRealm } from '../core';
 import type { SearchRequest } from '../types';
 
@@ -67,6 +70,12 @@ const findManyMock = prisma.subject.findMany as jest.Mock;
 // The Elasticsearch client is constructed once at module scope, so the search
 // mock has to be read off that instance rather than re-mocked per test.
 const esSearchMock = (Client as unknown as jest.Mock).mock.results[0].value.search as jest.Mock;
+const esGetMappingMock = (Client as unknown as jest.Mock).mock.results[0].value.indices.getMapping as jest.Mock;
+
+/** The mapping the alias resolves to: one concrete index whose semantic fields name an endpoint. */
+const mappingOf = (index: string, inferenceId: string) => ({
+    [index]: { mappings: { properties: { name: { type: 'text', fields: { semantic: { type: 'semantic_text', inference_id: inferenceId } } } } } },
+});
 
 /** The SearchRequest that reached the query builder — what the search actually ran. */
 const requestSentToElasticsearch = (): SearchRequest => buildSearchQueryMock.mock.calls[0][0];
@@ -74,6 +83,8 @@ const requestSentToElasticsearch = (): SearchRequest => buildSearchQueryMock.moc
 beforeEach(() => {
     jest.clearAllMocks();
     cacheEntries.clear();
+    resetIndexProfileCache();
+    esGetMappingMock.mockResolvedValue(mappingOf('subjects-test', '.jina-embeddings-v5-text-small'));
     esSearchMock.mockResolvedValue({ hits: { total: { value: 0, relation: 'eq' }, hits: [] }, took: 1 });
     getCitiesMock.mockResolvedValue(REALM_CITIES.map(id => ({ id })) as never);
     getListedCitiesCachedMock.mockResolvedValue(REALM_CITIES.map(id => ({ id })) as never);
@@ -149,6 +160,37 @@ describe('searchInRealm — extraction is advisory', () => {
         await searchInRealm({ query: 'προϋπολογισμός πέρσι' }, 'greece');
 
         expect(requestSentToElasticsearch().dateRange).toEqual(derived);
+    });
+
+    // The map's quick-range pill is a default window, not a period the reader
+    // typed: it applies when nothing else names one, and a period in the text
+    // still wins over it (and is reported back, so the pill moves to match).
+    it('searches the fallback window when neither the caller nor the text names a period', async () => {
+        const fallback = { start: '2026-09-21T14:03:12.000Z', end: '2026-10-05T14:03:12.000Z' };
+
+        await searchInRealm({ query: 'παιδικοί σταθμοί', fallbackDateRange: fallback }, 'greece');
+
+        expect(requestSentToElasticsearch().dateRange).toEqual(fallback);
+    });
+
+    it('lets a period read from the text replace the fallback window', async () => {
+        const fallback = { start: '2026-09-21T14:03:12.000Z', end: '2026-10-05T14:03:12.000Z' };
+        const derived = { start: '2026-02-01T00:00:00.000Z', end: '2026-02-28T23:59:59.999Z' };
+        processFiltersMock.mockResolvedValue({ cityIds: undefined, dateRange: derived, locations: undefined });
+
+        const response = await searchInRealm({ query: 'παιδικοί σταθμοί τον Φεβρουάριο', fallbackDateRange: fallback }, 'greece');
+
+        expect(requestSentToElasticsearch().dateRange).toEqual(derived);
+        expect(response.derivedFilters).toEqual({ dateRange: derived });
+    });
+
+    it('lets a date range the caller set replace the fallback window', async () => {
+        const fallback = { start: '2026-09-21T14:03:12.000Z', end: '2026-10-05T14:03:12.000Z' };
+        const callerRange = { start: '2026-01-01T00:00:00.000Z', end: '2026-01-31T23:59:59.999Z' };
+
+        await searchInRealm({ query: 'παιδικοί σταθμοί', dateRange: callerRange, fallbackDateRange: fallback, config: { extractFilters: false } }, 'greece');
+
+        expect(requestSentToElasticsearch().dateRange).toEqual(callerRange);
     });
 
     // An empty city list means "no city filter" to buildFilters, so an empty
@@ -387,6 +429,26 @@ describe('search matches cross the retrieval/hydration seam', () => {
     });
 });
 
+describe('searchSubjectsInRealm — the resolved index is gone', () => {
+    it('re-reads the alias and searches again, and alerts on any other failure', async () => {
+        esGetMappingMock
+            .mockResolvedValueOnce(mappingOf('subjects-2026-08', 'opencouncil-multilingual-e5-small-elasticsearch'))
+            .mockResolvedValueOnce(mappingOf('subjects-2026-10', '.jina-embeddings-v5-text-small'));
+        esSearchMock
+            .mockRejectedValueOnce({ meta: { body: { error: { type: 'index_not_found_exception' } } } })
+            .mockResolvedValueOnce({ hits: { total: { value: 0, relation: 'eq' }, hits: [] }, took: 1 });
+
+        await searchSubjectsInRealm({ query: 'πάρκα' }, 'greece');
+
+        expect(buildSearchQueryMock.mock.calls.map(call => call[3]?.index)).toEqual(['subjects-2026-08', 'subjects-2026-10']);
+        expect(sendErrorAdminAlertMock).not.toHaveBeenCalled();
+
+        esSearchMock.mockRejectedValueOnce({ meta: { body: { error: { type: 'search_phase_execution_exception' } } } });
+        await expect(searchSubjectsInRealm({ query: 'πάρκα' }, 'greece')).rejects.toBeDefined();
+        expect(sendErrorAdminAlertMock).toHaveBeenCalledTimes(1);
+    });
+});
+
 describe('searchSubjectsInRealm — failure alert', () => {
     // A filter the alert leaves out is a filter the person on call cannot see
     // when that filter is what Elasticsearch rejected.
@@ -414,7 +476,7 @@ describe('searchRelatedSubjectsInRealm', () => {
     it('caps the query to the realm and passes the scope through', async () => {
         await searchRelatedSubjectsInRealm(SEED, 'other', 'greece');
 
-        expect(buildRelatedSubjectsQueryMock).toHaveBeenCalledWith(SEED, 'other', REALM_CITIES);
+        expect(buildRelatedSubjectsQueryMock).toHaveBeenCalledWith(SEED, 'other', REALM_CITIES, expect.objectContaining({ index: 'subjects-test', relatedMinSimilarity: 0.75 }));
         expect(esSearchMock).toHaveBeenCalled();
     });
 
@@ -428,9 +490,40 @@ describe('searchRelatedSubjectsInRealm', () => {
 
         expect(createCacheMock).toHaveBeenCalledWith(
             expect.any(Function),
-            ['subject', 'seed', 'related', 'city', 'greece', '0.93', '5', 'subjects-test'],
+            ['subject', 'seed', 'related', 'city', 'greece', '0.75', '5', 'subjects-test'],
             { tags: ['cities:all', 'city:athens:meeting:meeting-1', 'city:athens:meetings'], revalidate: 86400 },
         );
+    });
+
+    // The alias moves to a rebuilt index without a deploy. Until it moves, the
+    // old index embeds with the old model, so its floor applies, the query
+    // names it, and its name keys the entries; after the swap all three
+    // change together, and the old entries retire.
+    it('queries, keys and gates by the index the alias serves, not by the build', async () => {
+        esGetMappingMock.mockResolvedValue(mappingOf('subjects-2026-08', 'opencouncil-multilingual-e5-small-elasticsearch'));
+
+        await searchRelatedSubjectsInRealm(SEED, 'city', 'greece');
+
+        expect(buildRelatedSubjectsQueryMock).toHaveBeenCalledWith(SEED, 'city', REALM_CITIES, expect.objectContaining({ index: 'subjects-2026-08', relatedMinSimilarity: 0.93 }));
+        expect(createCacheMock.mock.calls[0][1]).toEqual(['subject', 'seed', 'related', 'city', 'greece', '0.93', '5', 'subjects-2026-08']);
+    });
+
+    // The index a profile names can be deleted before the next refresh. The
+    // answer from Elasticsearch names the condition; the stale profile goes
+    // and the request runs once more under what the alias serves now.
+    it('re-reads the alias and runs again when the resolved index is gone', async () => {
+        esGetMappingMock
+            .mockResolvedValueOnce(mappingOf('subjects-2026-08', 'opencouncil-multilingual-e5-small-elasticsearch'))
+            .mockResolvedValueOnce(mappingOf('subjects-2026-10', '.jina-embeddings-v5-text-small'));
+        esSearchMock
+            .mockRejectedValueOnce({ meta: { body: { error: { type: 'index_not_found_exception' } } } })
+            .mockResolvedValueOnce({ hits: { total: { value: 0, relation: 'eq' }, hits: [] }, took: 1 });
+
+        await searchRelatedSubjectsInRealm(SEED, 'city', 'greece');
+
+        expect(buildRelatedSubjectsQueryMock.mock.calls.map(call => call[3]?.index)).toEqual(['subjects-2026-08', 'subjects-2026-10']);
+        expect(createCacheMock.mock.calls.map(call => call[1][7])).toEqual(['subjects-2026-08', 'subjects-2026-10']);
+        expect(sendErrorAdminAlertMock).not.toHaveBeenCalled();
     });
 
     it('tags the other scope with the meetings of every other municipality of the realm', async () => {
@@ -438,7 +531,7 @@ describe('searchRelatedSubjectsInRealm', () => {
 
         expect(createCacheMock).toHaveBeenCalledWith(
             expect.any(Function),
-            ['subject', 'seed', 'related', 'other', 'greece', '0.93', '5', 'subjects-test'],
+            ['subject', 'seed', 'related', 'other', 'greece', '0.75', '5', 'subjects-test'],
             {
                 tags: ['cities:all', 'city:athens:meeting:meeting-1', 'city:chania:meetings', 'city:argos:meetings'],
                 revalidate: 86400,
@@ -532,5 +625,38 @@ describe('searchRelatedSubjectsInRealm', () => {
         const results = await searchRelatedSubjectsInRealm(SEED, 'city', 'greece');
 
         expect(results.map(r => [r.id, r.score])).toEqual([['near', 0.95], ['far', 0.94]]);
+    });
+});
+
+describe('searchInRealm — calendar days of the date range', () => {
+    const getCityTimezoneMock = getCityTimezone as jest.MockedFunction<typeof getCityTimezone>;
+
+    it('reads the days in the zone of the one searched city', async () => {
+        getCityTimezoneMock.mockResolvedValue('Europe/Belgrade');
+
+        await searchInRealm({ cityIds: ['athens'], dateRange: { start: '2026-01-10', end: '2026-01-11' } }, 'greece');
+
+        expect(getCityTimezoneMock).toHaveBeenCalledWith('athens');
+        expect(requestSentToElasticsearch().dateRange)
+            .toEqual({ start: '2026-01-09T23:00:00.000Z', end: '2026-01-11T22:59:59.999Z' });
+    });
+
+    it('reads the days in DEFAULT_TIMEZONE for more than one city', async () => {
+        await searchInRealm({ query: 'πάρκα', dateRange: { start: '2026-01-10', end: '2026-01-11' } }, 'greece');
+
+        expect(getCityTimezoneMock).not.toHaveBeenCalled();
+        expect(requestSentToElasticsearch().dateRange)
+            .toEqual({ start: '2026-01-09T22:00:00.000Z', end: '2026-01-11T21:59:59.999Z' });
+    });
+
+    it('reads the days of a range that the query text supplied', async () => {
+        processFiltersMock.mockResolvedValue({
+            cityIds: undefined, dateRange: { start: '2025-01-01', end: '2025-12-31' }, locations: undefined,
+        });
+
+        await searchInRealm({ query: 'προϋπολογισμός πέρσι' }, 'greece');
+
+        expect(requestSentToElasticsearch().dateRange)
+            .toEqual({ start: '2024-12-31T22:00:00.000Z', end: '2025-12-31T21:59:59.999Z' });
     });
 });

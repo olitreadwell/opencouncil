@@ -25,6 +25,7 @@ jest.mock('../api/errors', () => {
 
 jest.mock('../auth', () => ({
   withUserAuthorizedToEdit: jest.fn(),
+  getCurrentUser: jest.fn(),
 }));
 
 jest.mock('../db/prisma', () => ({
@@ -32,6 +33,7 @@ jest.mock('../db/prisma', () => ({
   default: {
     user: {
       findMany: jest.fn(),
+      findFirst: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
       delete: jest.fn(),
@@ -45,10 +47,12 @@ jest.mock('../db/prisma', () => ({
 }));
 
 import prisma from '../db/prisma';
-import { withUserAuthorizedToEdit } from '../auth';
-import { createUser, updateUser, deleteUser } from '../db/users';
+import { withUserAuthorizedToEdit, getCurrentUser } from '../auth';
+import { createUser, updateUser, deleteUser, deleteCurrentUser } from '../db/users';
 
 const mockWithUserAuthorizedToEdit = withUserAuthorizedToEdit as jest.MockedFunction<typeof withUserAuthorizedToEdit>;
+const mockGetCurrentUser = getCurrentUser as jest.MockedFunction<typeof getCurrentUser>;
+const mockFindFirst = prisma.user.findFirst as jest.MockedFunction<typeof prisma.user.findFirst>;
 const mockCreate = prisma.user.create as jest.MockedFunction<typeof prisma.user.create>;
 const mockUpdate = prisma.user.update as jest.MockedFunction<typeof prisma.user.update>;
 const mockDelete = prisma.user.delete as jest.MockedFunction<typeof prisma.user.delete>;
@@ -60,6 +64,8 @@ describe('users db layer - normalization and duplicate handling', () => {
     jest.spyOn(console, 'error').mockImplementation(() => {});
 
     mockWithUserAuthorizedToEdit.mockResolvedValue(true);
+    // No machine account behind any id unless a test says so.
+    mockFindFirst.mockResolvedValue(null);
 
     const mockedUser = {
       id: 'user-1',
@@ -122,35 +128,11 @@ describe('users db layer - normalization and duplicate handling', () => {
       ).rejects.toThrow('A user with this email already exists.');
     });
 
-    it('skips auth check when skipAuthCheck is enabled and dev tools are allowed', async () => {
-      const prev = process.env.DEPLOYMENT_ENV;
-      process.env.DEPLOYMENT_ENV = 'development';
-      try {
-        await createUser(
-          {
-            email: 'skip-auth@example.com',
-          },
-          { skipAuthCheck: true }
-        );
-
-        expect(mockWithUserAuthorizedToEdit).not.toHaveBeenCalled();
-      } finally {
-        process.env.DEPLOYMENT_ENV = prev;
-      }
-    });
-
-    it('rejects skipAuthCheck when dev tools are not allowed (production)', async () => {
-      const prev = process.env.DEPLOYMENT_ENV;
-      process.env.DEPLOYMENT_ENV = 'production';
-      try {
-        await expect(
-          createUser({ email: 'skip-auth-prod@example.com' }, { skipAuthCheck: true })
-        ).rejects.toThrow('skipAuthCheck is only permitted');
-        // The bypass must not create the user.
-        expect(prisma.user.create).not.toHaveBeenCalled();
-      } finally {
-        process.env.DEPLOYMENT_ENV = prev;
-      }
+    it('checks authorization even when a caller passes the retired skipAuthCheck option', async () => {
+      // This is a "use server" module, so a client can call it with any arguments.
+      const callAsClient = createUser as (...args: unknown[]) => Promise<unknown>;
+      await callAsClient({ email: 'skip-auth@example.com' }, { skipAuthCheck: true });
+      expect(mockWithUserAuthorizedToEdit).toHaveBeenCalledWith({});
     });
 
     it('throws BadRequestError for empty email', async () => {
@@ -282,6 +264,42 @@ describe('users db layer - normalization and duplicate handling', () => {
           administers: [{ cityId: 'city-1' }],
         })
       ).rejects.toThrow('Failed to update user');
+    });
+  });
+
+  describe('machine accounts', () => {
+    const MACHINE = { id: 'bot-1', name: 'Paola', email: 'paola@machines.opencouncil.invalid' };
+
+    it('never gives a person an address of the machine domain', async () => {
+      await expect(createUser({ email: 'me@machines.opencouncil.invalid' })).rejects.toThrow('reserved');
+      await expect(updateUser('user-1', { email: 'me@machines.opencouncil.invalid' })).rejects.toThrow('reserved');
+      expect(mockCreate).not.toHaveBeenCalled();
+      expect(mockUpdate).not.toHaveBeenCalled();
+    });
+
+    it('keeps the address of a machine account, and lets its name and rights change', async () => {
+      mockFindFirst.mockResolvedValue(MACHINE as unknown as Awaited<ReturnType<typeof prisma.user.findFirst>>);
+
+      await expect(updateUser('bot-1', { email: 'paola@example.com' })).rejects.toThrow('cannot change');
+      expect(mockUpdate).not.toHaveBeenCalled();
+
+      await updateUser('bot-1', { name: 'Paola 2', isSuperAdmin: false });
+      expect(mockUpdate).toHaveBeenCalledWith(expect.objectContaining({ data: { name: 'Paola 2', isSuperAdmin: false } }));
+    });
+
+    it('writes only the fields of the form, so a direct call cannot turn a person into a machine account', async () => {
+      // updateUser is a Server Action: a client can post any object to it.
+      await updateUser('user-1', { name: 'Anna', isMachine: true } as unknown as Parameters<typeof updateUser>[1]);
+      expect(mockUpdate.mock.calls[0][0].data).not.toHaveProperty('isMachine');
+    });
+
+    it('refuses to delete a machine account, from the admin and from the account itself', async () => {
+      mockFindFirst.mockResolvedValue(MACHINE as unknown as Awaited<ReturnType<typeof prisma.user.findFirst>>);
+      await expect(deleteUser('bot-1')).rejects.toThrow('retired by revoking its tokens');
+
+      mockGetCurrentUser.mockResolvedValue({ id: 'bot-1', isMachine: true } as unknown as Awaited<ReturnType<typeof getCurrentUser>>);
+      await expect(deleteCurrentUser()).rejects.toThrow('retired by revoking its tokens');
+      expect(mockDelete).not.toHaveBeenCalled();
     });
   });
 

@@ -9,21 +9,33 @@ import { taskScope } from "./types";
 import { after } from "next/server";
 import { generateImagesForMeeting } from "../subjectImages";
 import { requestProcessAgendaInternal } from "./processAgendaInternal";
-import { meetingLabelInCity } from '@/lib/meetingName';
+import { meetingLabelInCity, meetingNameInCity } from '@/lib/meetingName';
 import { recordsGreekCodeFacts } from '@/lib/meetingLifecycleRules';
-import { checkAgendaIdentity } from '@/lib/agendaMeetingRecord';
+import { checkAgendaIdentity, describeAgendaRead, type AgendaRecordReconciliation } from '@/lib/agendaMeetingRecord';
 import { formatClockTime, localCalendarDate } from '@/lib/formatters/time';
+import { errorMessage } from '@/lib/utils/errors';
+import { sendAgendaReadingAlert, sendTaskAdminAlert } from '@/lib/discord';
+import { webUrl } from '@/lib/zod-schemas/primitives';
 
 /**
  * User-facing Server Action that checks authorization before processing.
+ * A rejected URL comes back as a value: production Next hides the message of
+ * an error that a Server Action throws.
  */
 export async function requestProcessAgenda(agendaUrl: string, councilMeetingId: string, cityId: string, {
     force = false
 }: {
     force?: boolean;
-} = {}) {
+} = {}): Promise<{ ok: true } | { ok: false; message: string }> {
     await withUserAuthorizedToEdit(taskScope({ type: 'processAgenda', cityId, councilMeetingId }));
-    return requestProcessAgendaInternal(agendaUrl, councilMeetingId, cityId, { force });
+    // The task server fetches this URL, so the same rule as the REST and MCP
+    // paths applies: http(s) only.
+    const url = webUrl().safeParse(agendaUrl);
+    if (!url.success) {
+        return { ok: false, message: 'The agenda URL must start with http:// or https://' };
+    }
+    await requestProcessAgendaInternal(url.data, councilMeetingId, cityId, { force });
+    return { ok: true };
 }
 
 export async function handleProcessAgendaResult(taskId: string, response: ProcessAgendaResult) {
@@ -60,6 +72,10 @@ export async function handleProcessAgendaResult(taskId: string, response: Proces
             `processAgenda result for task ${taskId} has no subjects array (got ${typeof response?.subjects}); ` +
             `skipping subject replacement to avoid data loss. Task remains succeeded.`
         );
+        await reportAgenda(taskId, task.councilMeeting, {
+            details: [{ name: 'Subjects', value: 'not replaced: the result holds no subjects array', inline: true }],
+            problems: [],
+        });
         return;
     }
 
@@ -113,22 +129,38 @@ export async function handleProcessAgendaResult(taskId: string, response: Proces
         { pruneUnmatched: true }
     );
 
-    // Before the cache and the notifications below: the kind is part of the
-    // derived name that both of them show.
+    // Before the cache and the success alert below: the kind is part of the
+    // derived name that the meeting page and the alert show.
     // The subjects are saved: nothing here may fail the task.
+    let written: AgendaRecordReconciliation['patch'] = {};
+    let problems: string[] = [];
     if (greek && (response.meetingRecord || (response.meetingsInAgenda?.length ?? 0) > 1 || identityDifferences.length > 0)) {
         try {
             const { applyAgendaMeetingRecord } = await import('./applyAgendaMeetingRecord');
-            Object.assign(task.councilMeeting, await applyAgendaMeetingRecord(task.councilMeeting, response.meetingRecord ?? null, response.meetingsInAgenda ?? [], identityDifferences));
+            const applied = await applyAgendaMeetingRecord(task.councilMeeting, response.meetingRecord ?? null, response.meetingsInAgenda ?? [], identityDifferences);
+            Object.assign(task.councilMeeting, applied.written);
+            written = applied.written;
+            problems = applied.problems;
         } catch (error) {
             console.error(`processAgenda could not apply the meeting record of ${task.councilMeeting.cityId}/${task.councilMeeting.id}:`, error);
+            problems = [`the meeting record was not applied: ${errorMessage(error)}`];
         }
     }
+    // The task's own success alert (discordAlertMode: handlerReportsSuccess),
+    // after the write, so that it names the meeting by its new title.
+    await reportAgenda(taskId, task.councilMeeting, {
+        details: [
+            ...(greek && response.meetingRecord
+                ? [{ name: 'From the invitation', value: describeAgendaRead(response.meetingRecord, written) }]
+                : []),
+            { name: 'Subjects', value: String(subjects.length), inline: true },
+        ],
+        problems,
+    });
 
-    // Bust the meeting/subject cache now that the new agenda subjects are persisted,
-    // BEFORE sending notifications below. The notification send is rate-limited
-    // (~500ms/recipient), so revalidating only after it finishes would let early
-    // recipients open the meeting and see stale content.
+    // Bust the meeting/subject cache now that the new agenda subjects are
+    // persisted. The notifications follow once the task reads as succeeded
+    // (tasks.ts), so their first readers open the new content.
     revalidateMeeting(task.councilMeeting.cityId, task.councilMeeting.id);
 
     // Illustrations for the agenda subjects, days before the meeting. Through
@@ -136,60 +168,39 @@ export async function handleProcessAgendaResult(taskId: string, response: Proces
     // calls must outlive the response rather than escape it. Each failure
     // alerts on its own.
     after(() => generateImagesForMeeting(task.councilMeeting.cityId, task.councilMeeting.id));
+}
 
-    // Create notifications if administrative body allows it
-    const adminBody = task.councilMeeting.administrativeBody;
-    if (adminBody && adminBody.notificationBehavior !== 'NOTIFICATIONS_DISABLED') {
-        const { createNotificationsForMeeting } = await import('../db/notifications');
-        const { releaseNotifications } = await import('../notifications/deliver');
-        const { sendNotificationsCreatedAdminAlert, sendNotificationsSentAdminAlert } = await import('../discord');
-
-        try {
-            const stats = await createNotificationsForMeeting(
-                task.councilMeeting.cityId,
-                task.councilMeeting.id,
-                'beforeMeeting'
-            );
-
-            console.log(`Created ${stats.notificationsCreated} beforeMeeting notifications for ${stats.subjectsTotal} subjects`);
-
-            const autoSend = adminBody.notificationBehavior === 'NOTIFICATIONS_AUTO';
-
-            // Send Discord admin alert about notification creation
-            if (stats.notificationsCreated > 0) {
-                sendNotificationsCreatedAdminAlert({
-                    cityName: task.councilMeeting.city.name_en,
-                    meetingName: meetingLabelInCity(task.councilMeeting, 'el'),
-                    notificationType: 'beforeMeeting',
-                    notificationsCreated: stats.notificationsCreated,
-                    subjectsTotal: stats.subjectsTotal,
-                    cityId: task.councilMeeting.cityId,
-                    meetingId: task.councilMeeting.id,
-                    autoSend
-                });
-            }
-
-            // If auto-send is enabled, release notifications immediately
-            if (autoSend) {
-                console.log('Auto-sending notifications...');
-                const releaseResult = await releaseNotifications(stats.notificationIds);
-                console.log(`Released notifications: ${releaseResult.emailsSent} emails`);
-
-                // Send Discord admin alert about sending
-                sendNotificationsSentAdminAlert({
-                    cityId: task.councilMeeting.cityId,
-                    meetingId: task.councilMeeting.id,
-                    cityName: task.councilMeeting.city.name_en,
-                    meetingName: meetingLabelInCity(task.councilMeeting, 'el'),
-                    notificationCount: stats.notificationsCreated,
-                    emailsSent: releaseResult.emailsSent,
-                    failed: releaseResult.failed,
-                    leftPending: releaseResult.leftPending
-                });
-            }
-        } catch (error) {
-            console.error('Error creating notifications after processAgenda:', error);
-            // Don't throw - we don't want to fail the entire task if notifications fail
+/**
+ * The success alert of the task, in the format of every task alert, with what
+ * the result held. A problem for a person to decide goes in its own alert.
+ */
+async function reportAgenda(
+    taskId: string,
+    meeting: Parameters<typeof meetingNameInCity>[0] & { id: string; cityId: string; city: { name_en: string } },
+    { details, problems }: { details: { name: string; value: string; inline?: boolean }[]; problems: string[] },
+) {
+    // The subjects are saved: an alert that fails must not fail the task.
+    try {
+        await sendTaskAdminAlert({
+            status: 'completed',
+            taskType: 'processAgenda',
+            cityName: meeting.city.name_en,
+            meetingName: meetingLabelInCity(meeting, 'en'),
+            taskId,
+            cityId: meeting.cityId,
+            meetingId: meeting.id,
+            details,
+        });
+        if (problems.length > 0) {
+            await sendAgendaReadingAlert({
+                cityId: meeting.cityId,
+                cityName: meeting.city.name_en,
+                meetingId: meeting.id,
+                meetingName: meetingNameInCity(meeting, 'el'),
+                problems,
+            });
         }
+    } catch (error) {
+        console.error('Failed to send the processAgenda alerts:', error);
     }
 }

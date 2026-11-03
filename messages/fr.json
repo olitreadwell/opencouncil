@@ -60,6 +60,7 @@
     "adminBodyType_community": "Communautés",
     "allPeople": "Tous",
     "allBodies": "Tous",
+    "pagination": "Pages",
     "backToHome": "Retour à l'accueil",
     "loadingError": "Erreur de chargement",
     "all": "Tout",
@@ -116,6 +117,9 @@
     }
   },
   "Footer": {
+    "selectCountry": "Choisir un pays",
+    "searchCountry": "Rechercher un pays",
+    "noCountries": "Aucun pays trouvé.",
     "tagline": "Conçu avec respect et considération pour les collectivités locales.",
     "companyDescription": "OpenCouncil est une société de <link>Schema Labs</link>, une organisation à but non lucratif qui développe des technologies au service de la démocratie.",
     "linksHeading": "Liens",
@@ -189,10 +193,7 @@
     "realmDescription": "Le groupe/locataire auquel appartient cette commune.",
     "language": "Langue",
     "selectLanguage": "Sélectionnez la langue",
-    "languageDescription": "La langue de contenu de cette commune (métadonnée uniquement ; ne change pas la langue de l'interface).",
-    "languageGreek": "Grec",
-    "languageFrench": "Français",
-    "languageSerbian": "Serbe",
+    "languageDescription": "La langue dans laquelle le conseil siège. Elle fixe la langue de la transcription et des résumés ; elle ne change pas la langue de l'interface.",
     "adminSettings": "Paramètres d'administration",
     "status": "Statut",
     "selectStatus": "Sélectionnez un statut",
@@ -709,7 +710,6 @@
   },
   "CouncilMeeting": {
     "items": "{count, plural, =0 {Aucune séance} =1 {1 séance} other {# séances}}",
-    "itemsCapped": "Les {count} plus récentes",
     "pages": {
       "overview": "Aperçu",
       "map": "Carte",
@@ -878,6 +878,23 @@
     "adminParty": "Gérer le groupe",
     "adminPerson": "Gérer le membre",
     "adminBody": "Gérer l'organe"
+  },
+  "ReportForm": {
+    "title": "Créer un rapport d’avancement",
+    "city": "Commune",
+    "selectCity": "Sélectionnez une commune",
+    "searchCity": "Rechercher une commune...",
+    "noCityFound": "Aucune commune trouvée.",
+    "contractReference": "Numéro de contrat",
+    "contractReferencePlaceholder": "ex. 25SYMV01234567",
+    "period": "Période",
+    "halfYear": "Semestre {number}",
+    "months": "{count} mois",
+    "generating": "Génération...",
+    "generate": "Créer le rapport (.docx)",
+    "success": "Rapport créé avec succès",
+    "error": "Erreur",
+    "failed": "Échec de la génération du rapport"
   },
   "OfferForm": {
     "success": "Succès",
@@ -1074,6 +1091,7 @@
     "noContributions": "Aucune contribution d'intervenant",
     "unknownSpeaker": "Intervenant inconnu",
     "noStatements": "Aucune intervention d'orateur",
+    "noStatementsByCirculation": "Lors d’une séance par consultation écrite, les membres votent par écrit, sans débat. Il n’y a donc pas d’interventions.",
     "relatedSubjects": "Sujets liés",
     "relatedOtherCities": "Autres communes",
     "relatedSeeMore": "Voir plus dans la recherche",

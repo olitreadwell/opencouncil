@@ -3,10 +3,9 @@ import { type City, type Party, type Person, type CouncilMeeting, type Administr
 import { cache } from "react";
 import { auth } from "@/auth";
 import prisma from "@/lib/db/prisma";
-import { validateServiceApiKey } from "@/lib/db/apiKeys";
-import { ForbiddenError, UnauthorizedError } from "@/lib/api/errors";
-import { type NextRequest } from "next/server";
+import { notAuthorizedError } from "@/lib/api/errors";
 import { type UnreleasedScope, NO_UNRELEASED, ALL_UNRELEASED } from "@/lib/unreleased";
+import { publicAdministrativeBodyRelation } from "@/lib/db/types";
 
 // Request-scoped so the many call sites that each need the viewer — a page and
 // the queries it calls — resolve the session and the user row once per request.
@@ -22,7 +21,7 @@ const currentUser = cache(async () => {
                     city: true,
                     party: true,
                     person: true,
-                    administrativeBody: true,
+                    administrativeBody: publicAdministrativeBodyRelation,
                 }
             }
         }
@@ -191,9 +190,10 @@ export async function withUserAuthorizedToEdit(scope: AuthorizationScope) {
     const isAuthorized = await checkUserAuthorization(scope);
 
     if (!isAuthorized) {
-        // An ApiError, so a route that answers through handleApiError says 403
-        // and not 500. The message stays: callers match on it.
-        throw new ForbiddenError("Not authorized");
+        // An ApiError, so a route that answers through handleApiError says 401
+        // without a session and 403 without the right. getCurrentUser is
+        // cached per request, so this reads no row again.
+        throw notAuthorizedError(Boolean(await getCurrentUser()));
     }
 
     return true;
@@ -227,55 +227,4 @@ export async function getRoleLimitForCity(cityId: City["id"]): Promise<ReadonlyS
     if (!user) return new Set();
     if (user.isSuperAdmin || administersCity(user, cityId)) return null;
     return new Set(heldBodyIdsInCity(user, cityId));
-}
-
-export type ServiceAuthResult =
-    | { type: 'service'; keyName: string }
-    | { type: 'user'; userId: string };
-
-/**
- * Validate a service API key from the `Authorization: Bearer …` header.
- * Returns `null` if no Bearer header is present (caller may fall back to session auth).
- * Throws `UnauthorizedError` if the Bearer token is invalid or revoked — never falls through.
- */
-export async function validateBearerAuth(
-    request: NextRequest
-): Promise<{ keyName: string } | null> {
-    const authHeader = request.headers.get('authorization');
-    if (!authHeader?.startsWith('Bearer ')) return null;
-
-    const token = authHeader.slice(7);
-    const apiKey = await validateServiceApiKey(token);
-    if (!apiKey) throw new UnauthorizedError("Invalid API key");
-
-    return { keyName: apiKey.name };
-}
-
-/**
- * Authenticate a request via either a service API key (Bearer token)
- * or a user session. Service keys get full access (equivalent to superadmin).
- * User sessions are checked against the standard authorization hierarchy.
- *
- * Throws if neither auth method succeeds.
- */
-export async function withServiceOrUserAuth(
-    request: NextRequest,
-    scope: AuthorizationScope = {}
-): Promise<ServiceAuthResult> {
-    const bearer = await validateBearerAuth(request);
-    if (bearer) {
-        return { type: 'service', keyName: bearer.keyName };
-    }
-
-    // Fall back to session auth — reuse the result to avoid a second DB round-trip
-    const isAuthorized = await checkUserAuthorization(scope);
-    if (!isAuthorized) {
-        throw new UnauthorizedError("Not authorized");
-    }
-
-    // checkUserAuthorization already verified the user exists and is authorized,
-    // so getCurrentUser() is guaranteed to return non-null here. However this is
-    // still a second DB call. TODO: refactor checkUserAuthorization to return the user.
-    const user = await getCurrentUser();
-    return { type: 'user', userId: user!.id };
 }

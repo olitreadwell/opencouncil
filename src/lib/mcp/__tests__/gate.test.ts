@@ -16,10 +16,10 @@ jest.mock('../../db/prisma', () => ({
 }));
 
 import { requirePublicTranscript, requireVisibleMeeting } from '../gate';
+import { mcpRealmStore, requestContext } from '../realm-context';
 import { ForbiddenError, NotFoundError } from '../../api/errors';
 
-const USER = { type: 'user', userId: 'u1' } as const;
-const SERVICE = { type: 'service', keyName: 'bot' } as const;
+const USER = { userId: 'u1' } as const;
 
 /** The row that the gate selects, and the payload that it returns for it. */
 function row(released: boolean) {
@@ -33,7 +33,7 @@ function row(released: boolean) {
         videoUrl: null,
         administrativeBody: { name: 'Δημοτικό Συμβούλιο', name_en: 'Municipal Council', showUnreviewedTranscript: true },
         taskStatuses: [],
-        city: { timezone: 'Europe/Athens' },
+        city: { timezone: 'Europe/Athens', realm: 'greece', language: 'el' },
     };
 }
 function payload(released: boolean, editor: boolean | null) {
@@ -41,6 +41,8 @@ function payload(released: boolean, editor: boolean | null) {
         released,
         dateTime: new Date('2026-05-12T18:00:00Z'),
         name: 'Δημοτικό Συμβούλιο · Τακτική Συνεδρίαση · 12/05/2026',
+        locale: 'el',
+        contentLanguage: 'el',
         videoUrl: null,
         administrativeBody: { name: 'Δημοτικό Συμβούλιο' },
         publicTranscript: true,
@@ -58,7 +60,6 @@ describe('requireVisibleMeeting', () => {
         mockMeetingFindFirst.mockResolvedValue(row(true));
         await expect(requireVisibleMeeting('athens', 'm1', null)).resolves.toEqual(payload(true, null));
         await expect(requireVisibleMeeting('athens', 'm1', USER)).resolves.toEqual(payload(true, null));
-        await expect(requireVisibleMeeting('athens', 'm1', SERVICE)).resolves.toEqual(payload(true, null));
     });
 
     it('hides unreleased meetings from anonymous and unrelated users', async () => {
@@ -67,10 +68,8 @@ describe('requireVisibleMeeting', () => {
         await expect(requireVisibleMeeting('athens', 'm1', USER)).rejects.toThrow(NotFoundError);
     });
 
-    it('shows unreleased meetings to service identities and city editors', async () => {
+    it('shows unreleased meetings to city editors and superadmins', async () => {
         mockMeetingFindFirst.mockResolvedValue(row(false));
-        await expect(requireVisibleMeeting('athens', 'm1', SERVICE)).resolves.toEqual(payload(false, true));
-
         mockUserFindUnique.mockResolvedValue({ isSuperAdmin: false, administers: [{ cityId: 'athens' }] });
         await expect(requireVisibleMeeting('athens', 'm1', USER)).resolves.toEqual(payload(false, true));
 
@@ -109,15 +108,34 @@ describe('requireVisibleMeeting', () => {
         await expect(requireVisibleMeeting('athens', 'm1', USER)).rejects.toThrow(NotFoundError);
     });
 
+    it('names the meeting in the UI language of the realm of its city, as the site does', async () => {
+        // A Kraków meeting without a kind: the poland realm shows the city in English.
+        mockMeetingFindFirst.mockResolvedValue({
+            ...row(true),
+            dateTime: new Date('2026-10-20T15:00:00Z'),
+            kind: null,
+            administrativeBody: { name: 'Rada Miasta Krakowa', name_en: 'Kraków City Council', showUnreviewedTranscript: true },
+            city: { timezone: 'Europe/Warsaw', realm: 'poland', language: 'pl' },
+        });
+        await expect(requireVisibleMeeting('krakow', 'm1', null)).resolves.toMatchObject({
+            name: 'Kraków City Council · Meeting 20/10/2026',
+            locale: 'en',
+            contentLanguage: 'pl',
+        });
+
+        mockMeetingFindFirst.mockResolvedValue({ ...row(true), city: { timezone: 'Europe/Paris', realm: 'france' } });
+        await expect(requireVisibleMeeting('lyon', 'm1', null)).resolves.toMatchObject({ locale: 'fr' });
+    });
+
     it('reads the body of the meeting in the same query', async () => {
         mockMeetingFindFirst.mockResolvedValue(row(true));
         await requireVisibleMeeting('athens', 'm1', null);
-        expect(mockMeetingFindFirst.mock.calls[0][0].select).toMatchObject({ administrativeBodyId: true });
+        expect(mockMeetingFindFirst.mock.calls[0][0].select).toMatchObject({ administrativeBodyId: true, city: { select: { language: true } } });
     });
 
     it('404s missing meetings for everyone', async () => {
         mockMeetingFindFirst.mockResolvedValue(null);
-        await expect(requireVisibleMeeting('athens', 'nope', SERVICE)).rejects.toThrow(NotFoundError);
+        await expect(requireVisibleMeeting('athens', 'nope', USER)).rejects.toThrow(NotFoundError);
         await expect(requireVisibleMeeting('athens', 'nope', null)).rejects.toThrow(NotFoundError);
     });
 });
@@ -138,6 +156,26 @@ describe('realm scoping', () => {
         expect(where).toMatchObject({ cityId: 'athens', id: 'm1', city: { realm: 'greece' } });
     });
 });
+describe('realm scoping for a superadmin', () => {
+    const access = (superadmin: boolean) => ({ superadmin, cityIds: new Set<string>(), bodyIds: new Set<string>() });
+    const whereFor = async (superadmin: boolean) => {
+        mockMeetingFindFirst.mockResolvedValue(row(true));
+        await mcpRealmStore.run(requestContext('greece', null, USER, { adminAccess: access(superadmin) }), () =>
+            requireVisibleMeeting('krakow', 'm1', USER));
+        return mockMeetingFindFirst.mock.calls[0][0].where;
+    };
+
+    beforeEach(() => jest.clearAllMocks());
+
+    it('reaches a meeting of another realm', async () => {
+        expect(await whereFor(true)).toEqual({ cityId: 'krakow', id: 'm1' });
+    });
+
+    it('keeps an administrator who is not a superadmin in the realm of the request', async () => {
+        expect(await whereFor(false)).toMatchObject({ city: { realm: 'greece' } });
+    });
+});
+
 
 describe('the transcript of a visible meeting', () => {
     beforeEach(() => {

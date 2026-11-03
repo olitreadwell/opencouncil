@@ -4,7 +4,7 @@ import { captureEvent } from '@/lib/analytics/capture';
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import FormSheet from '../FormSheet';
 import PartyForm from './PartyForm';
-import { City, Person, Role, AdministrativeBody, AdministrativeBodyType } from '@prisma/client';
+import { City, Person, Role, AdministrativeBodyType } from '@prisma/client';
 import { ImageOrInitials } from '../ImageOrInitials';
 import { Button } from '../ui/button';
 import { PartyWithPersons } from '@/lib/db/parties';
@@ -15,7 +15,7 @@ import { toast } from '@/hooks/use-toast';
 import { Breadcrumb, BreadcrumbList, BreadcrumbItem, BreadcrumbLink, BreadcrumbSeparator } from '@/components/ui/breadcrumb';
 import { Link } from '@/i18n/routing';
 import { getLatestContributionsForParty } from '@/lib/db/contributions';
-import { ContributionForPerson } from '@/lib/db/types';
+import { ContributionForPerson, type PublicAdministrativeBody } from '@/lib/db/types';
 import { ContributionCard, ContributionCardSkeleton } from '@/components/meetings/subject/ContributionCard';
 import { isUserAuthorizedToEdit } from '@/lib/actions/auth';
 import { getAdministrativeBodyTypesForPeople, filterPersonByAdminBodyTypes } from '@/lib/utils/administrativeBodies';
@@ -61,11 +61,11 @@ function PartyMembersTab({
     party: PartyWithPersons,
     people: PersonWithRelations[],
     canEdit: boolean,
-    administrativeBodies: AdministrativeBody[]
+    administrativeBodies: PublicAdministrativeBody[]
 }) {
     const t = useTranslations('Party');
     const tCommon = useTranslations('Common');
-    const roleTitles = useRoleTitles();
+    const roleTitles = useRoleTitles(city.language);
     const [selectedTypes, setSelectedTypes] = useState<AdministrativeBodyType[]>([]);
 
     // The picker sits in the current-members header and offers the bodies those
@@ -140,6 +140,7 @@ function PartyMembersTab({
                             <PersonCard
                                 key={person.id}
                                 item={person}
+                                cityLanguage={city.language}
                                 editable={canEdit}
                                 analyticsSurface="party_members"
                             />
@@ -209,6 +210,7 @@ function PartyMembersTab({
 
 // Segments Tab Component
 function SegmentsTab({
+    cityLanguage,
     typeOptions,
     selectedType,
     onSelectType,
@@ -222,6 +224,7 @@ function SegmentsTab({
     allLabel,
     timezone
 }: {
+    cityLanguage: string,
     typeOptions: { value: AdministrativeBodyType; label: string }[],
     selectedType: AdministrativeBodyType | null,
     onSelectType: (type: AdministrativeBodyType | null) => void,
@@ -289,6 +292,7 @@ function SegmentsTab({
                                 transition={{ delay: 0.1 * index }}
                             >
                                 <ContributionCard
+                                    cityLanguage={cityLanguage}
                                     contribution={contribution}
                                     subjectId={contribution.subject.id}
                                     meeting={{
@@ -360,7 +364,7 @@ function SegmentsTab({
 export default function PartyC({ city, party, administrativeBodies, seatTotals }: {
     city: City,
     party: PartyWithPersons,
-    administrativeBodies: AdministrativeBody[],
+    administrativeBodies: PublicAdministrativeBody[],
     /** Every active seat in the city, per type of body — the whole each composition bar measures against. */
     seatTotals: BodySeatTotals,
 }) {
@@ -433,14 +437,14 @@ export default function PartyC({ city, party, administrativeBodies, seatTotals }
                 setIsLoadingContributions(true);
                 setContributions([]);
                 setPage(1);
-                const { results, totalCount } = await getLatestContributionsForParty(
+                const { results, total } = await getLatestContributionsForParty(
                     party.id,
                     1,
                     5,
                     selectedAdminBodyType
                 );
                 setContributions(results);
-                setTotalCount(totalCount);
+                setTotalCount(total);
             } catch (error) {
                 console.error('Error fetching contributions:', error);
             } finally {
@@ -664,6 +668,7 @@ export default function PartyC({ city, party, administrativeBodies, seatTotals }
 
                             <TabsContent value="contributions" className="mt-6">
                                 <SegmentsTab
+                                    cityLanguage={city.language}
                                     typeOptions={typeOptions}
                                     selectedType={selectedAdminBodyType}
                                     onSelectType={handleAdminBodyTypeSelect}

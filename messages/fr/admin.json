@@ -24,8 +24,6 @@
     "columnMeetings": "Séances",
     "columnPeople": "Personnes",
     "columnParties": "Groupes",
-    "languageGreek": "Grec",
-    "languageFrench": "Français",
     "cityCount": "{count, plural, one {# commune} other {# communes}}"
   },
   "taskStatus": {
@@ -69,6 +67,20 @@
     "noTasks": "Aucune tâche en cours d'exécution"
   },
   "adminActions": {
+    "releaseDialog": {
+      "title": "Publier cette séance ?",
+      "description": "La séance devient publique. Voici ce que reçoivent ses abonnés.",
+      "loading": "Vérification des notifications…",
+      "loadError": "La vérification des notifications a échoué. La publication les crée quand même si la séance est d'actualité.",
+      "email": "E-mail",
+      "notis": "WhatsApp (Notis)",
+      "emailSends": "{count, plural, one {# abonné reçoit} other {# abonnés reçoivent}} tout de suite une notification sur {phase}.",
+      "emailWaits": "{count, plural, one {# abonné reçoit} other {# abonnés reçoivent}} une notification sur {phase}. Elle attend dans Notifications qu'un administrateur l'approuve.",
+      "emailNoRecipients": "Aucun abonné ne reçoit de nouvelle notification sur {phase}.",
+      "notisEligible": "La séance peut recevoir un message de Notis sur {phase}, si Notis ne l'a pas déjà envoyé.",
+      "notisNone": "Aucun message de Notis : {reason}",
+      "confirm": "Publier"
+    },
     "sections": {
       "meetingDetails": "Gestion de la séance",
       "meetingDetailsSubtitle": "Modifiez les informations de base de cette séance.",
@@ -306,14 +318,7 @@
       "showRestMissing": "{n} sans décision",
       "showRestWithdrawn": "{n, plural, one {# retiré} other {# retirés}}",
       "showLess": "Afficher moins",
-      "empty": "Aucun sujet ne correspond à ce filtre.",
-      "result": {
-        "unanimous": "À l'unanimité",
-        "majority": "À la majorité",
-        "rejected": "Rejetée",
-        "none": "—",
-        "noVote": "—"
-      }
+      "empty": "Aucun sujet ne correspond à ce filtre."
     },
     "panel": {
       "adaTitle": "Ajouter une décision par ADA pour {subject}",
@@ -915,7 +920,7 @@
       },
       "decision_number": {
         "label": "decision number",
-        "description": "«απεχώρησε στην 286 ΑΚΣ»",
+        "description": "«απεχώρησε στην απόφαση 286»",
         "hint": ""
       },
       "phase": {
@@ -994,6 +999,59 @@
       "start": "Start a record",
       "choose": "Choose…",
       "draft": "New record, saved when you confirm it"
+    }
+  },
+  "machineAccounts": {
+    "title": "Comptes machine",
+    "lead": "Des comptes pour les services qui utilisent uniquement le MCP et agissent avec les droits que vous leur donnez ici.",
+    "create": "Nouveau compte machine",
+    "empty": "Aucun compte machine pour l'instant.",
+    "createdOn": "Créé le {date}",
+    "noActiveToken": "aucun jeton actif",
+    "rights": {
+      "superAdmin": "Super Admin",
+      "none": "Aucun droit"
+    },
+    "grantType": {
+      "city": "Commune",
+      "party": "Groupe",
+      "person": "Personne",
+      "body": "Organe"
+    },
+    "editRights": "Modifier les droits",
+    "newToken": "Nouveau jeton",
+    "creating": "Création…",
+    "never": "jamais",
+    "active": "Actif",
+    "new": "Nouveau",
+    "revokedOn": "Révoqué le {date}",
+    "revoke": "Révoquer",
+    "revokeToken": "Révoquer le jeton {prefix}…",
+    "revokeQuestion": "Révoquer ce jeton ?",
+    "revokeConfirm": "Oui, révoquer",
+    "revoking": "Révocation…",
+    "cancel": "Annuler",
+    "columns": {
+      "token": "Jeton",
+      "created": "Créé",
+      "lastUsed": "Dernière utilisation",
+      "status": "État",
+      "actions": "Actions"
+    },
+    "reveal": {
+      "title": "Nouveau jeton. Copiez-le maintenant : il n'est affiché que cette fois.",
+      "keep": "Il reste ici jusqu'à ce que vous cliquiez sur « Je l'ai copié ».",
+      "headerForm": "Adresse et jeton bearer (de préférence)",
+      "pathForm": "Pour les clients qui ne peuvent pas envoyer d'en-têtes",
+      "pathFormNote": "Les proxys et les journaux d'accès enregistrent cette forme. Préférez l'en-tête quand le client le permet.",
+      "warning": "Quiconque possède ce jeton agit dans le MCP avec les droits de ce compte. Conservez-le comme un mot de passe. Vous pouvez le révoquer à tout moment.",
+      "dismiss": "Je l'ai copié",
+      "copyAddress": "Copier l'adresse",
+      "copyToken": "Copier le jeton",
+      "copyPathForm": "Copier l'adresse avec le jeton"
+    },
+    "errors": {
+      "failed": "L'action a échoué. Rechargez la page et réessayez."
     }
   }
 }

@@ -1,4 +1,6 @@
-import { z } from 'zod';
+import * as z from 'zod';
+import { vmsg } from './messages';
+import { ISO_DATE_OR_DATE_TIME_RULE, isoDateOrDateTime } from './dates';
 
 // Rank of a person in the election result of a body
 export const electedOrderSchema = z.number().int().nonnegative().nullable();
@@ -6,9 +8,8 @@ export const electedOrderSchema = z.number().int().nonnegative().nullable();
 // A blank title is no title: a plain member has a role without a name.
 export const roleTitleSchema = z.string().nullable().optional().transform(value => value?.trim() || null);
 
-// An ISO 8601 date, or a date-time with a time zone. A date-time without a
-// zone is rejected, because the server would read it in its own zone.
-export const roleDateSchema = z.union([z.string().date(), z.string().datetime({ offset: true })])
+export const roleDateSchema = isoDateOrDateTime()
+    .meta({ description: ISO_DATE_OR_DATE_TIME_RULE })
     .nullable()
     .optional()
     .transform(value => value ? new Date(value) : null);
@@ -31,4 +32,27 @@ export function roleDatesInOrder(role: { startDate: Date | null; endDate: Date |
     return !role.startDate || !role.endDate || role.endDate >= role.startDate;
 }
 
-export const roleDatesInOrderIssue = { message: 'The end date must not be before the start date.', path: ['endDate'] };
+export const roleDatesInOrderIssue = { error: vmsg('roleEndBeforeStart'), path: ['endDate'] };
+
+type RolePeriod = { startDate: Date | null; endDate: Date | null };
+
+/**
+ * Whether two roles hold at the same moment. A role holds from its start up to,
+ * not including, its end, as `isRoleActiveAt` reads it: a role that ends on the
+ * day the next one starts does not overlap it. No start means since always, and
+ * no end means still current.
+ */
+export function rolePeriodsOverlap(a: RolePeriod, b: RolePeriod): boolean {
+    const start = (role: RolePeriod) => role.startDate?.getTime() ?? -Infinity;
+    const end = (role: RolePeriod) => role.endDate?.getTime() ?? Infinity;
+    return start(a) < end(b) && start(b) < end(a);
+}
+
+/** JSON body of POST /roles/elected-order: the elected order of the members of one body. */
+export const electedOrderRequestSchema = z.object({
+    administrativeBodyId: z.string().min(1),
+    rankings: z.array(z.object({
+        roleId: z.string().min(1),
+        electedOrder: electedOrderSchema,
+    })),
+});

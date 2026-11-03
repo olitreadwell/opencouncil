@@ -11,7 +11,6 @@ const mockPersonFindUnique = jest.fn();
 const mockPartyFindUnique = jest.fn();
 
 jest.mock('@/auth', () => ({ auth: (...args: unknown[]) => mockAuth(...args) }));
-jest.mock('@/lib/db/apiKeys', () => ({ validateServiceApiKey: jest.fn() }));
 jest.mock('@/lib/db/prisma', () => ({
     __esModule: true,
     default: {
@@ -24,7 +23,7 @@ jest.mock('@/lib/db/prisma', () => ({
 }));
 
 import { isUserAuthorizedToEdit, withUserAuthorizedToEdit, getUnreleasedScope, getRoleLimitForCity, personIsOwnedByBodyAdmin } from '../auth';
-import { ForbiddenError } from '@/lib/api/errors';
+import { ForbiddenError, UnauthorizedError } from '@/lib/api/errors';
 
 type Row = { cityId?: string | null; partyId?: string | null; personId?: string | null; administrativeBodyId?: string | null };
 
@@ -176,6 +175,12 @@ describe('an anonymous caller', () => {
         expect(await isUserAuthorizedToEdit({ cityId: 'athens', administrativeBodyId: 'youth' })).toBe(false);
         mockPersonFindUnique.mockResolvedValue({ cityId: 'athens', roles: [{ administrativeBodyId: 'youth' }] });
         expect(await isUserAuthorizedToEdit({ personId: 'p1' })).toBe(false);
+    });
+
+    it('is refused with a 401 UnauthorizedError by withUserAuthorizedToEdit', async () => {
+        const error = await withUserAuthorizedToEdit({ cityId: 'athens' }).catch((e: unknown) => e);
+        expect(error).toBeInstanceOf(UnauthorizedError);
+        expect((error as UnauthorizedError).statusCode).toBe(401);
     });
 });
 

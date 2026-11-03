@@ -24,8 +24,6 @@
     "columnMeetings": "Meetings",
     "columnPeople": "People",
     "columnParties": "Parties",
-    "languageGreek": "Greek",
-    "languageFrench": "French",
     "cityCount": "{count, plural, one {# city} other {# cities}}"
   },
   "taskStatus": {
@@ -69,6 +67,20 @@
     "noTasks": "No tasks running"
   },
   "adminActions": {
+    "releaseDialog": {
+      "title": "Release this meeting?",
+      "description": "The meeting becomes public. Its subscribers are told the following.",
+      "loading": "Checking the notifications…",
+      "loadError": "Could not check the notifications. The release still creates them if the meeting is news.",
+      "email": "Email",
+      "notis": "WhatsApp (Notis)",
+      "emailSends": "{count, plural, one {# subscriber gets} other {# subscribers get}} a notification about {phase} at once.",
+      "emailWaits": "{count, plural, one {# subscriber gets} other {# subscribers get}} a notification about {phase}. It waits in Notifications until an administrator approves it.",
+      "emailNoRecipients": "No subscriber gets a new notification about {phase}.",
+      "notisEligible": "The meeting is eligible for a Notis message about {phase}, if Notis has not sent one already.",
+      "notisNone": "No Notis message: {reason}",
+      "confirm": "Release"
+    },
     "sections": {
       "meetingDetails": "Meeting Management Details",
       "meetingDetailsSubtitle": "Edit basic information about this meeting.",
@@ -306,14 +318,7 @@
       "showRestMissing": "{n} with no decision",
       "showRestWithdrawn": "{n, plural, one {# withdrawn} other {# withdrawn}}",
       "showLess": "Show less",
-      "empty": "No subject matches this filter.",
-      "result": {
-        "unanimous": "Unanimous",
-        "majority": "By majority",
-        "rejected": "Rejected",
-        "none": "—",
-        "noVote": "—"
-      }
+      "empty": "No subject matches this filter."
     },
     "panel": {
       "adaTitle": "Add a decision by ADA for {subject}",
@@ -915,7 +920,7 @@
       },
       "decision_number": {
         "label": "decision number",
-        "description": "«απεχώρησε στην 286 ΑΚΣ»",
+        "description": "«απεχώρησε στην απόφαση 286»",
         "hint": ""
       },
       "phase": {
@@ -994,6 +999,59 @@
       "start": "Start a record",
       "choose": "Choose…",
       "draft": "New record, saved when you confirm it"
+    }
+  },
+  "machineAccounts": {
+    "title": "Machine accounts",
+    "lead": "Accounts for services that use only the MCP and act with the rights you give them here.",
+    "create": "New machine account",
+    "empty": "No machine account yet.",
+    "createdOn": "Created {date}",
+    "noActiveToken": "no active token",
+    "rights": {
+      "superAdmin": "Super Admin",
+      "none": "No rights"
+    },
+    "grantType": {
+      "city": "City",
+      "party": "Party",
+      "person": "Person",
+      "body": "Body"
+    },
+    "editRights": "Edit rights",
+    "newToken": "New token",
+    "creating": "Creating…",
+    "never": "never",
+    "active": "Active",
+    "new": "New",
+    "revokedOn": "Revoked {date}",
+    "revoke": "Revoke",
+    "revokeToken": "Revoke the token {prefix}…",
+    "revokeQuestion": "Revoke this token?",
+    "revokeConfirm": "Yes, revoke",
+    "revoking": "Revoking…",
+    "cancel": "Cancel",
+    "columns": {
+      "token": "Token",
+      "created": "Created",
+      "lastUsed": "Last used",
+      "status": "Status",
+      "actions": "Actions"
+    },
+    "reveal": {
+      "title": "New token. Copy it now: it is shown only this once.",
+      "keep": "It stays here until you click \"I have copied it\".",
+      "headerForm": "Address and bearer token (preferred)",
+      "pathForm": "For clients that cannot send headers",
+      "pathFormNote": "Proxies and access logs record this form. Prefer the header where the client supports it.",
+      "warning": "Anyone who has this token acts with the rights of this account in the MCP. Store it like a password. You can revoke it at any time.",
+      "dismiss": "I have copied it",
+      "copyAddress": "Copy the address",
+      "copyToken": "Copy the token",
+      "copyPathForm": "Copy the address with the token"
+    },
+    "errors": {
+      "failed": "The action failed. Reload the page and try again."
     }
   }
 }

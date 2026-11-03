@@ -1,54 +1,14 @@
 import "server-only";
-import type { City } from "@prisma/client";
+import type { City, Prisma } from "@prisma/client";
 import prisma from "./prisma";
-import type { CityWithCounts } from "./cities";
-
-// Mirrors CITY_COUNT_SELECT / CITY_ORDER_BY in cities.ts. Duplicated rather than
-// imported because cities.ts is a "use server" module and may only export async
-// functions (Next.js server-action constraint).
-const CITY_COUNT_SELECT = {
-    select: {
-        persons: true,
-        parties: true,
-        councilMeetings: {
-            where: { released: true },
-        },
-    },
-};
-
-const CITY_ORDER_BY = [
-    // supported > demo > pending, by CityStatus declaration order
-    { status: 'desc' as const },
-    { name: 'asc' as const },
-];
-
-/**
- * Every city regardless of status — the superadmin-equivalent view, without
- * consulting the session. The caller authenticates the request out-of-band (a
- * service API key at the API-route layer).
- *
- * Must return exactly what `getCities({ includeNonPublic: true })` returns for a
- * session superadmin: `GET /api/cities?includeUnlisted=true` dispatches to one or
- * the other purely on how the caller authenticated, so a difference here is a
- * difference in what two credentials for the same access level can see. It used
- * to filter to non-pending, which meant listed + unlisted; with `unlisted` folded
- * into `pending` that same filter would now hide the staged cities.
- *
- * MUST live in a non-"use server" module so it is not registered as a Next.js server
- * action — otherwise any client could invoke it directly and bypass the API-route auth.
- */
-export async function getAllCitiesAsServiceKey(): Promise<CityWithCounts[]> {
-    return prisma.city.findMany({
-        include: { _count: CITY_COUNT_SELECT },
-        orderBy: CITY_ORDER_BY,
-    });
-}
+import { NotFoundError } from '@/lib/api/errors';
 
 /**
  * Create a city with no auth check, for a caller that has already authorized
  * the write: `createCity` after its session gate, and the MCP admin tools,
- * which carry a token instead of a session. Lives here for the same reason as
- * `getAllCitiesAsServiceKey`: cities.ts is a "use server" module.
+ * which carry a token instead of a session. Lives in a non-"use server"
+ * module so it is not registered as a Server Action: cities.ts is one, and a
+ * client could otherwise invoke this write directly and bypass the gate.
  *
  * `peopleOrdering` stays a column with its default but nothing reads or writes
  * it any more: one order applies to every city.
@@ -57,7 +17,60 @@ export async function createCityDirect(cityData: Omit<City, 'createdAt' | 'updat
     return prisma.city.create({ data: cityData });
 }
 
+/** Authorized callers only. The predicate also prevents a concurrent customer upgrade being overwritten. */
+export async function publishCityDemoDirect(cityId: string): Promise<City> {
+    return prisma.city.update({
+        where: { id: cityId, status: { in: ['pending', 'demo'] } },
+        data: { status: 'demo' },
+    });
+}
+
+/** Shared PostGIS write for callers that already authorized the city edit. Input is normalized by parseBoundaryInput. */
+export async function updateCityGeometryDirect(id: string, geometry: GeoJSON.Polygon | GeoJSON.MultiPolygon): Promise<void> {
+    const updated = await prisma.$executeRaw`
+        UPDATE "City"
+        SET geometry = ST_SetSRID(ST_GeomFromGeoJSON(${JSON.stringify(geometry)}), 4326),
+            "updatedAt" = NOW()
+        WHERE id = ${id}
+    `;
+    if (updated === 0) throw new NotFoundError('City not found');
+}
+
 /** The English name of a city, for an alert that needs nothing else of it. */
 export async function getCityNameEnAndTimezone(cityId: string): Promise<{ name_en: string; timezone: string } | null> {
     return prisma.city.findUnique({ where: { id: cityId }, select: { name_en: true, timezone: true } });
+}
+
+// Shared by the site's city lists (cities.ts) and the MCP. They live here, not
+// in the "use server" cities.ts, which may export async functions only.
+export const CITY_COUNT_SELECT = {
+    select: {
+        persons: true,
+        parties: true,
+        councilMeetings: {
+            where: {
+                released: true
+            }
+        }
+    }
+};
+
+export const CITY_ORDER_BY = [
+    // supported > demo > pending, by CityStatus declaration order
+    { status: 'desc' as const },
+    { name: 'asc' as const }
+];
+
+/**
+ * Cities that match `where`, with their counts, in the order of the site's
+ * lists. No access check: for callers that have done their own (the MCP's
+ * superadmin listing).
+ */
+export async function listCitiesWithCounts(where: Prisma.CityWhereInput) {
+    return prisma.city.findMany({ where, include: { _count: CITY_COUNT_SELECT }, orderBy: CITY_ORDER_BY });
+}
+
+/** How many cities each realm has in each status. */
+export async function countCitiesByRealmAndStatus() {
+    return prisma.city.groupBy({ by: ['realm', 'status'], _count: { _all: true } });
 }

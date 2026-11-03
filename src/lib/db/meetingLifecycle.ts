@@ -1,7 +1,7 @@
 // The one write path for the lifecycle of a meeting: its schedule status, its
 // kind and format, its links to other meetings, and the visibility rules that
 // the links carry. The meeting API routes call it after they authorize the
-// request, so it does no auth of its own (the service key reaches it too).
+// request, so it does no auth of its own (the MCP admin tools reach it too).
 import "server-only";
 import { CouncilMeeting, Prisma, PrismaClient } from '@prisma/client';
 import prisma from "./prisma";
@@ -12,7 +12,7 @@ import {
     type MeetingRecordState,
 } from '@/lib/meetingLifecycleRules';
 import type { CouncilMeetingWithAdminBody } from './meetings';
-import { DECISION_KIND_SELECT } from '@/lib/tasks/pollDecisionsBackoff';
+import { meetingWithAdminBodyInclude } from './types/meeting';
 
 type Client = Prisma.TransactionClient | PrismaClient;
 
@@ -42,11 +42,6 @@ const chainSelect = {
     hiddenByPostponement: true,
 } satisfies Prisma.CouncilMeetingSelect;
 type ChainRow = Prisma.CouncilMeetingGetPayload<{ select: typeof chainSelect }>;
-
-const withAdminBody = {
-    administrativeBody: true,
-    continuationOf: DECISION_KIND_SELECT.continuationOf,
-} satisfies Prisma.CouncilMeetingInclude;
 
 function chainTooLong(): LifecycleRuleError {
     return new LifecycleRuleError('chainTooLong', `A postponement chain is longer than ${MAX_CHAIN_LENGTH} meetings.`);
@@ -183,7 +178,7 @@ function newRecordState(data: NewMeetingRecord): MeetingRecordState {
 export async function createMeetingRecord(data: NewMeetingRecord): Promise<CouncilMeetingWithAdminBody> {
     return prisma.$transaction(async (tx) => {
         await assertValid(tx, data.cityId, newRecordState(data));
-        const meeting = await tx.councilMeeting.create({ data, include: withAdminBody });
+        const meeting = await tx.councilMeeting.create({ data, include: meetingWithAdminBodyInclude });
         if (meeting.released && meeting.postponedFromId) {
             await hideChainFrom(tx, data.cityId, meeting.postponedFromId);
         }
@@ -215,7 +210,7 @@ export async function updateMeetingRecord(
         const meeting = await client.councilMeeting.update({
             where: { cityId_id: { cityId, id } },
             data: definedOnly(patch),
-            include: withAdminBody,
+            include: meetingWithAdminBodyInclude,
         });
         // A relink applies the visibility at once when the meeting or a later
         // meeting of its chain is public, the same as a release would: the
@@ -236,9 +231,10 @@ export async function updateMeetingRecord(
  * Release or unrelease a meeting. Releasing the new meeting of a postponement
  * hides every meeting before it in the chain. Unreleasing it, when it was
  * released, shows its direct predecessor again. The call is idempotent: a
- * meeting that already has the requested visibility changes nothing.
+ * meeting that already has the requested visibility changes nothing, and
+ * `changed` says which case it was, read inside the transaction.
  */
-export async function setMeetingReleased(cityId: string, id: string, released: boolean): Promise<CouncilMeetingWithAdminBody> {
+export async function setMeetingReleased(cityId: string, id: string, released: boolean): Promise<{ meeting: CouncilMeetingWithAdminBody; changed: boolean }> {
     return prisma.$transaction(async (tx) => {
         const current = await tx.councilMeeting.findUnique({ where: { cityId_id: { cityId, id } }, select: chainSelect });
         if (!current) throw new Error(`Meeting ${cityId}/${id} not found`);
@@ -255,11 +251,12 @@ export async function setMeetingReleased(cityId: string, id: string, released: b
 
         // A change of visibility by the admin replaces the memory of a hide.
         // A repeated call changes nothing, so the memory stays.
-        return tx.councilMeeting.update({
+        const meeting = await tx.councilMeeting.update({
             where: { cityId_id: { cityId, id } },
             data: { released, ...(current.released !== released && { hiddenByPostponement: false }) },
-            include: withAdminBody,
+            include: meetingWithAdminBodyInclude,
         });
+        return { meeting, changed: current.released !== released };
     });
 }
 

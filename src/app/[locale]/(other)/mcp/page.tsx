@@ -1,14 +1,13 @@
 import { Metadata } from "next";
 import { getTranslations } from "next-intl/server";
 import { Link } from "@/i18n/routing";
-import { getRealm } from "@/lib/realm.server";
-import { realmBaseUrl } from "@/lib/utils/realmBaseUrl";
 import { getCurrentUser } from "@/lib/auth";
+import { mcpBaseUrl } from "@/lib/mcp/baseUrl";
 import { listUserMcpTokens } from "@/lib/db/mcpTokens";
 import { CopyButton } from "@/components/mcp/CopyButton";
 import { ConnectPanel } from "@/components/mcp/ConnectPanel";
 import { McpTokenManager } from "@/components/mcp/McpTokenManager";
-import { buildCanonicalAlternates } from "@/lib/utils/hreflang";
+import { withCanonicalUrl } from "@/lib/utils/hreflang";
 import { ArrowRight } from "lucide-react";
 
 // Both entry points read the locale from params and pass it explicitly:
@@ -20,31 +19,22 @@ export async function generateMetadata(props: {
 }): Promise<Metadata> {
     const { locale } = await props.params;
     const t = await getTranslations({ locale, namespace: "mcp.metadata" });
-    return {
+    return withCanonicalUrl("/mcp", {
         title: t("title"),
         description: t("description"),
-        alternates: await buildCanonicalAlternates("/mcp"),
         openGraph: {
             title: t("title"),
             description: t("description"),
             type: "website",
             siteName: "OpenCouncil",
         },
-    };
+    });
 }
 
 // The walkthrough is linked rather than embedded: an embed sits between the
 // reader and the address they came for, and browsers that block third-party
 // storage render it as a blank frame with no error the page can detect.
 const LOOM_VIDEO_URL = "https://www.loom.com/share/14194bb035464ce6abcd76b8b8faf873";
-
-/**
- * The address must match how `/api/mcp` resolves the realm — from the request
- * Host — or the reader pastes a connector scoped to the wrong realm for good.
- */
-async function mcpBaseUrl(): Promise<string> {
-    return `${realmBaseUrl(await getRealm())}/mcp`;
-}
 
 const EXAMPLES = ["example1", "example2", "example3", "example4"] as const;
 

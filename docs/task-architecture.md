@@ -111,7 +111,7 @@ The `pollDecisions` task can be triggered automatically to fetch decisions from 
 **Authentication:** `Authorization: Bearer <CRON_SECRET>`
 
 **What it does:**
-1. Finds meetings from the last 90 days in cities that have `diavgeiaUid` configured
+1. Finds meetings from the last 90 days in supported cities that have `diavgeiaUid` configured. A poll is a paid task, so the cron does not poll a pending or demo city. An admin can still poll any meeting by hand. The filter is `decisionPollCandidateWhere` in `src/lib/db/decisionEligibility.ts`, which the polling stats also use.
 2. Filters to meetings that still have subjects with no linked decision
 3. Applies progressive backoff based on previous polling history (see below)
 4. Dispatches `pollDecisions` tasks to the backend task server for up to 10 meetings per invocation
@@ -153,9 +153,11 @@ This returns per-decision data showing: when Diavgeia published it, when the cro
 **Key files:**
 - `src/app/api/cron/poll-decisions/route.ts` — Cron API route
 - `src/app/api/cron/poll-decisions-stats/route.ts` — Polling effectiveness stats
-- `src/lib/tasks/pollDecisions.ts` — `pollDecisionsForRecentMeetings()` (cron logic), `getPollingStats()` (stats), `pollDecisionsForMeeting()` (core logic shared with admin UI and cron)
+- `src/lib/tasks/pollDecisions.ts` — `pollDecisionsForRecentMeetings()` (cron logic), `pollDecisionsForMeeting()` (core logic shared with admin UI and cron)
+- `src/lib/tasks/pollingStats.ts` — `getPollingStats()` (stats)
 
 **Prerequisites per city:**
+- City must be `supported` (`CUSTOMER_CITY_WHERE` in `src/lib/cityStatus.ts`)
 - City must have `diavgeiaUid` set (configured in city settings)
 - Optionally, administrative bodies can have `diavgeiaUnitIds` for more precise matching
 
@@ -165,13 +167,14 @@ The `poll-livestreams` cron closes the manual gap between a meeting being livest
 and its transcription: it finds the meeting's YouTube video and triggers `transcribe`
 automatically.
 
-**Endpoint:** `GET /api/cron/poll-livestreams` (`?dryRun=1` logs decisions without acting)
+**Endpoint:** `GET /api/cron/poll-livestreams` (`?dryRun=true` logs decisions without acting; `?dryRun=1` works too)
 **Authentication:** `Authorization: Bearer <CRON_SECRET>`
 
 **What it does (each run):**
 1. Finds candidate meetings: a `processAgenda` task has `succeeded`, `dateTime` is within
-   ±12h of now, `youtubeUrl` is still null, the administrative body has a `youtubeChannelUrl`,
-   and no `transcribe` task is already in flight.
+   ±12h of now, `youtubeUrl` is still null, the city is supported (a transcribe is a paid
+   task), the administrative body has a `youtubeChannelUrl`, and no `transcribe` task is
+   already in flight.
 2. Lists recent videos for each distinct channel from the channel's uploads playlist
    (`playlistItems.list` + `videos.list`) — reliable and immediate, unlike `search.list`,
    whose index lags for just-finished livestreams and intermittently 403s. Resolved channel
@@ -187,6 +190,7 @@ automatically.
 **Requirements:**
 - `YOUTUBE_API_KEY` (Google Cloud, "YouTube Data API v3"). When unset, the cron no-ops.
 - `CACHE_URL` (Valkey). When unset, the cron still works but the multi-meeting alert may repeat.
+- The city must be `supported` (`CUSTOMER_CITY_WHERE` in `src/lib/cityStatus.ts`).
 - Each administrative body that should be polled must have `youtubeChannelUrl` set.
 
 **Setup:** alongside the `poll-decisions` trigger, schedule:
@@ -270,6 +274,8 @@ A key feature of the task architecture is the ability to reprocess the results o
 When the result handler throws, the task becomes `failed`. `responseBody` keeps the payload and `failureReason` holds the error. After a fix to the handler, a reprocess of the task uses the stored payload.
 
 The `failureReason` column starts with migration `20261006120000_task_status_failure_reason`. A failed row from before that migration has no `failureReason`, and its `responseBody` can hold failure text instead of a payload. A reprocess refuses such a row when the text is not JSON.
+
+The `responseBody` of a `processAgenda` task is also an input to a later task. For a forced summarize, `getSummarizeRequestBody` reads the newest succeeded one by `createdAt` and sends its description of each agenda subject. A summarize that already succeeded runs again only with force. summarize overwrites `Subject.description`, so after the first summary this payload is the only copy of the agenda text. A change to how `TaskStatus` bodies are kept, masked or deleted must keep these payloads. A replay of an older `processAgenda` task writes its subjects again, but the newer task is still the one that summarize reads.
 
 ### Basic Reprocessing
 

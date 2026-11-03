@@ -10,7 +10,7 @@ import SearchFilterSections from "./SearchFilterSections";
 import {
     DERIVED_FILTER_PARAM,
     DERIVED_FILTER_PARAMS,
-    filterDateRangeToInstants,
+    filterDateRange,
     formatFilterDate,
     hasActiveSearchFilters,
     parseDerivedKeys,
@@ -28,10 +28,12 @@ import { getCity } from "@/lib/db/cities";
 import { getPerson } from "@/lib/db/people";
 import { getParty } from "@/lib/db/parties";
 import { Skeleton } from "../ui/skeleton";
+import { belowHeaderScrollMargin } from "@/components/layout/headerOffset";
 import { useToast } from "@/hooks/use-toast";
 import { SubjectListContainer } from "@/components/subject/SubjectListContainer";
-import { getPartyFromRoles } from "@/lib/utils";
+import { cn, getPartyFromRoles } from "@/lib/utils";
 import { toAdministrativeBodyType } from "@/lib/utils/administrativeBodies";
+import { readPageParam, totalPagesOf } from "@/lib/zod-schemas/listQuery";
 import { useTranslations } from 'next-intl';
 import posthog from "posthog-js";
 
@@ -70,7 +72,7 @@ export default function SearchPage() {
     const topicIds = searchParams.get('topicIds') || undefined;
     const dateFrom = searchParams.get('dateFrom') || undefined;
     const dateTo = searchParams.get('dateTo') || undefined;
-    const page = parseInt(searchParams.get('page') || '1');
+    const page = readPageParam(searchParams.get('page'));
     // Which of the filters above the query text supplied, rather than the
     // reader choosing. Kept as a string until it is needed, so the memo below
     // is keyed on something stable.
@@ -91,11 +93,17 @@ export default function SearchPage() {
         total: number;
         isLoading: boolean;
         error: Error | null;
+        // The query these results answer. The search runs in an effect, after
+        // the first render, so a page that arrives with a query has nothing
+        // loaded yet and is not loading yet either: without this the server
+        // HTML, and every render until the effect starts, said "no results".
+        resultsFor: string | null;
     }>({
         results: [],
         total: 0,
         isLoading: false,
-        error: null
+        error: null,
+        resultsFor: null
     });
 
     // Update URL parameters
@@ -162,6 +170,15 @@ export default function SearchPage() {
             router.push(href, { scroll: false });
         }
     }, [router, searchParams]);
+
+    // The router does not scroll (`scroll: false` above), and the pager sits
+    // under the last result. Scroll now: the skeletons hold the same place
+    // while the new page loads.
+    const resultsRef = useRef<HTMLDivElement>(null);
+    const goToPage = (target: number) => {
+        updateSearchParams({ page: target.toString() });
+        resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    };
 
     /**
      * Put what the query text supplied onto the filter pills, so the reader can
@@ -238,7 +255,7 @@ export default function SearchPage() {
         // empty the results with nothing on screen to explain why.
         const adminBodyTypeFilter = toAdministrativeBodyType(adminBodyType);
         const requestedCityIds = cityId ? [cityId] : undefined;
-        const requestedDateRange = filterDateRangeToInstants(dateFrom, dateTo);
+        const requestedDateRange = filterDateRange(dateFrom, dateTo);
         const searchedWith = (cityIds?: string[], dateRange?: { start: string; end: string }) =>
             JSON.stringify([query, cityIds, personId, partyId, adminBodyId, adminBodyTypeFilter, topicIds, dateRange, page]);
 
@@ -261,7 +278,7 @@ export default function SearchPage() {
 
         // Skip search if temporarily disabled
         if (SEARCH_TEMPORARILY_DISABLED) {
-            setState(prev => ({ ...prev, results: [], total: 0, isLoading: false }));
+            setState(prev => ({ ...prev, results: [], total: 0, isLoading: false, resultsFor: query }));
             return;
         }
 
@@ -340,10 +357,10 @@ export default function SearchPage() {
             // follows the URL write can tell whether it would be asking the
             // same question.
             //
-            // A derived date usually means it would not. The model answers with
-            // a range of its own, while the URL carries a calendar day and
-            // reads back local day edges — rarely the same instants. The second
-            // search is the correction for that, not waste: recording the URL's
+            // A derived date can mean it would not. The model can answer with
+            // date-times, while the URL carries calendar days, so the two are
+            // not the same range. The second search is the correction for
+            // that, not waste: recording the URL's
             // interval here instead would suppress it and leave the results on
             // screen describing one period while the pill and the shareable
             // link claim another.
@@ -360,7 +377,8 @@ export default function SearchPage() {
                 results: response.results,
                 total: response.total,
                 isLoading: false,
-                error: null
+                error: null,
+                resultsFor: query
             });
 
             if (newlyDerived.length > 0) {
@@ -398,7 +416,7 @@ export default function SearchPage() {
                 page,
                 duration_ms: Math.round(performance.now() - startedAt),
             });
-            setState(prev => ({ ...prev, error, isLoading: false }));
+            setState(prev => ({ ...prev, error, isLoading: false, resultsFor: query }));
             toast({
                 variant: "destructive",
                 title: "Search Error",
@@ -491,7 +509,7 @@ export default function SearchPage() {
         return () => { live = false; };
     }, [cityId, personId, partyId]);
 
-    const totalPages = Math.ceil(state.total / PAGE_SIZE);
+    const totalPages = totalPagesOf(state.total, PAGE_SIZE);
 
     // Memoize the grid of results
     const resultsGrid = useMemo(() => (
@@ -647,7 +665,7 @@ export default function SearchPage() {
                 </div>
 
                 {/* Same max width as the search bar above, so the results column lines up with it. */}
-                <div className="mx-auto w-full max-w-6xl">
+                <div ref={resultsRef} className={cn("mx-auto w-full max-w-6xl", belowHeaderScrollMargin)}>
                     {state.error ? (
                         <div className="flex justify-center items-center min-h-[400px]">
                             <div className="text-center space-y-3">
@@ -664,7 +682,7 @@ export default function SearchPage() {
                                 </button>
                             </div>
                         </div>
-                    ) : state.isLoading ? (
+                    ) : state.isLoading || (query && state.resultsFor !== query) ? (
                         <div className="flex flex-col gap-4 mt-6">
                             {Array.from({ length: PAGE_SIZE }).map((_, i) => (
                                 <Skeleton key={i} className="h-[136px] w-full rounded-lg" />
@@ -701,7 +719,7 @@ export default function SearchPage() {
                             {totalPages > 1 && (
                                 <div className="flex justify-center gap-2 mt-8">
                                     <button
-                                        onClick={() => updateSearchParams({ page: (page - 1).toString() })}
+                                        onClick={() => goToPage(page - 1)}
                                         disabled={page === 1}
                                         className="px-4 py-2 rounded-md border bg-background hover:bg-accent disabled:opacity-50 disabled:hover:bg-background transition-colors"
                                     >
@@ -711,7 +729,7 @@ export default function SearchPage() {
                                         {ts('pageOf', { page, total: totalPages })}
                                     </div>
                                     <button
-                                        onClick={() => updateSearchParams({ page: (page + 1).toString() })}
+                                        onClick={() => goToPage(page + 1)}
                                         disabled={page === totalPages}
                                         className="px-4 py-2 rounded-md border bg-background hover:bg-accent disabled:opacity-50 disabled:hover:bg-background transition-colors"
                                     >
