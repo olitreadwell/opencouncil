@@ -1,11 +1,18 @@
 /**
- * Validates the Serbian message catalogs against the English source: every
- * message in messages/sr* must (a) parse as ICU MessageFormat and (b) use
- * exactly the argument set of its English counterpart — the two failure modes
- * machine translation can introduce that key-parity checks can't see. Exits
- * non-zero with a per-message report. Only the Cyrillic source is checked:
- * sr-Latn is derived from it at load time by an ICU-safe transform
- * (src/lib/serbian/catalog.ts).
+ * Validates the message catalogs:
+ *
+ * 1. Serbian catalogs against the English source: every message must (a) parse
+ *    as ICU MessageFormat and (b) use exactly the argument set of its English
+ *    counterpart — failure modes machine translation can introduce.
+ * 2. Plural categories per locale (issue #597): every `plural` argument in the
+ *    en/el/fr/sr catalogs must use only real categories for that locale, and
+ *    cover every category it needs for realistic counts (explicit `=N` forms
+ *    count as independent coverage). Greek/French need one/other; Serbian
+ *    needs one/few/other.
+ *
+ * Exits non-zero with a per-message report. Only the Cyrillic source is
+ * checked for parity: sr-Latn is derived from it at load time by an ICU-safe
+ * transform (src/lib/serbian/catalog.ts).
  *
  * Run directly (`npx tsx scripts/validate-sr-catalogs.ts`) or via the jest
  * wrapper in src/lib/__tests__/sr-latn-catalog.test.ts (the parser is
@@ -14,6 +21,7 @@
 import fs from 'fs';
 import path from 'path';
 import { parse, type MessageFormatElement } from '@formatjs/icu-messageformat-parser';
+import { pluralCategoryIssues } from '../src/i18n/pluralCategories';
 
 const messagesDir = path.join(__dirname, '..', 'messages');
 
@@ -73,9 +81,40 @@ for (const [enFile, srFile] of filePairs) {
     }
 }
 
+// Plural categories per locale (issue #597). The catalogs are modular; gather
+// each locale's top-level file plus its module dir, if present.
+const locales = ['en', 'el', 'fr', 'sr'];
+
+for (const locale of locales) {
+    const files: string[] = [];
+    if (fs.existsSync(path.join(messagesDir, `${locale}.json`))) files.push(`${locale}.json`);
+    const dir = path.join(messagesDir, locale);
+    if (fs.existsSync(dir)) {
+        for (const f of fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort()) files.push(path.join(locale, f));
+    }
+    for (const file of files) {
+        const messages = flatten(readJson(path.join(messagesDir, file)), '', new Map());
+        for (const [key, msg] of messages) {
+            let ast: MessageFormatElement[];
+            try {
+                ast = parse(msg, { requiresOtherClause: false });
+            } catch (e) {
+                continue; // parity pass above already reported unparseable Serbian; other locales are parse-checked elsewhere
+            }
+            for (const issue of pluralCategoryIssues(ast, locale)) {
+                const parts: string[] = [];
+                if (issue.missing.length > 0) parts.push(`missing [${issue.missing.join(', ')}]`);
+                if (issue.invalid.length > 0) parts.push(`invalid [${issue.invalid.join(', ')}]`);
+                errors.push(`${file} → ${key}: plural '${issue.argument}' ${parts.join('; ')}`);
+            }
+        }
+    }
+}
+
 if (errors.length > 0) {
     console.error(errors.join('\n'));
-    console.error(`\n${errors.length} problem(s) in ${checked} messages`);
+    console.error(`\n${errors.length} problem(s) in ${checked} Serbian messages (parity + plural categories)`);
     process.exit(1);
 }
 console.log(`OK: ${checked} Serbian messages parse as ICU and match English argument sets`);
+console.log('OK: en/el/fr/sr plural categories are valid and complete per locale');
