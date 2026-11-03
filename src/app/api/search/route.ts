@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { search } from '@/lib/search';
-import { z } from 'zod';
 import { searchRequestSchema } from '@/lib/zod-schemas/search';
+import type { SearchRequest } from '@/lib/search/types';
+import { searchError } from '@/lib/api/errors';
+import { paginationOf } from '@/lib/zod-schemas/listQuery';
 
 // Hardcoded search configuration
 const SEARCH_CONFIG = {
@@ -14,35 +16,26 @@ export async function POST(request: NextRequest) {
         const body = await request.json();
         const validatedRequest = searchRequestSchema.parse(body);
 
-        // Calculate offset for pagination
-        const offset = (validatedRequest.page - 1) * validatedRequest.pageSize;
-
-        // Prepare search request
-        const searchRequest = {
-            ...validatedRequest,
+        // The filters have the search's own names and units, so they pass
+        // through. Only paging and detail are API-shaped.
+        const { page, pageSize, detailed, ...filters } = validatedRequest;
+        const searchRequest: SearchRequest = {
+            ...filters,
             config: {
                 ...SEARCH_CONFIG,
-                size: validatedRequest.pageSize,
-                from: offset,
-                detailed: validatedRequest.detailed
+                size: pageSize,
+                from: (page - 1) * pageSize,
+                detailed
             }
         };
 
         // Perform the search
         const { results, total, derivedFilters } = await search(searchRequest);
 
-        // Calculate pagination metadata
-        const totalPages = Math.ceil(total / validatedRequest.pageSize);
-
         // Return paginated results
         return NextResponse.json({
             results,
-            pagination: {
-                total,
-                page: validatedRequest.page,
-                pageSize: validatedRequest.pageSize,
-                totalPages
-            },
+            pagination: paginationOf(total, validatedRequest.page, validatedRequest.pageSize),
             // The search reads the query text for filters, so a request that
             // named a municipality or a period in prose comes back narrowed.
             // Reporting it is the difference between a caller that can see the
@@ -50,30 +43,6 @@ export async function POST(request: NextRequest) {
             derivedFilters
         });
     } catch (error) {
-        console.error('Search error:', error);
-
-        if (error instanceof z.ZodError) {
-            return NextResponse.json(
-                {
-                    error: {
-                        code: 'INVALID_REQUEST',
-                        message: 'Invalid request parameters',
-                        details: error.errors
-                    }
-                },
-                { status: 400 }
-            );
-        }
-
-        return NextResponse.json(
-            {
-                error: {
-                    code: 'SEARCH_ERROR',
-                    message: 'An error occurred while performing the search',
-                    details: error instanceof Error ? error.message : 'Unknown error'
-                }
-            },
-            { status: 500 }
-        );
+        return searchError(error);
     }
-} 
+}

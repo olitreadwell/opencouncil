@@ -46,7 +46,7 @@ describe("golden scenarios (recorded replay)", () => {
         anthropic: replay,
         now: () => FIXED_NOW,
         prompts: { system: "SYSTEM", contextPack: "PACK", editorial: "ED", compaction: "COMPACT" },
-        config: { model: "claude-sonnet-5", maxTurns: 8, mcpUrl: "https://opencouncil.gr/mcp", effort: "low" },
+        config: { model: "claude-sonnet-5", maxTurns: 8, mcpUrl: "https://opencouncil.gr/mcp", effort: "low", reactiveEffort: "medium" },
         mcp: { call: async () => null },
       };
 
@@ -103,6 +103,8 @@ describe("golden scenarios (recorded replay)", () => {
           "update_taste_profile",
           "schedule_wakeup",
           "unsubscribe_user",
+          "open_support_request",
+          "withdraw_support_request",
         ]);
         expect(req.system).toHaveLength(2);
         expect(req.system[0].cache_control).toBeUndefined();

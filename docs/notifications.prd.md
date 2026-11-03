@@ -4,6 +4,8 @@
 
 OpenCouncil's notification system sends automated updates to users about council meeting subjects relevant to their location and topic preferences. Notifications are sent before meetings (agenda preview) and after meetings (meeting summary).
 
+In Greek text that users read, the name of the feature is «ενημερώσεις», not «ειδοποιήσεις». The test `src/lib/__tests__/el-glossary.test.ts` enforces this name in the Greek catalogs and in the Greek text in the code. The privacy and terms pages keep the old word until their legal text is revised.
+
 ## System Architecture
 
 ### Data Models
@@ -33,13 +35,27 @@ OpenCouncil's notification system sends automated updates to users about council
 
 ### Notification Creation Triggers
 
-1. **Before Meeting Notifications**
-   - Created when `processAgenda` task completes successfully
-   - **Behavior depends on administrative body's `notificationBehavior` setting**
-   
-2. **After Meeting Notifications**
-   - Created when `summarize` task completes successfully
-   - **Behavior depends on administrative body's `notificationBehavior` setting**
+The app creates notifications by itself only for a released meeting, and only while the meeting is news. Email and Notis (WhatsApp) use one rule for "news", so both channels decide the same way. `@opencouncil/ui/lib/meeting-news` holds the rule. The Notis poller and `src/lib/notifications/freshness.ts` import it.
+
+| Phase | Notification | News when |
+|---|---|---|
+| `processAgenda` succeeds | `beforeMeeting` | the meeting is in the future |
+| `summarize` succeeds | `afterMeeting` | the meeting is in the past |
+
+For both phases, the task must have completed in the last 7 days. A meeting older than 15 days is never news. Email adds one condition that Notis does not check: a postponed or cancelled meeting gets no `beforeMeeting` email.
+
+`notificationOutcome` (`src/lib/notifications/freshness.ts`) is the one decision: no email (and why), sent at once (`NOTIFICATIONS_AUTO`), or left for approval (`NOTIFICATIONS_APPROVAL`). The task callbacks act on it. The release, the release dialog, the review dialog, the task buttons of the meeting admin page and the MCP tools (`get_meeting`, `start_task`) describe it with the same text (`messages/*/notificationOutcome.json`).
+
+1. **After a task**
+   - `notifySubscribersOfTask` runs after the task status becomes `succeeded` (`src/lib/tasks/tasks.ts`), not inside the result handler.
+   - An unreleased meeting gets no notifications at this point.
+
+2. **On release**
+   - Before the release, a dialog in the meeting admin panel shows what the release does: the email recipients, and whether the meeting is eligible for a Notis message.
+   - The release creates the email notifications for the phase that is news (`notifySubscribersOnRelease`). It counts only succeeded tasks, so a task that is still writing its results notifies by itself once it succeeds.
+   - The body's `notificationBehavior` applies, as after a task.
+   - Notis sends its WhatsApp message on its own schedule, once per meeting and phase. The app cannot stop it.
+
 3. **Manual Creation**
    - Admins can manually create notifications from meeting admin page:
      - first, by selecting a NotificationType (before/after meeting)
@@ -109,7 +125,7 @@ NotificationDeliveries represent the sending of a notification to a user through
 - Uses the title and body content created during delivery creation
 
 **Phone channel:**
-The Notis service owns the WhatsApp templates, the WhatsApp-first delivery with SMS fallback, the quiet hours, and the ΣΤΟΠ ceremony. Its README documents them. The release step marks a `message` delivery row from before the switch as `skipped`. This app has no Bird integration left: no sender, no webhook, no credentials.
+The Notis service owns the WhatsApp templates, the WhatsApp-first delivery with SMS fallback, the quiet hours, and the ΣΤΟΠ ceremony. Its README documents them. The release step marks a `message` delivery row from before the switch as `skipped`. This app has no Bird webhook and sends no notification. Its one call to Bird is the SMS with a phone verification code.
 
 **Delivery Status Updates:**
 - Successful sending updates the delivery `status` field
@@ -176,31 +192,18 @@ export async function generateEmailContent(notification: Notification): Promise<
 
 ### 3. Automatic Notification Triggers
 
-#### In `src/lib/tasks/processAgenda.ts`:
-```typescript
-// After successful subject creation in handleProcessAgendaResult
-const stats = await createNotificationsForMeeting(
-  task.councilMeeting.cityId,
-  task.councilMeeting.id,
-  'beforeMeeting'
-);
-// Log notification creation statistics
-```
+`src/lib/notifications/meetingNotifications.ts` holds the automatic triggers:
 
-#### In `src/lib/tasks/summarize.ts`:
-```typescript
-// After successful summary creation in handleSummarizeResult  
-const stats = await createNotificationsForMeeting(
-  councilMeeting.cityId,
-  councilMeeting.id,
-  'afterMeeting'
-);
-// Log notification creation statistics
-```
+- `notifySubscribersOfTask(cityId, meetingId, phase)`: `handleTaskUpdate` and `processTaskResponse` call it after the status becomes `succeeded`.
+- `notifySubscribersOnRelease(cityId, meetingId)`: `toggleMeetingRelease` calls it through `after()` when a meeting becomes public.
+- `getReleaseOutlook(cityId, meetingId)`: the release dialog reads it through the `getMeetingReleaseOutlook` Server Action.
+- `getTaskNotificationOutcome(cityId, meetingId, phase)`: the MCP tools read it.
+
+A failure in these triggers does not fail the task or the release. A Discord alert asks an admin to create the notifications by hand.
 
 ### 4. Notification View Page
 
-#### `src/app/notifications/[id]/page.tsx` - Public notification view:
+#### `src/app/[locale]/(other)/notifications/[id]/page.tsx` - Public notification view:
 **Requirements:**
 - **Unauthenticated access**: No login required
 - **Mobile-first responsive design**: Optimized for mobile devices
@@ -277,6 +280,19 @@ The completion screen shows the real first message (`notis_intro`) and says when
 - **Per-city rows**: topics and locations, an email checkbox (`notifyByEmail`), edit (step 2 of the signup), delete.
 - **History**: past notifications with their delivery statuses.
 
+#### Phone verification
+
+A reader can prove that they own their mobile number with a code ([issue #813](https://github.com/schemalabz/opencouncil/issues/813)). The step is optional, so that it costs no signups.
+
+- **Nothing waits for it.** A number is saved on the account at once, in the signup, the petition and the profile. Νότης writes to it as before, verified or not.
+- **Where it is offered.** The profile's phone field shows «Δεν έχει επιβεβαιωθεί» with a "confirm with a code" button. The code opens in a dialog (`src/components/phone/PhoneCodeForm.tsx`). A verified number shows a tick.
+- **What the proof gives.** `User.phoneVerifiedAt` is set. A verified number cannot be claimed by another account. A number that another account only typed passes to the reader who proves it. A changed number is unverified again.
+- **The one case that needs a code.** A reader saves a number that another account already typed. The profile saves the other fields and opens the code dialog for that number.
+- **The code.** Six digits, kept as an HMAC with `NEXTAUTH_SECRET`, good for 10 minutes, void after 5 wrong attempts. A reader may ask for a code every 30 seconds, and 3 times an hour. One number receives at most 5 codes an hour, from all accounts together (`src/lib/phone-verification/constants.ts`).
+- **The limits hold under concurrency.** Each code that goes out is a `PhoneCodeSend` row, and the limits count these rows. A request checks the limits and reserves its row under a Postgres advisory lock on the number and on the account. An SMS that Bird refuses releases the reservation. An SMS that gets no answer keeps it, because the SMS may still arrive. A wrong-code attempt is claimed in one conditional update before the comparison. A confirmation takes the same lock on the number, so two accounts cannot both win it.
+- **Alerts.** Three requests post a Discord alert the moment the code goes out. These are a number outside the realm countries, the third code to one number within an hour, and the fifth code to one number. A failed Bird call posts one alert per ten minutes.
+- **The carrier.** The main app sends the code as one SMS, straight to Bird's SMS channel (`src/lib/phone-verification/sms.ts`). The code does not go through Notis. Without the three Bird values, a development or preview deployment prints the code to the server log. Production refuses.
+
 #### Unsubscribe
 
 - **ΣΤΟΠ on WhatsApp**: Notis unsubscribes the reader and keeps their preferences. The profile switch shows the subscription status, so it shows off.
@@ -289,18 +305,13 @@ The completion screen shows the real first message (`notis_intro`) and says when
 
 #### Core API Routes:
 ```typescript
-// Public endpoints
-GET /api/notifications/[id] - Get notification for public view
-
 // Admin endpoints  
 POST /api/cities/[cityId]/meetings/[meetingId]/notifications - Create notifications manually
 GET /api/admin/notifications - List all notifications with filters
 POST /api/admin/notifications/release - Release pending notifications
-GET /api/notifications/[id]/preview - Admin preview notification content
 
 // Administrative body management
 GET /api/admin/administrative-bodies - List with notification behavior
-PATCH /api/admin/administrative-bodies/[id]/notification-behavior - Update behavior
 
 // User preference management  
 GET /api/users/[userId]/notification-preferences - Get user preferences

@@ -13,6 +13,7 @@
  *   SKIP_ENV_VALIDATION=1 npx tsx scripts/search-eval.ts --min-score 0.94   # sweep the semantic cutoff
  *   SKIP_ENV_VALIDATION=1 npx tsx scripts/search-eval.ts --tier-margin      # field-tier ordering
  *   SKIP_ENV_VALIDATION=1 npx tsx scripts/search-eval.ts --related <id>    # a subject's related subjects, both scopes
+ *   SKIP_ENV_VALIDATION=1 npx tsx scripts/search-eval.ts --bands           # best similarity per case: the cutoff window, per model
  */
 // Must stay the FIRST import: it loads .env before `../src/lib/search/query`
 // initialises `@/env.mjs`. See scripts/search-eval-env.ts.
@@ -20,8 +21,9 @@ import './search-eval-env';
 
 import { Client, estypes } from '@elastic/elasticsearch';
 import { buildSearchQuery, rankingMultiplierRatio, MAX_RANKING_MULTIPLIER_RATIO } from '../src/lib/search/query';
-import type { SearchRequest } from '../src/lib/search/types';
+import type { QueryContainer, SearchRequest } from '../src/lib/search/types';
 import { buildRelatedSubjectsQuery, type RelatedSubjectSeed } from '../src/lib/search/related';
+import { resolveIndexProfile } from '../src/lib/search/profile';
 import type { RelatedScope } from '../src/lib/search/types';
 import { NO_EXTRACTED_FILTERS } from '../src/lib/search/filters';
 
@@ -31,6 +33,12 @@ interface EvalCase {
     query: string;
     expect: Expectation;
     note: string;
+    /**
+     * Measured by --bands only. The query is junk for the semantic arm, but
+     * one of its words is a real word of the corpus (Αθήνα, τιμή, αγάπη), so
+     * the lexical arm matches it and the full suite cannot expect empty.
+     */
+    bandsOnly?: boolean;
 }
 
 const CASES: EvalCase[] = [
@@ -101,6 +109,25 @@ const CASES: EvalCase[] = [
     { query: 'λεφτά για τον αθλητισμό', expect: 'results', note: 'paraphrase: sports funding colloquial' },
     { query: 'ζώα χωρίς ιδιοκτήτη', expect: 'results', note: 'paraphrase: stray animals' },
     { query: 'βοήθεια σε φτωχούς', expect: 'results', note: 'paraphrase: welfare' },
+    // Paraphrases added for the jina calibration (Oct 2026): colloquial
+    // wording of common municipal matters, none sharing a stem with the
+    // likely subject title. The floor of this group is what the cutoff must
+    // stay under.
+    { query: 'θέσεις πάρκινγκ για ανάπηρους', expect: 'results', note: 'paraphrase: disabled parking (docs say ΑμεΑ)' },
+    { query: 'λακκούβες στους δρόμους', expect: 'results', note: 'paraphrase: potholes' },
+    { query: 'κλαδέματα δέντρων', expect: 'results', note: 'paraphrase: tree pruning' },
+    { query: 'φωτισμός δρόμων', expect: 'results', note: 'paraphrase: street lighting' },
+    { query: 'παιδικές χαρές ασφάλεια', expect: 'results', note: 'paraphrase: playground safety' },
+    { query: 'συλλογή ογκωδών αντικειμένων', expect: 'results', note: 'paraphrase: bulky waste pickup' },
+    { query: 'επιδότηση ενοικίου', expect: 'results', note: 'paraphrase: rent subsidy' },
+    { query: 'δημοτικά τέλη μείωση', expect: 'results', note: 'paraphrase: municipal fee reduction' },
+    { query: 'σχολικά γεύματα', expect: 'results', note: 'paraphrase: school meals' },
+    { query: 'αντιπλημμυρικά έργα', expect: 'results', note: 'paraphrase: flood works' },
+    { query: 'ποδοσφαιρικό γήπεδο συντήρηση', expect: 'results', note: 'paraphrase: football pitch upkeep' },
+    { query: 'κάδοι ανακύκλωσης γειτονιά', expect: 'results', note: 'paraphrase: recycling bins' },
+    { query: 'αδέσποτες γάτες στείρωση', expect: 'results', note: 'paraphrase: stray cat neutering' },
+    { query: 'κατάληψη πεζοδρομίου από καφετέριες', expect: 'results', note: 'paraphrase: cafe tables on the pavement' },
+    { query: 'χρηματοδότηση ΕΣΠΑ έργα δήμου', expect: 'results', note: 'paraphrase: EU-funded works' },
     // Junk — must return zero results
     { query: 'lava', expect: 'empty', note: 'the canonical bug report' },
     { query: 'bitcoin mining', expect: 'empty', note: 'off-topic English' },
@@ -115,7 +142,41 @@ const CASES: EvalCase[] = [
     { query: 'pizza margherita', expect: 'empty', note: 'logged junk' },
     { query: 'ηνκξκ', expect: 'empty', note: 'logged junk: keyboard mash (Greek)' },
     { query: 'asdfqwer', expect: 'empty', note: 'logged junk: keyboard mash (Latin)' },
+    // Junk added for the jina calibration (Oct 2026): everyday searches that
+    // have nothing to do with a council. The ceiling of this group is what
+    // the cutoff must stay above. Nearest neighbours are arbitrary, so this
+    // ceiling moves as the index grows; a wider group pins it better.
+    { query: 'καιρός αύριο Αθήνα', expect: 'empty', note: 'off-topic: weather', bandsOnly: true },
+    { query: 'iphone 15 τιμή', expect: 'empty', note: 'off-topic: phone price', bandsOnly: true },
+    { query: 'champions league τελικός', expect: 'empty', note: 'off-topic: football final' },
+    { query: 'python tutorial', expect: 'empty', note: 'off-topic English' },
+    { query: 'ηλιοβασίλεμα Σαντορίνη', expect: 'empty', note: 'off-topic: tourism' },
+    { query: 'ταινίες 2025 netflix', expect: 'empty', note: 'off-topic: streaming' },
+    { query: 'συνταγή τζατζίκι', expect: 'empty', note: 'off-topic: recipe' },
+    { query: 'ζώδια εβδομάδας', expect: 'empty', note: 'off-topic: horoscope' },
+    { query: 'bitcoin price today', expect: 'empty', note: 'off-topic English' },
+    { query: 'πώς να χάσω κιλά', expect: 'empty', note: 'off-topic: diet' },
+    { query: 'ελληνικό τραγούδι eurovision', expect: 'empty', note: 'off-topic: music', bandsOnly: true },
+    { query: 'οδηγίες πλυντηρίου', expect: 'empty', note: 'off-topic: appliance manual' },
+    { query: 'Harry Potter βιβλία', expect: 'empty', note: 'off-topic: books' },
+    { query: 'ασκήσεις κοιλιακών', expect: 'empty', note: 'off-topic: fitness' },
+    { query: 'ΑΜΚΑ ραντεβού', expect: 'empty', note: 'off-topic: national health number' },
+    { query: 'μαθηματικά λυκείου', expect: 'empty', note: 'off-topic: school maths', bandsOnly: true },
+    { query: 'qwertyuiop', expect: 'empty', note: 'keyboard mash (Latin row)' },
+    { query: 'νέο κινητό samsung', expect: 'empty', note: 'off-topic: phone', bandsOnly: true },
+    { query: 'chatgpt', expect: 'empty', note: 'off-topic: one word', bandsOnly: true },
+    { query: 'αγάπη', expect: 'empty', note: 'off-topic: one word', bandsOnly: true },
 ];
+
+/**
+ * The group a case belongs to in the band measurement (see runBands): junk
+ * sets the ceiling the cutoff must clear, paraphrases set the floor it must
+ * stay under, and the rest is on-topic wording the lexical arm also serves.
+ */
+function bandGroup(c: EvalCase): 'junk' | 'paraphrase' | 'on-topic' {
+    if (c.expect === 'empty') return 'junk';
+    return c.note.startsWith('paraphrase') ? 'paraphrase' : 'on-topic';
+}
 
 interface HitRow {
     score: number;
@@ -147,8 +208,8 @@ interface EvalSource {
 // container type also allows a bare function array; buildSearchQuery always
 // emits the full query form.
 function rankedQueryOf(
-    query: estypes.QueryDslQueryContainer | undefined
-): estypes.QueryDslQueryContainer | undefined {
+    query: QueryContainer | undefined
+): QueryContainer | undefined {
     const functionScore = query?.function_score;
     return functionScore && !Array.isArray(functionScore) ? functionScore.query : undefined;
 }
@@ -157,9 +218,9 @@ function rankedQueryOf(
 // semantic search is off, and one level deeper when location boosts wrap the
 // text core.
 function textDisMaxOf(
-    query: estypes.QueryDslQueryContainer | undefined
+    query: QueryContainer | undefined
 ): estypes.QueryDslDisMaxQuery | undefined {
-    const must = (query?.bool?.must ?? []) as estypes.QueryDslQueryContainer[];
+    const must = (query?.bool?.must ?? []) as QueryContainer[];
     return must.find((c) => c.dis_max)?.dis_max;
 }
 
@@ -167,9 +228,9 @@ function textDisMaxOf(
 // emits: the first branch of the dis_max when the semantic arm is on, and the
 // text clause itself when it is off.
 function lexicalBoolOf(
-    query: estypes.QueryDslQueryContainer | undefined
+    query: QueryContainer | undefined
 ): estypes.QueryDslBoolQuery | undefined {
-    const must = (rankedQueryOf(query)?.bool?.must ?? []) as estypes.QueryDslQueryContainer[];
+    const must = (rankedQueryOf(query)?.bool?.must ?? []) as QueryContainer[];
     const textClause = must[0];
     return (textClause?.dis_max?.queries?.[0] ?? textClause)?.bool;
 }
@@ -194,11 +255,11 @@ async function runQuery(
             size,
             enableSemanticSearch: mode !== 'lexical',
             // Left undefined unless --min-score was passed, so the default run
-            // measures DEFAULT_SEMANTIC_MIN_SCORE exactly as production applies it.
+            // measures the index's profile exactly as production applies it.
             semanticMinScore,
         },
     };
-    const q = buildSearchQuery(request, NO_EXTRACTED_FILTERS);
+    const q = buildSearchQuery(request, NO_EXTRACTED_FILTERS, undefined, await resolveIndexProfile(client));
 
     // Semantic-only mode: the semantic side is the second branch of the dis_max
     // under `must` (see buildSemanticFallbackQuery). Keep only that branch so
@@ -206,7 +267,7 @@ async function runQuery(
     if (mode === 'semantic') {
         const textCore = rankedQueryOf(q.query);
         const disMax = textDisMaxOf(textCore);
-        const semantic = disMax?.queries.find((c) => c.function_score);
+        const semantic = disMax?.queries.find((c) => c?.function_score);
         if (!disMax || !textCore || !semantic) throw new Error('semantic fallback branch missing');
         disMax.queries = [semantic];
         // Lift the text core out of applyRanking. This mode exists to calibrate
@@ -275,7 +336,7 @@ async function runRelated(subjectId: string, minScore?: number): Promise<void> {
 
     for (const scope of ['city', 'other'] as RelatedScope[]) {
         const q = {
-            ...buildRelatedSubjectsQuery(seed, scope, cityIds),
+            ...buildRelatedSubjectsQuery(seed, scope, cityIds, await resolveIndexProfile(client)),
             ...(minScore !== undefined && { min_score: minScore }),
         };
         const res = await client.search<EvalSource>({
@@ -360,7 +421,7 @@ const TIER_MARGIN_QUERIES = [
 // Which tier each scoring clause belongs to, recovered from the clause shape.
 // Used only to tell name clauses from the rest, but the full label makes the
 // printed failures readable.
-function tierLabel(inner: estypes.QueryDslQueryContainer): string {
+function tierLabel(inner: QueryContainer): string {
     if (inner.match) {
         const field = Object.keys(inner.match)[0];
         const match = inner.match[field];
@@ -382,7 +443,8 @@ function tierLabel(inner: estypes.QueryDslQueryContainer): string {
     if (inner.nested?.query) return tierLabel(inner.nested.query);
     // A field's alternate spellings share one dis_max and therefore one tier
     // (see anySpelling), so the first branch names the whole clause.
-    if (inner.dis_max?.queries.length) return tierLabel(inner.dis_max.queries[0]);
+    const firstSpelling = inner.dis_max?.queries[0];
+    if (firstSpelling) return tierLabel(firstSpelling);
     return 'unknown';
 }
 
@@ -396,8 +458,9 @@ type Nameable = { _name?: string };
 // spellings and the nested wrapper. It is what tells the two halves of a
 // coverage pair apart: the strict half takes LEXICAL_MINIMUM_SHOULD_MATCH, the
 // partial half takes 1.
-function coverageOf(inner: estypes.QueryDslQueryContainer): string | number | undefined {
-    if (inner.dis_max?.queries.length) return coverageOf(inner.dis_max.queries[0]);
+function coverageOf(inner: QueryContainer): string | number | undefined {
+    const firstSpelling = inner.dis_max?.queries[0];
+    if (firstSpelling) return coverageOf(firstSpelling);
     if (inner.nested?.query) return coverageOf(inner.nested.query);
     const options = Object.values(inner.match ?? {})[0];
     return typeof options === 'object' && options !== null
@@ -411,8 +474,8 @@ function coverageOf(inner: estypes.QueryDslQueryContainer): string | number | un
 // such rather than counted off as a repeat: a `#2` suffix reads as "the same
 // tier again", which is how a partial name match came to be scored as a title
 // match below.
-function stampTierNames(query: estypes.QueryDslQueryContainer | undefined): void {
-    const should = (lexicalBoolOf(query)?.should ?? []) as estypes.QueryDslQueryContainer[];
+function stampTierNames(query: QueryContainer | undefined): void {
+    const should = (lexicalBoolOf(query)?.should ?? []) as QueryContainer[];
     if (!should.length) throw new Error('lexical should-clauses missing');
 
     const counts: Record<string, number> = {};
@@ -428,9 +491,11 @@ function stampTierNames(query: estypes.QueryDslQueryContainer | undefined): void
 
 // One clause may be a dis_max over spellings, so every branch takes the same
 // name — matched_queries reports the tier, whichever spelling matched.
-function stampClause(inner: estypes.QueryDslQueryContainer, name: string): void {
+function stampClause(inner: QueryContainer, name: string): void {
     if (inner.dis_max) {
-        for (const branch of inner.dis_max.queries) stampClause(branch, name);
+        for (const branch of inner.dis_max.queries) {
+            if (branch) stampClause(branch, name);
+        }
         return;
     }
     if (inner.nested) {
@@ -464,7 +529,9 @@ type TierRun = 'live' | 'bare';
 async function runTierQuery(queryText: string, run: TierRun): Promise<TierHit[]> {
     const q = buildSearchQuery(
         { query: queryText, config: { size: 100, enableSemanticSearch: run === 'live' } },
-        NO_EXTRACTED_FILTERS
+        NO_EXTRACTED_FILTERS,
+        undefined,
+        await resolveIndexProfile(client)
     );
     stampTierNames(q.query);
     const query = run === 'live' ? q.query : rankedQueryOf(q.query);
@@ -588,10 +655,74 @@ async function runTierMargin(): Promise<void> {
     if (failed) process.exitCode = 1;
 }
 
+/** The best semantic similarity any document reaches for one query, with no cutoff. */
+async function bestSimilarity(queryText: string): Promise<{ score: number; name: string } | null> {
+    const res = await client.search<EvalSource>({
+        index: (await resolveIndexProfile(client)).index,
+        size: 1,
+        _source: ['name'],
+        query: {
+            dis_max: {
+                tie_breaker: 0,
+                queries: [
+                    { semantic: { field: 'name.semantic', query: queryText } },
+                    { semantic: { field: 'description.semantic', query: queryText } },
+                ],
+            },
+        },
+    });
+    const hit = res.hits.hits[0];
+    return hit?._score != null ? { score: hit._score, name: hit._source?.name ?? '' } : null;
+}
+
+/**
+ * The measurement that picks a cutoff, and that compares embedding models:
+ * for every case, the best similarity the index reaches, grouped into junk,
+ * paraphrase and on-topic. Prints the junk ceiling, the paraphrase floor, the
+ * window between them, and that window as a share of the model's band, so
+ * two models on different similarity scales compare on one number. Run it
+ * against one probe index per model (ELASTICSEARCH_INDEX=<probe>) with the
+ * same CASES, and keep the model with the widest share.
+ */
+async function runBands(): Promise<void> {
+    const profile = await resolveIndexProfile(client);
+    console.log(`\n▶ bands on ${profile.index} (${profile.inferenceId ?? 'unknown endpoint'}), ${CASES.length} cases`);
+    const scores: Record<'junk' | 'paraphrase' | 'on-topic', number[]> = { junk: [], paraphrase: [], 'on-topic': [] };
+    const rows: Array<{ group: string; score: number; query: string; name: string }> = [];
+    for (const c of CASES) {
+        const best = await bestSimilarity(c.query);
+        if (!best) continue;
+        const group = bandGroup(c);
+        scores[group].push(best.score);
+        rows.push({ group, score: best.score, query: c.query, name: best.name });
+    }
+    for (const row of rows.sort((a, b) => b.score - a.score)) {
+        console.log(`  ${row.score.toFixed(3)}  ${row.group.padEnd(10)} ${row.query.padEnd(38)} -> ${row.name.slice(0, 50)}`);
+    }
+    const max = (xs: number[]) => Math.max(...xs);
+    const min = (xs: number[]) => Math.min(...xs);
+    const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+    const junkCeiling = max(scores.junk);
+    const paraphraseFloor = min(scores.paraphrase);
+    const onTopicCeiling = max([...scores['on-topic'], ...scores.paraphrase]);
+    const band = onTopicCeiling - junkCeiling;
+    const window = paraphraseFloor - junkCeiling;
+    console.log(`\n  junk        n=${scores.junk.length}  min/median/max = ${min(scores.junk).toFixed(3)} / ${median(scores.junk).toFixed(3)} / ${junkCeiling.toFixed(3)}`);
+    console.log(`  paraphrase  n=${scores.paraphrase.length}  min/median/max = ${paraphraseFloor.toFixed(3)} / ${median(scores.paraphrase).toFixed(3)} / ${max(scores.paraphrase).toFixed(3)}`);
+    console.log(`  on-topic    n=${scores['on-topic'].length}  min/median/max = ${min(scores['on-topic']).toFixed(3)} / ${median(scores['on-topic']).toFixed(3)} / ${max(scores['on-topic']).toFixed(3)}`);
+    console.log(`\n  junk ceiling ${junkCeiling.toFixed(3)}  paraphrase floor ${paraphraseFloor.toFixed(3)}  window ${window >= 0 ? '+' : ''}${window.toFixed(3)}`);
+    console.log(`  band (junk ceiling to on-topic ceiling) ${band.toFixed(3)}  window share ${(100 * window / band).toFixed(1)}%`);
+    console.log(`  a cutoff mid-window: ${((junkCeiling + paraphraseFloor) / 2).toFixed(3)}  (current profile: ${profile.semanticMinScore})`);
+}
+
 async function main() {
     const args = process.argv.slice(2);
     if (args.includes('--tier-margin')) {
         await runTierMargin();
+        return;
+    }
+    if (args.includes('--bands')) {
+        await runBands();
         return;
     }
     const flagValue = (flag: string): string | undefined => {
@@ -600,9 +731,10 @@ async function main() {
     };
 
     const mode = (flagValue('--mode') ?? 'full') as 'full' | 'lexical' | 'semantic';
-    // Sweeps DEFAULT_SEMANTIC_MIN_SCORE without editing query.ts: run the suite
+    // Sweeps the index's semanticMinScore (profile.ts) without editing query.ts: run the suite
     // at several cutoffs and read where the on-topic and paraphrase cases start
-    // to go empty and the junk ones stop. That sweep is what produced 0.930.
+    // to go empty and the junk ones stop. That sweep produced every cutoff in
+    // the PROFILES table of profile.ts.
     const rawMinScore = flagValue('--min-score');
     const semanticMinScore = rawMinScore === undefined ? undefined : Number(rawMinScore);
     if (semanticMinScore !== undefined && !Number.isFinite(semanticMinScore)) {
@@ -625,7 +757,7 @@ async function main() {
 
     let pass = 0;
     const failures: string[] = [];
-    for (const c of CASES) {
+    for (const c of CASES.filter(c => !c.bandsOnly)) {
         const { total, rows } = await runQuery(c.query, mode, semanticMinScore);
         const ok = c.expect === 'empty' ? total === 0 : total > 0;
         if (ok) pass++; else failures.push(c.query);
@@ -633,7 +765,7 @@ async function main() {
         console.log(`\n${flag} "${c.query}" (${c.note}) [expect ${c.expect}] — total=${total}`);
         printRows(rows.slice(0, c.expect === 'empty' ? 5 : 8));
     }
-    console.log(`\n═══ ${pass}/${CASES.length} expectations met (mode=${mode}` +
+    console.log(`\n═══ ${pass}/${CASES.filter(c => !c.bandsOnly).length} expectations met (mode=${mode}` +
         `${semanticMinScore === undefined ? '' : `, min-score=${semanticMinScore}`})` +
         (failures.length ? ` — failing: ${failures.map(f => `"${f}"`).join(', ')}` : ''));
     // A missed expectation is a failure, not a note in the log. Without this the

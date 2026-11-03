@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { LocateFixed, Loader2, PanelLeftClose } from 'lucide-react';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { ListHeader, RankedListHint, ZoomGroup } from './conceptShared';
 import { type LayoutProps, type LandingView } from '@/lib/landing/landingCore';
 import { matchesMunicipalityName } from '@/lib/landing/landingData';
@@ -14,6 +14,7 @@ import { MunicipalitiesList, MunicipalitySearch } from './MunicipalitiesList';
 import { LandingAside } from './LandingAside';
 import { SubjectList } from './SubjectList';
 import { InfoPanel } from './InfoPanel';
+import { aboutVideo } from '@/lib/landing/aboutVideo';
 
 /* ============================ DESKTOP LAYOUT ============================ */
 export function DesktopLayout({
@@ -66,10 +67,12 @@ export function DesktopLayout({
     infoOpen,
     onToggleInfo,
     infoHint,
+    hotSubjects,
     explainAvailable,
     realm,
 }: LayoutProps) {
     const t = useTranslations('landingV2');
+    const locale = useLocale();
     // The list panel beside the rail — collapsible (X), default open.
     const [panelOpen, setPanelOpen] = useState(true);
     // The Δήμοι tab's name search. It narrows the cards and the petition leaderboard. The
@@ -125,7 +128,7 @@ export function DesktopLayout({
             <aside
                 className="absolute bottom-4 left-4 top-4 z-[7] flex overflow-hidden rounded-2xl border border-black/40 bg-muted shadow-2xl ring-1 ring-black/5"
             >
-                <LandingAside view={view} onSelect={selectView} infoOpen={infoOpen} onToggleInfo={onToggleInfo} infoHint={infoHint} cities={cities} realm={realm} />
+                <LandingAside view={view} onSelect={selectView} infoOpen={infoOpen} onToggleInfo={onToggleInfo} infoHint={infoHint} realm={realm} />
 
                 {/* collapsible list column — the info drawer reuses it (over the current map) */}
                 {(panelOpen || infoOpen) && (
@@ -171,7 +174,7 @@ export function DesktopLayout({
                     )}
 
                     {infoOpen ? (
-                        <InfoPanel explainAvailable={explainAvailable} />
+                        <InfoPanel cities={cities} subjects={hotSubjects} explainAvailable={explainAvailable} video={aboutVideo(realm, locale)} onExploreMap={() => onToggleInfo()} />
                     ) : view === 'municipalities' ? (
                         <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto bg-muted/50 mb-3 px-4 py-4">
                             <MunicipalitiesList
@@ -247,7 +250,12 @@ export function DesktopLayout({
                                 onCommitSearch={onCommitSearch}
                             />
                         </div>
-                        <DateRangePill value={range} onChange={setRange} />
+                        <DateRangePill
+                            value={range}
+                            onChange={setRange}
+                            filters={filters}
+                            onClearDates={() => setFilters({ ...filters, dateFrom: null, dateTo: null })}
+                        />
                     </div>
                     <div className="pointer-events-auto relative z-10">
                         <CategoryFilterBar

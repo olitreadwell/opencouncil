@@ -3,41 +3,56 @@
 import { useState, useEffect, useCallback, useRef, useMemo, type ReactNode } from 'react';
 import { useLocale, useTranslations } from 'next-intl';
 import { Loader2, RotateCcw, Search } from 'lucide-react';
+import type * as z from 'zod';
 import { Input } from '@/components/ui/input';
 import { useToast } from '@/hooks/use-toast';
 import { AdminStrip, AdminToolButton } from '@/components/admin/AdminStrip';
 import { useCouncilMeetingData } from '../CouncilMeetingDataContext';
 import { DecisionWithSource, SubjectExtractedData } from '@/lib/db/decisions';
 import { MeetingCandidate } from '@/lib/db/decisionCandidateShape';
+import type { AdaLookupOutcome, AdministrativeBodySettings } from '@/lib/db/types';
+import { ADA_LOOKUP_SETTLE_MS } from '@/lib/db/types/adaLookups';
 import { getPollingHistoryForMeeting, requestPollDecisions, resolveCandidateConflict } from '@/lib/tasks/pollDecisions';
-import { pollCadence } from '@/lib/tasks/pollDecisionsBackoff';
+import { pollCadence, takesNoDecisions } from '@/lib/tasks/pollDecisionsBackoff';
 import { calculateVoteResult, voteCountsPhrase, voteResultSentence } from '@/lib/utils/votes';
-import { formatCalendarDate, formatDate } from '@/lib/formatters/time';
-import { isRecordSubject, recordSection } from '@/lib/utils/subjects';
-import { splitAttendance } from '@/lib/utils/attendance';
-import { isMayorRole, isRoleActiveAt } from '@/lib/utils/roles';
-import { hasRecordedVote, resultKey } from '@/lib/utils/decisionResult';
+import { formatCalendarDate, formatDate, localCalendarDate } from '@/lib/formatters/time';
+import { getLocalizedMunicipalityName, getLocalizedName } from '@/lib/formatters/name';
+import type { decisionActionSchema, decisionUpsertSchema } from '@/lib/zod-schemas/decision';
+import { isRecordSubject } from '@/lib/utils/subjects';
+import { buildDecisionTable, orderRecordSubjects, type DecisionTableSubject } from '@/lib/decisionsTable/rows';
 import { causeFromPayload, decisionWriteCause, DecisionWriteError } from '@/lib/utils/decisionWriteCause';
 import { normalizeText } from '@/lib/utils';
 import { TWO_COLUMN_GRID } from '@/components/ui/surface-card';
-import { CollapsibleMarkdown, NameList, sortNamesByElectedOrder } from '@/components/meetings/decisions/shared';
+import { CollapsibleMarkdown, NameList } from '@/components/meetings/decisions/shared';
 import { scrollElementToContainerTop } from '@/lib/utils/scrollAnchor';
 import { attentionCount, estimateWork, isLikelyMatch, routeCandidates, splitWaitingSubjects } from '@/components/meetings/decisions/candidates';
 import { rowCandidates } from '@/components/meetings/decisions/rowCandidates';
 import { QuestionsCard, type Receipt } from '@/components/meetings/decisions/QuestionsCard';
-import { DecisionsTable, type TableRow } from '@/components/meetings/decisions/DecisionsTable';
+import { DecisionsTable, type DecisionsFilter, type TableRow } from '@/components/meetings/decisions/DecisionsTable';
+import { auditSignalFor } from '@/components/meetings/decisions/auditSignal';
+import { changeKey, documentCountsByChange } from '@/components/meetings/decisions/changeDocumentCounts';
+import { AuditEvidence } from '@/components/meetings/decisions/AuditEvidence';
+import { useAuditMode } from '@/components/meetings/decisions/useAuditMode';
 import { LinkPanel, type PanelConfirm, type PanelSubject } from '@/components/meetings/decisions/LinkPanel';
 import { SubjectPicker } from '@/components/meetings/decisions/SubjectPicker';
 import type { DiavgeiaFooterState } from '@/components/meetings/decisions/DiavgeiaFooter';
-import type { AdaEntry } from '@/components/meetings/decisions/AdaForm';
-import { diavgeiaDocUrl } from '@/components/meetings/decisions/pdfUrl';
+import { AdaLookupStep, type AdaLookupState } from '@/components/meetings/decisions/AdaLookupStep';
+import { readAdaLookup } from '@/lib/actions/adaLookups';
 import { readDiavgeiaUnitEntries } from '@/lib/utils/diavgeiaUnitScope';
 import { ConfirmSheet } from '@/components/meetings/decisions/ConfirmSheet';
+import { CandidateFacts } from '@/components/meetings/decisions/CandidateFacts';
+import { ManualDecisionForm, type ManualDecisionEntry } from '@/components/meetings/decisions/ManualDecisionForm';
 import type { MinutesData, MinutesSubject } from '@/lib/minutes/types';
 import { buildTimeline } from '@/components/meetings/decisions/timeline';
-import { downloadFile } from '@/lib/export/download';
+import { SubjectPresence } from '@/components/meetings/decisions/SubjectPresence';
+import { buildAttendance, buildSubjectRollCall } from '@/lib/minutes/builders';
+import { downloadFromUrl } from '@/lib/export/download';
 import { MinutesPreviewDialog } from '@/components/meetings/decisions/MinutesPreviewDialog';
+import { DerivationDialog } from '@/components/meetings/decisions/DerivationDialog';
 import { DecisionsRail } from '@/components/meetings/decisions/rail/DecisionsRail';
+import type { ConventionsPanel } from '@/components/meetings/decisions/rail/ConventionsSection';
+import type { DerivationOutput } from '@/lib/derivation/types';
+import { nameIssue } from '@/lib/derivation/issueText';
 
 /** MeetingCandidate as it arrives over JSON — dates serialized to strings. */
 type CandidateView = Omit<MeetingCandidate, 'publishDate' | 'meetingDate'> & {
@@ -50,15 +65,11 @@ interface DecisionsPayload {
     decisions: DecisionWithSource[];
     extractedData: SubjectExtractedData[];
     candidates?: CandidateView[];
+    derivation?: DerivationOutput;
 }
 
 /** Every write the page can POST to the decisions route. */
-type DecisionsAction =
-    | { action: 'assignCandidate'; candidateId: string; subjectId: string }
-    | { action: 'dismissCandidate'; candidateId: string }
-    | { action: 'undismissCandidate'; candidateId: string }
-    | { action: 'resetExtraction'; subjectId: string }
-    | { action: 'clearExtractedData' };
+type DecisionsAction = z.input<typeof decisionActionSchema>;
 
 /** The row panel: which row it belongs to, what it is doing, what it is asking. */
 interface PanelState {
@@ -71,6 +82,12 @@ interface PanelState {
     confirm: PanelConfirm | null;
     /** A failed write, shown inline. The row is unchanged when this is set. */
     error: string | null;
+    /** The ΑΔΑ step's state. It lives on the page because the poll that answers it does. */
+    lookup: AdaLookupState;
+    /** A manual entry waiting in the sheet for «Αποθήκευση». */
+    manual: ManualDecisionEntry | null;
+    /** The last entry the form continued with, so the form refills if it remounts. */
+    lastManual: ManualDecisionEntry | null;
 }
 
 /** A rejected proposal, kept on the page so the row and its receipt can undo it together. */
@@ -91,6 +108,8 @@ interface SheetView {
     /** Set only for a linked decision — the sheet names the subject it belongs to. */
     subjectId: string | null;
     subjectName: string | null;
+    /** A candidate opened from a subject's row: the subject a link would go to. */
+    target: { subjectId: string; candidate: CandidateView } | null;
 }
 
 /** The number a decision is known by; Diavgeia's filing protocol stands in until
@@ -116,40 +135,84 @@ const MAX_RECEIPTS = 4;
  * for a sticky header the container may gain later). */
 const JUMP_TO_TABLE_MARGIN_PX = 16;
 
+/** Index anything the derivation reports per subject. Rows with no subject —
+ * the meeting-wide issues — belong to the rail's card, not to a table row. */
+function bySubject<T extends { subjectId?: string }>(rows: T[]): Map<string, T[]> {
+    const map = new Map<string, T[]>();
+    for (const row of rows) {
+        if (!row.subjectId) continue;
+        const list = map.get(row.subjectId);
+        if (list) list.push(row);
+        else map.set(row.subjectId, [row]);
+    }
+    return map;
+}
+
 /** Turn a failed response into the error the page reads causes from. */
 const writeFailure = async (response: Response): Promise<DecisionWriteError> => {
     const payload = await response.json().catch(() => null) as unknown;
     return new DecisionWriteError(causeFromPayload(payload), `HTTP ${response.status}`);
 };
 
-export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }) {
+export function MeetingDecisionsPage({ isSuperAdmin, bodySettings }: {
+    isSuperAdmin: boolean;
+    /** The settings of the meeting's body. The page reads them for an editor; the public meeting does not carry them. */
+    bodySettings: Pick<AdministrativeBodySettings, 'diavgeiaUnitIds' | 'decisionConventions'> | null;
+}) {
+    // The mode lives here rather than in the rail that toggles it, because the
+    // table and the sheet read it too, and a superadmin's choice must never
+    // reach a page rendered for anyone else.
+    const [auditModePreference, setAuditMode] = useAuditMode();
+    const auditMode = isSuperAdmin && auditModePreference;
     const { toast } = useToast();
-    const { subjects, meeting, city, people, getPerson } = useCouncilMeetingData();
+    const { subjects, meeting, city, getPerson } = useCouncilMeetingData();
+    // A λογοδοσία or an απολογισμός has no decisions on Diavgeia: the page offers no poll for it.
+    const noDecisions = takesNoDecisions(meeting);
     const t = useTranslations('admin.adminActions');
     const tPage = useTranslations('admin.decisionsPage');
+    const tTable = useTranslations('decisionsTable');
     const tSubject = useTranslations('Subject');
     const locale = useLocale();
-    const administrativeBodyId = meeting.administrativeBodyId ?? null;
     // What a poll would actually ask Diavgeia for. Parsed through the same
     // helper the task uses, so a malformed entry surfaces here — in the admin
     // page, before it fails a poll — rather than only in the task log.
     const pollScope = useMemo(
-        () => readDiavgeiaUnitEntries(meeting.administrativeBody?.diavgeiaUnitIds),
-        [meeting.administrativeBody?.diavgeiaUnitIds],
+        () => readDiavgeiaUnitEntries(bodySettings?.diavgeiaUnitIds),
+        [bodySettings?.diavgeiaUnitIds],
     );
-    const meetingDate = new Date(meeting.dateTime);
-    const mayorPersonId = people.find(p =>
-        p.roles.some(r => isRoleActiveAt(r, meetingDate) && isMayorRole(r))
-    )?.id ?? null;
+    // The rules the derivation read this body's documents by, for the rail.
+    // getMeetingBodySettings parsed them: an unparseable record is null, as
+    // good as none, and the section says so. Nothing routes to a body on its own — its fields sit
+    // in the city form — so the edit link goes to the city's own page, whose
+    // admin strip opens that form.
+    const conventionsPanel = useMemo<ConventionsPanel | null>(() => {
+        const body = meeting.administrativeBody;
+        if (!body) return null;
+        return {
+            rules: bodySettings?.decisionConventions ?? null,
+            bodyName: getLocalizedName(body, locale),
+            cityName: getLocalizedMunicipalityName(city, locale),
+            editHref: `/${city.id}`,
+        };
+    }, [meeting.administrativeBody, bodySettings?.decisionConventions, city, locale]);
 
     const [decisions, setDecisions] = useState<Record<string, DecisionWithSource>>({});
     const [candidates, setCandidates] = useState<CandidateView[]>([]);
     const [extractedData, setExtractedData] = useState<Record<string, SubjectExtractedData>>({});
+    const [derivation, setDerivation] = useState<DerivationOutput | null>(null);
+    const [isRederiving, setIsRederiving] = useState(false);
     const [hasLoaded, setHasLoaded] = useState(false);
     const [loadFailed, setLoadFailed] = useState(false);
     const [minutes, setMinutes] = useState<MinutesData | null>(null);
     const [minutesFailed, setMinutesFailed] = useState(false);
     const [previewOpen, setPreviewOpen] = useState(false);
+    const [derivationOpen, setDerivationOpen] = useState(false);
+    const openDerivation = useCallback(() => setDerivationOpen(true), []);
+    // Undefined for anyone but a superadmin. The audit line and the issues card
+    // offer the link only when they are handed one, so withholding the callback
+    // is what keeps the glossary out of a city admin's reach — no second
+    // permission check down there to keep in step with this one.
+    const explainDerivation = isSuperAdmin ? openDerivation : undefined;
     const [pollingStatus, setPollingStatus] = useState<Awaited<ReturnType<typeof getPollingHistoryForMeeting>> | null>(null);
     const [isPolling, setIsPolling] = useState(false);
     const [isClearing, setIsClearing] = useState(false);
@@ -157,7 +220,7 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
     const [busySubjectId, setBusySubjectId] = useState<string | null>(null);
     const [busyCandidateId, setBusyCandidateId] = useState<string | null>(null);
 
-    const [filter, setFilter] = useState<'all' | 'missing'>('all');
+    const [filter, setFilter] = useState<DecisionsFilter>('all');
     const [subjectQuery, setSubjectQuery] = useState('');
     const [panel, setPanel] = useState<PanelState | null>(null);
     const [pickerCandidateId, setPickerCandidateId] = useState<string | null>(null);
@@ -168,11 +231,26 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
      * the next load — and its receipt could no longer show what it set aside. */
     const [setAside, setSetAside] = useState<Record<string, CandidateView>>({});
     const [rejected, setRejected] = useState<Record<string, RejectedProposal>>({});
-    const [viewing, setViewing] = useState<string | null>(null);
+    /** The document the sheet shows, and the row it was opened from — a
+     * candidate opened from a row can be matched to it from the sheet. */
+    const [viewing, setViewing] = useState<{ id: string; targetSubjectId: string | null } | null>(null);
+    /** The other organization a looked-up document came from, by its ΑΔΑ. No
+     * column holds it, and the panel's lookup state goes when the panel closes:
+     * the sheet opened again later still has to warn. */
+    const [lookupOrganizations, setLookupOrganizations] = useState<Record<string, string>>({});
+    const openSheet = useCallback(
+        (documentId: string, targetSubjectId: string | null) => setViewing({ id: documentId, targetSubjectId }),
+        [],
+    );
     // Bumped by handleJumpToTable; the effect below fires after the filter
     // change it triggers has committed, so it measures the table at its new
     // (post-filter) height rather than the one before the click.
     const [jumpToTableRequest, setJumpToTableRequest] = useState(0);
+    /** The subject whose issues are open in a row under it, in audit mode. */
+    const [openAuditSubjectId, setOpenAuditSubjectId] = useState<string | null>(null);
+    // Bumped when the issues card sends the page to a subject; the effect below
+    // scrolls once the row it opened has rendered.
+    const [auditJumpRequest, setAuditJumpRequest] = useState(0);
     const tableRef = useRef<HTMLDivElement>(null);
     const receiptSeq = useRef(0);
     /** The last write the row panel sent. Its error strip sends this one again:
@@ -197,6 +275,7 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
             setDecisions(decisionMap);
             setCandidates(data.candidates ?? []);
             setExtractedData(extractedMap);
+            setDerivation(data.derivation ?? null);
             setLoadFailed(false);
             return data;
         } catch {
@@ -310,16 +389,104 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
         }
     }, [tPage, labelOfId]);
 
+    // The poll that answers a lookup ends on another service; when the page's
+    // own poll watch sees it gone, read what it found for the typed ΑΔΑ. A read
+    // that finds the task still running asks again ten seconds later: the task
+    // can end before the watch ever sees it, or the watch can fail to start,
+    // and the step must not wait on it forever.
+    const lookup = panel?.lookup;
+    const panelSubjectId = panel?.subjectId ?? null;
+    useEffect(() => {
+        if (lookup?.kind !== 'searching' || pollingStatus?.pendingTaskId === lookup.taskId) return;
+        const { ada, taskId } = lookup;
+        // A later run re-reads the same task, so an outcome this run is still
+        // waiting for must not land on a panel that has moved on.
+        let cancelled = false;
+        let retry: ReturnType<typeof setTimeout> | null = null;
+        let candidateMissingSince: number | null = null;
+        const read = async () => {
+            const outcome = await readAdaLookup(meeting.cityId, meeting.id, taskId, ada)
+                .catch((): AdaLookupOutcome => ({ state: 'failed' }));
+            if (cancelled) return;
+            if (outcome.state === 'running') {
+                retry = setTimeout(() => { void read(); }, 10_000);
+                return;
+            }
+            const data = outcome.state === 'found' ? await fetchDecisions() : null;
+            if (cancelled) return;
+            // The candidate list can be read before the poll's result handler
+            // has written the candidate the outcome names: keep searching for
+            // as long as the outcome read itself would.
+            if (outcome.state === 'found' && outcome.candidateId !== null
+                && !data?.candidates?.some(c => c.id === outcome.candidateId)) {
+                candidateMissingSince ??= Date.now();
+                if (Date.now() - candidateMissingSince < ADA_LOOKUP_SETTLE_MS) {
+                    retry = setTimeout(() => { void read(); }, 10_000);
+                    return;
+                }
+            }
+            const next: AdaLookupState = (() => {
+                switch (outcome.state) {
+                    case 'notFound': return { kind: 'notFound', ada };
+                    case 'error': return { kind: 'error', ada };
+                    case 'notADecision': return { kind: 'notADecision', ada };
+                    case 'failed': return { kind: 'failed', ada, cause: null };
+                    case 'found': {
+                        const holder = outcome.linkedTo;
+                        if (holder) {
+                            const label = holder.meetingId === meeting.id
+                                ? (labelOfId(holder.subjectId) ?? ada)
+                                : tPage('panel.otherMeetingSubject', {
+                                    subject: holder.agendaItemIndex !== null
+                                        ? tPage('subjectLabel.numbered', { n: holder.agendaItemIndex })
+                                        : tPage('subjectLabel.named', { name: holder.subjectName }),
+                                    meeting: holder.meetingName,
+                                });
+                            return { kind: 'linkedElsewhere', ada, label };
+                        }
+                        const candidate = data?.candidates?.find(c => c.id === outcome.candidateId);
+                        if (!candidate) return { kind: 'failed', ada, cause: null };
+                        const organizationLabel = outcome.organizationLabel;
+                        if (organizationLabel) setLookupOrganizations(labels => ({ ...labels, [candidate.ada]: organizationLabel }));
+                        return { kind: 'found', ada, candidateId: candidate.id, number: candidateNumberOf(candidate), organizationLabel: outcome.organizationLabel };
+                    }
+                }
+            })();
+            setPanel(p => p && p.lookup.kind === 'searching' && p.lookup.taskId === taskId ? { ...p, lookup: next } : p);
+            if (next.kind === 'found') openSheet(next.candidateId, panelSubjectId);
+        };
+        void read();
+        return () => {
+            cancelled = true;
+            if (retry !== null) clearTimeout(retry);
+        };
+    }, [lookup, pollingStatus?.pendingTaskId, meeting.cityId, meeting.id, fetchDecisions, labelOfId, tPage, openSheet, panelSubjectId]);
+
     // ─── The view model ──────────────────────────────────────────────────
 
     const recordSubjects = useMemo(() => subjects.filter(isRecordSubject), [subjects]);
-    /** Agenda order, the order a posted Πίνακας is written in: the items taken
-     * up out of the agenda first, then the agenda itself by index. */
-    const orderedSubjects = useMemo(() => [
-        ...recordSubjects.filter(s => recordSection(s) === 'outOfAgenda'),
-        ...recordSubjects.filter(s => recordSection(s) === 'agenda')
-            .sort((a, b) => (a.agendaItemIndex ?? 0) - (b.agendaItemIndex ?? 0)),
-    ], [recordSubjects]);
+    /** The Πίνακας as the shared builder lays it out — agenda order, the items
+     * taken up out of the agenda first (issue 366) — over this page's own
+     * decisions and votes, which it refreshes after every write while the
+     * page's subjects stay as the server rendered them. */
+    const table = useMemo(() => buildDecisionTable(subjects.map((subject): DecisionTableSubject => {
+        const decision = decisions[subject.id];
+        return {
+            id: subject.id,
+            name: subject.name,
+            agendaItemTitle: subject.agendaItemTitle,
+            agendaItemIndex: subject.agendaItemIndex,
+            agendaSectionIndex: subject.agendaSectionIndex,
+            nonAgendaReason: subject.nonAgendaReason,
+            withdrawn: subject.withdrawn,
+            outcome: subject.outcome,
+            decision: decision
+                ? { decisionNumber: decision.decisionNumber, protocolNumber: decision.protocolNumber, pdfUrl: decision.pdfUrl, ada: decision.ada, summary: decision.summary }
+                : null,
+            votes: extractedData[subject.id]?.votes ?? [],
+        };
+    })), [subjects, decisions, extractedData]);
+    const orderedSubjects = useMemo(() => orderRecordSubjects(subjects), [subjects]);
 
     const hasDecision = useCallback((id: string) => Boolean(decisions[id]), [decisions]);
     const routed = useMemo(
@@ -342,31 +509,50 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
         return map;
     }, [decisions, candidates]);
 
-    const rows: TableRow[] = orderedSubjects.map(subject => {
+    // ─── What the derivation says, per subject ───────────────────────────
+    //
+    // The audit line and the sheet's evidence both ask the same three questions
+    // of one subject, so the meeting-wide output is indexed once here rather
+    // than scanned per row.
+
+    /** A person's name from the city's people the page already holds, for the issues that concern one. */
+    const personName = useCallback((personId: string) => getPerson(personId)?.name, [getPerson]);
+    /** A subject as the table numbers it: «3. Title», or the title alone off the agenda. */
+    const subjectLabel = useCallback((subjectId: string) => {
+        const subject = subjects.find(s => s.id === subjectId);
+        if (!subject) return undefined;
+        return subject.agendaItemIndex !== null ? `${subject.agendaItemIndex}. ${displayName(subject)}` : displayName(subject);
+    }, [subjects, displayName]);
+    /** The derivation's issues with the ids their messages would print replaced by names, once for every surface. */
+    const issues = useMemo(
+        () => (derivation?.issues ?? []).map(issue => nameIssue(issue, { person: personName, subject: subjectLabel })),
+        [derivation, personName, subjectLabel],
+    );
+    const issuesBySubject = useMemo(() => bySubject(issues), [issues]);
+    const derivedVotesBySubject = useMemo(() => bySubject(derivation?.votes ?? []), [derivation]);
+    const derivedAttendanceBySubject = useMemo(() => bySubject(derivation?.attendance ?? []), [derivation]);
+    /** How many of the meeting's documents stated each change (`changeKey`): the
+     * audit line looks the counts up here instead of `src/lib/minutes` carrying them too. */
+    const eventDocumentCounts = useMemo(() => documentCountsByChange(derivation?.events ?? []), [derivation]);
+
+    const rows: TableRow[] = table.rows.map(row => {
+        const subject = row.subject;
         const decision = decisions[subject.id];
-        const votes = extractedData[subject.id]?.votes ?? [];
-        const result = resultKey({ withdrawn: subject.withdrawn, hasDecision: Boolean(decision), votes });
         const proposal = decision ? undefined : routed.proposalBySubject.get(subject.id);
         return {
-            subject: {
-                id: subject.id,
-                name: displayName(subject),
-                agendaItemIndex: subject.agendaItemIndex,
-                nonAgendaReason: subject.nonAgendaReason,
-                withdrawn: subject.withdrawn,
-            },
+            subject,
             decision: decision
                 ? {
-                    number: decisionNumberOf(decision, tPage('table.linked')),
+                    number: row.decision?.number ?? tPage('table.linked'),
                     manualBy: decision.createdBy?.name || decision.createdBy?.email || null,
                 }
                 : null,
-            result,
+            result: row.result,
             // A dash means two different things and only one of them explains
             // itself: a linked decision whose document records no vote. A row
             // with nothing linked yet has nothing to explain.
-            resultHint: result === 'noVote' ? tPage('table.noVoteHint') : null,
-            voteCounts: hasRecordedVote(result) ? voteCountsPhrase(tPage, calculateVoteResult(votes)) : null,
+            resultHint: row.result === 'noVote' ? tPage('table.noVoteHint') : null,
+            voteCounts: row.voteCounts ? voteCountsPhrase(tPage, row.voteCounts) : null,
             proposal: proposal
                 ? {
                     candidateId: proposal.id,
@@ -377,6 +563,15 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
                 : null,
             rejected: rejected[subject.id]
                 ? { candidateId: rejected[subject.id].candidateId, number: rejected[subject.id].number }
+                : null,
+            // Only under the mode: the row is the clerk's table for everyone
+            // else, and a line about how a fact was reached is not theirs.
+            audit: auditMode
+                ? auditSignalFor({
+                    issues: issuesBySubject.get(subject.id) ?? [],
+                    votes: derivedVotesBySubject.get(subject.id) ?? [],
+                    personName,
+                })
                 : null,
         };
     });
@@ -392,15 +587,16 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
     };
     const visibleRows = query ? rows.filter(matchesQuery) : rows;
     const missingCount = visibleRows.filter(row => row.result === 'none').length;
+    const auditCount = visibleRows.filter(row => row.audit?.needsCheck).length;
 
-    // The table hides the all/missing chips at zero, so a filter still set to
-    // 'missing' strands the clerk on an empty table with no control to get
-    // back — at the moment the last row is filled in, which is the success
-    // path of the whole page. Only 'all' is ever set here, so a deliberate
-    // choice of 'all' is never undone.
-    useEffect(() => {
-        if (missingCount === 0) setFilter('all');
-    }, [missingCount]);
+    // The table hides a chip at zero, so a filter still set to the one that just
+    // emptied would strand the clerk on an empty table with no control to get
+    // back — at the moment the last row is filled in, which is the success path
+    // of the whole page. Whether a filter still holds is a function of the
+    // counts, not an event, so it is answered here; `filter` stays the choice
+    // that was made, and applies again as soon as its rows come back.
+    const chipCount: Record<DecisionsFilter, number> = { all: visibleRows.length, missing: missingCount, audit: auditCount };
+    const effectiveFilter: DecisionsFilter = chipCount[filter] === 0 ? 'all' : filter;
 
     // A poll or another admin can fill a row after its proposal was rejected.
     // The rejection is settled then, and a kept entry would show its "Αναίρεση"
@@ -411,10 +607,7 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
             return Object.keys(next).length === Object.keys(current).length ? current : next;
         });
     }, [decisions]);
-    const beforeAgenda = subjects
-        .filter(subject => !isRecordSubject(subject))
-        .map(subject => ({ id: subject.id, name: displayName(subject) }))
-        .filter(subject => !query || normalizeText(subject.name).includes(query));
+    const beforeAgenda = table.beforeAgenda.filter(subject => !query || normalizeText(subject.name).includes(query));
 
     const decidableSubjects = recordSubjects.filter(s => !s.withdrawn);
     /** Whether anything on this meeting was extracted — an excerpt counts, so a
@@ -464,6 +657,7 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
     const estimate = estimateWork(attention, waiting);
 
     const pollState: DiavgeiaFooterState = pollCadence({
+        noDecisions,
         canPoll: Boolean(city.diavgeiaUid) && pollScope.every(entry => entry.scope !== null),
         pollInFlight: Boolean(pollingStatus?.pendingTaskId),
     });
@@ -479,16 +673,25 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
         if (!response.ok) throw await writeFailure(response);
     };
 
-    const putDecision = async (body: { subjectId: string; ada: string; decisionNumber: string | null; pdfUrl: string }): Promise<void> => {
+    const putDecision = async (body: {
+        subjectId: string;
+        pdfUrl: string;
+        ada?: string;
+        decisionNumber?: string | null;
+        title?: string | null;
+        protocolNumber?: string | null;
+    }): Promise<void> => {
         const response = await fetch(`/api/cities/${meeting.cityId}/meetings/${meeting.id}/decisions`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 subjectId: body.subjectId,
-                ada: body.ada,
                 pdfUrl: body.pdfUrl,
+                ...(body.ada ? { ada: body.ada } : {}),
                 ...(body.decisionNumber ? { decisionNumber: body.decisionNumber } : {}),
-            }),
+                ...(body.title ? { title: body.title } : {}),
+                ...(body.protocolNumber ? { protocolNumber: body.protocolNumber } : {}),
+            } satisfies z.input<typeof decisionUpsertSchema>),
         });
         if (!response.ok) throw await writeFailure(response);
     };
@@ -592,12 +795,14 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
         return true;
     };
 
-    /** Delete one link, then make the other: the shared body of replace and move. */
+    /** Delete one link, then make the other: the shared body of replace, move
+     * and a manual save over a linked decision. A failure closes the manual
+     * sheet too, so the panel's error strip under it can be seen. */
     const replaceLink = async (args: {
         loserSubjectId: string;
         loserDecision: DecisionWithSource;
         winnerSubjectId: string;
-        candidateId: string;
+        link: () => Promise<void>;
         onDone: () => void;
     }): Promise<void> => {
         setBusySubjectId(args.winnerSubjectId);
@@ -606,17 +811,17 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
             await deleteDecision(args.loserSubjectId);
         } catch (error) {
             setBusySubjectId(null);
-            setPanel(p => p && { ...p, confirm: null, error: failureSentence(error) });
+            setPanel(p => p && { ...p, confirm: null, manual: null, error: failureSentence(error) });
             return;
         }
         try {
-            await postAction({ action: 'assignCandidate', candidateId: args.candidateId, subjectId: args.winnerSubjectId });
+            await args.link();
             await refreshAfterWrite(true);
             args.onDone();
         } catch (error) {
             const restored = await relinkAfterFailure(args.loserSubjectId, args.loserDecision);
             if (restored) {
-                setPanel(p => p && { ...p, confirm: null, error: failureSentence(error) });
+                setPanel(p => p && { ...p, confirm: null, manual: null, error: failureSentence(error) });
             } else {
                 // The panel's note promises the row is unchanged, which is no
                 // longer true: say what is actually on the screen instead.
@@ -654,27 +859,61 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
         if (ok) dropReceipt(receiptId);
     };
 
-    const handleAdaLink = async (subjectId: string, entry: AdaEntry) => {
+    // A failed search is the step's own state, retried from the step's own
+    // button: the panel's error strip and its retry belong to writes.
+    const handleAdaSearch = async (subjectId: string, ada: string) => {
+        setPanel(p => p && { ...p, error: null });
+        try {
+            const start = await requestPollDecisions(meeting.cityId, meeting.id, { lookupAdas: [ada] });
+            setPanel(p => p && p.subjectId === subjectId ? {
+                ...p,
+                lookup: start.status === 'started' ? { kind: 'searching', ada, taskId: start.taskId } : { kind: 'blocked' },
+            } : p);
+            await refreshPollingStatus();
+        } catch (error) {
+            setPanel(p => p && p.subjectId === subjectId ? { ...p, lookup: { kind: 'failed', ada, cause: failureSentence(error) } } : p);
+        }
+    };
+
+    const handleManualSave = async (subjectId: string, entry: ManualDecisionEntry) => {
         const subject = subjectById.get(subjectId);
         if (!subject) return;
-        panelRetry.current = () => { void handleAdaLink(subjectId, entry); };
-        const ok = await runWrite({ subjectId, inPanel: true, changesDecision: true }, () => putDecision({
-            subjectId,
-            ada: entry.ada,
-            decisionNumber: entry.decisionNumber,
-            pdfUrl: diavgeiaDocUrl(entry.ada),
-        }));
-        if (!ok) return;
-        setPanel(null);
-        addReceipt(tPage('receipts.linked', {
-            number: entry.decisionNumber ?? entry.ada,
-            subject: labelOf(subject),
-        }));
-        // A decision typed in by hand carries no excerpt, no attendance and no
-        // votes. The poll's re-extraction path fills them, so the Αποτέλεσμα
-        // column has something to say without anyone asking for it.
-        await requestPollDecisions(meeting.cityId, meeting.id).catch(() => undefined);
-        await refreshPollingStatus();
+        panelRetry.current = () => { void handleManualSave(subjectId, entry); };
+        const afterSave = async () => {
+            setPanel(null);
+            addReceipt(tPage('receipts.savedManual', { number: entry.decisionNumber, subject: labelOf(subject) }));
+            // The poll reads the uploaded PDF like any linked decision. A poll already
+            // running reads it too if it started after the save; otherwise the next one does.
+            if (noDecisions) return;
+            try {
+                const start = await requestPollDecisions(meeting.cityId, meeting.id);
+                if (start.status === 'started') await refreshPollingStatus();
+            } catch (error) {
+                toast({ title: tPage('pollError'), description: failureSentence(error), variant: 'destructive' });
+            }
+        };
+        // A PUT over a candidate-backed decision would overwrite it in place and
+        // leave its candidate linked to a row that is now manual: unlink it
+        // first, as a replace does. A decision no candidate backs has nothing to
+        // release, and the PUT alone replaces it, so a failure leaves it there.
+        const current = decisions[subjectId];
+        if (current?.candidateBacked) {
+            await replaceLink({
+                loserSubjectId: subjectId,
+                loserDecision: current,
+                winnerSubjectId: subjectId,
+                link: () => putDecision({ subjectId, ...entry }),
+                onDone: () => { void afterSave(); },
+            });
+            return;
+        }
+        const ok = await runWrite({ subjectId, inPanel: true, changesDecision: true }, () => putDecision({ subjectId, ...entry }));
+        // The failure and its retry are in the panel, under the sheet.
+        if (!ok) {
+            setPanel(p => p && { ...p, manual: null });
+            return;
+        }
+        await afterSave();
     };
 
     const handleUnlink = async (subjectId: string) => {
@@ -728,7 +967,7 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
         addReceipt(
             tPage('receipts.dismissed', { number }),
             receiptId => { void handleUndoDismiss(candidateId, receiptId); },
-            { label: number, onOpen: () => setViewing(candidateId) },
+            { label: number, onOpen: () => openSheet(candidateId, null) },
         );
     };
 
@@ -777,6 +1016,31 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
         setJumpToTableRequest(request => request + 1);
     };
 
+    const toggleAuditSubject = useCallback((subjectId: string) => {
+        setOpenAuditSubjectId(open => (open === subjectId ? null : subjectId));
+    }, []);
+
+    /**
+     * From the issues card to a subject: its issues open under its row, and the
+     * row comes into view. The card shows whether or not audit mode is on, and
+     * the row exists only under it, so the jump turns the mode on. A search or
+     * the missing filter could hide the row, so both give way.
+     */
+    const selectIssueSubject = (subjectId: string) => {
+        if (!auditModePreference) setAuditMode(true);
+        setSubjectQuery('');
+        if (filter === 'missing') setFilter('all');
+        setOpenAuditSubjectId(subjectId);
+        setAuditJumpRequest(request => request + 1);
+    };
+
+    useEffect(() => {
+        if (auditJumpRequest === 0 || !openAuditSubjectId) return;
+        const row = Array.from(tableRef.current?.querySelectorAll<HTMLElement>('[data-subject-id]') ?? [])
+            .find(element => element.dataset.subjectId === openAuditSubjectId);
+        if (row) scrollElementToContainerTop(row, JUMP_TO_TABLE_MARGIN_PX);
+    }, [auditJumpRequest, openAuditSubjectId]);
+
     // Runs after the filter/query change above has committed and the table
     // has re-rendered at its new height, so the measurement below reflects
     // the layout the user actually sees rather than the one before the click.
@@ -788,7 +1052,8 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
     const handlePoll = async (forceExtract: boolean) => {
         setIsPolling(true);
         try {
-            await requestPollDecisions(meeting.cityId, meeting.id, forceExtract ? { forceExtract: true } : undefined);
+            const start = await requestPollDecisions(meeting.cityId, meeting.id, forceExtract ? { forceExtract: true } : undefined);
+            if (start.status === 'alreadyRunning') toast({ title: tPage('poll.alreadyRunning') });
             await refreshPollingStatus();
         } catch (error) {
             toast({ title: tPage('pollError'), description: failureSentence(error), variant: 'destructive' });
@@ -824,14 +1089,40 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
         }
     };
 
+    /** Re-run the derivation over the facts already stored, then show what it produced. */
+    const handleRederive = async () => {
+        setIsRederiving(true);
+        try {
+            const response = await fetch(`/api/cities/${meeting.cityId}/meetings/${meeting.id}/decisions`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'rederive' }),
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            // The derived rows are what the minutes read, so both are refetched.
+            await Promise.all([fetchDecisions(), fetchMinutes()]);
+        } catch (error) {
+            toast({ title: tPage('rederive'), description: `${error}`, variant: 'destructive' });
+        } finally {
+            setIsRederiving(false);
+        }
+    };
+
     const handleExportDocx = async () => {
         try {
-            const response = await fetch(`/api/cities/${meeting.cityId}/meetings/${meeting.id}/minutes`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            downloadFile(await response.blob(), `minutes-${city.id}-${meeting.id}.docx`);
+            await downloadFromUrl(`/api/cities/${meeting.cityId}/meetings/${meeting.id}/minutes`, `minutes-${city.id}-${meeting.id}.docx`);
             toast({ title: t('minutes.exportSuccess') });
         } catch {
             toast({ title: t('minutes.exportError'), variant: 'destructive' });
+        }
+    };
+
+    const handleExportDecisionsTable = async () => {
+        try {
+            await downloadFromUrl(`/api/cities/${meeting.cityId}/meetings/${meeting.id}/decisions/table`, `decisions-table-${city.id}-${meeting.id}.docx`);
+            toast({ title: tTable('exportSuccess') });
+        } catch {
+            toast({ title: tTable('exportError'), variant: 'destructive' });
         }
     };
 
@@ -840,7 +1131,7 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
     const openPanel = (subjectId: string, mode: 'link' | 'change') => {
         setPickerCandidateId(null);
         panelRetry.current = null;
-        setPanel({ subjectId, mode, query: '', confirm: null, error: null });
+        setPanel({ subjectId, mode, query: '', confirm: null, error: null, lookup: { kind: 'idle' }, manual: null, lastManual: null });
     };
 
     /** A pick in the row panel adds when the row is empty and replaces when it
@@ -888,7 +1179,7 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
             loserSubjectId,
             loserDecision,
             winnerSubjectId: subjectId,
-            candidateId: confirm.candidateId,
+            link: () => postAction({ action: 'assignCandidate', candidateId: confirm.candidateId, subjectId }),
             onDone: () => {
                 setPanel(null);
                 const number = candidateNumberOf(candidate);
@@ -909,6 +1200,11 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
         const subject = subjectById.get(subjectId);
         if (!subject) return null;
         const current = panel.mode === 'change' ? decisions[subjectId] : undefined;
+        // `blocked` is only a poll someone else started: it clears itself the
+        // moment that poll ends, since nothing here stored it.
+        const lookupState: AdaLookupState = panel.lookup.kind === 'idle' || panel.lookup.kind === 'blocked'
+            ? (pollingStatus?.pendingTaskId ? { kind: 'blocked' } : { kind: 'idle' })
+            : panel.lookup;
         return (
             <LinkPanel
                 subjectLabel={labelOf(subject)}
@@ -935,8 +1231,31 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
                 onCancelConfirm={() => setPanel(p => p && { ...p, confirm: null })}
                 onConfirm={confirm => handlePanelConfirm(subjectId, confirm)}
                 onLink={candidateId => handlePanelPick(subjectId, candidateId)}
-                onAdaSubmit={entry => { void handleAdaLink(subjectId, entry); }}
-                onOpenDocument={setViewing}
+                offerableCount={rowCandidates({ subjectId, candidates, subjectByCandidate, subjects: panelSubjects, query: '' }).length}
+                renderAdaStep={noDecisions ? null : ({ noCandidates, onBack, onManual, onClose }) => (
+                    <AdaLookupStep
+                        subjectLabel={labelOf(subject)}
+                        noCandidates={noCandidates}
+                        state={lookupState}
+                        onSearch={ada => { void handleAdaSearch(subjectId, ada); }}
+                        onOpenFound={candidateId => openSheet(candidateId, subjectId)}
+                        onManual={onManual}
+                        onBack={onBack}
+                        onClose={onClose}
+                    />
+                )}
+                renderManualStep={({ onBack, toAda, onClose }) => (
+                    <ManualDecisionForm
+                        subjectLabel={labelOf(subject)}
+                        uploadConfig={{ cityId: meeting.cityId, identifier: `${meeting.id}_${subjectId}`, kind: 'decision' }}
+                        initial={panel.lastManual}
+                        onContinue={entry => setPanel(p => p && { ...p, manual: entry, lastManual: entry })}
+                        onUseAda={noDecisions ? undefined : ada => { toAda(); void handleAdaSearch(subjectId, ada); }}
+                        onBack={onBack}
+                        onClose={onClose}
+                    />
+                )}
+                onOpenDocument={documentId => openSheet(documentId, subjectId)}
                 onClose={() => setPanel(null)}
                 saving={busySubjectId === subjectId}
                 error={panel.error}
@@ -983,12 +1302,68 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
         );
     };
 
+    /**
+     * What audit mode adds to the extraction pane: where each derived name came
+     * from, the phrase that licensed the inferences, the printed tally beside
+     * the derived one, the sentences behind the attendance changes, and this
+     * subject's issues as text rather than as tooltips.
+     *
+     * Null when the mode is off — the ordinary pane above is untouched — and
+     * null too when the derivation left this subject nothing to show.
+     */
+    const renderAuditEvidence = (subjectId: string): ReactNode => {
+        if (!auditMode) return null;
+        const decision = decisions[subjectId];
+        const issues = issuesBySubject.get(subjectId) ?? [];
+        const votes = derivedVotesBySubject.get(subjectId) ?? [];
+        const attendance = derivedAttendanceBySubject.get(subjectId) ?? [];
+        const tally = issues.find(issue => issue.code === 'TALLY_MISMATCH');
+        const diffs = tally?.code === 'TALLY_MISMATCH' ? tally.params.diffs : [];
+        const changes = (minutes?.attendanceChanges ?? []).flatMap(change => {
+            if (change.atSubject.id !== subjectId || !change.rawText) return [];
+            const counts = eventDocumentCounts.get(changeKey({ ...change, rawText: change.rawText }))
+                ?? { reportingDocuments: null, totalDocuments: null };
+            return [{ text: change.rawText, ...counts }];
+        });
+        const unmatchedNames = decision?.unmatchedNames ?? [];
+        const nameOf = (personId: string): string => personName(personId) ?? personId;
+
+        const empty = !decision?.voteResultPhrase && votes.length === 0 && attendance.length === 0
+            && diffs.length === 0 && changes.length === 0 && issues.length === 0
+            && unmatchedNames.length === 0;
+        if (empty) return null;
+
+        return (
+            <AuditEvidence
+                voteResultPhrase={decision?.voteResultPhrase ?? null}
+                votes={votes.map(vote => ({ name: nameOf(vote.personId), origin: vote.origin }))}
+                attendance={attendance.map(row => ({ name: nameOf(row.personId), status: row.status, origin: row.origin }))}
+                tallyDiffs={diffs}
+                changes={changes}
+                issues={issues}
+                personName={personName}
+                unmatchedNames={unmatchedNames}
+            />
+        );
+    };
+
     /** The extraction results for a linked subject: excerpt, references, roll call, votes.
      * Shown in the view sheet's second tab. */
     const renderExtractedDetails = (subjectId: string): ReactNode => {
         const decision = decisions[subjectId];
         const extracted = extractedData[subjectId];
-        if (!decision?.excerpt && !decision?.references && !extracted) return null;
+        const auditEvidence = renderAuditEvidence(subjectId);
+        if (!decision?.excerpt && !decision?.references && !extracted && !auditEvidence) return null;
+        // The subject's presence from one snapshot: the minutes' subject, whose
+        // attendance gives both the absentees and the people the roll call does
+        // not name. When the minutes did not load, the decisions request's own
+        // rows, with no ΔΗΜΑΡΧΟΣ or ΠΡΟΕΔΡΟΣ line.
+        const minutesSubject = minutesById.get(subjectId);
+        const subjectRollCall = minutes?.councilComposition && minutesSubject?.attendance
+            ? buildSubjectRollCall(minutes.councilComposition, minutesSubject.attendance, minutes.administrativeBody?.type ?? null, minutesSubject.presidedBy)
+            : extracted && extracted.attendance.length > 0
+                ? buildSubjectRollCall(null, buildAttendance(extracted.attendance, null, (personId, name) => ({ personId, name, party: null, partyLabel: null }), () => null), null, null)
+                : null;
         return (
             <div className="space-y-3">
                 {decision?.excerpt && (
@@ -1013,33 +1388,7 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
                     </div>
                 )}
 
-                {extracted && extracted.attendance.length > 0 && (() => {
-                    const filteredAttendance = splitAttendance(extracted.attendance, mayorPersonId);
-                    const present = sortNamesByElectedOrder(filteredAttendance.present, getPerson, administrativeBodyId);
-                    const absent = sortNamesByElectedOrder(filteredAttendance.absent, getPerson, administrativeBodyId);
-                    return (
-                        <div>
-                            <div className="text-xs font-medium text-muted-foreground mb-1">{tPage('attendance')}</div>
-                            <div className="text-xs text-foreground space-y-1">
-                                <span>{present.length} {tPage('present')}, {absent.length} {tPage('absent')}</span>
-                                <div className="flex flex-col gap-1">
-                                    {present.length > 0 && (
-                                        <NameList
-                                            names={present.map(a => a.personName)}
-                                            label={`${tPage('showNames')} (${tPage('present')})`}
-                                        />
-                                    )}
-                                    {absent.length > 0 && (
-                                        <NameList
-                                            names={absent.map(a => a.personName)}
-                                            label={`${tPage('showNames')} (${tPage('absent')})`}
-                                        />
-                                    )}
-                                </div>
-                            </div>
-                        </div>
-                    );
-                })()}
+                {subjectRollCall && <SubjectPresence rollCall={subjectRollCall} />}
 
                 {extracted && extracted.votes.length > 0 && (() => {
                     const voteResult = calculateVoteResult(extracted.votes);
@@ -1066,10 +1415,25 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
                                         )}
                                     </div>
                                 )}
+                                {/* A ΠΑΡΩΝ or ΑΠΟΧΗ declaration is not a vote, so a unanimous vote can still hold one. */}
+                                {(voteResult.presentCount > 0 || voteResult.didNotVoteCount > 0) && (
+                                    <div className="flex flex-col gap-1">
+                                        <NameList
+                                            names={extracted.votes.filter(v => v.voteType === 'PRESENT').map(v => v.personName)}
+                                            label={`${tSubject('votePresent')} (${voteResult.presentCount})`}
+                                        />
+                                        <NameList
+                                            names={extracted.votes.filter(v => v.voteType === 'DID_NOT_VOTE').map(v => v.personName)}
+                                            label={`${tSubject('voteDidNotVote')} (${voteResult.didNotVoteCount})`}
+                                        />
+                                    </div>
+                                )}
                             </div>
                         </div>
                     );
                 })()}
+
+                {auditEvidence}
 
                 {isSuperAdmin && (
                     <AdminStrip>
@@ -1094,7 +1458,8 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
      * "Άνοιγμα εγγράφου" controls. */
     const view: SheetView | null = (() => {
         if (!viewing) return null;
-        const candidate = candidates.find(c => c.id === viewing) ?? setAside[viewing];
+        const live = candidates.find(c => c.id === viewing.id);
+        const candidate = live ?? setAside[viewing.id];
         if (candidate) {
             return {
                 title: candidate.title,
@@ -1103,9 +1468,11 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
                 ada: candidate.ada,
                 subjectId: null,
                 subjectName: null,
+                // A candidate set aside is no longer offered, so it opens to be read only.
+                target: live && viewing.targetSubjectId ? { subjectId: viewing.targetSubjectId, candidate: live } : null,
             };
         }
-        const entry = Object.entries(decisions).find(([, decision]) => decision.id === viewing);
+        const entry = Object.entries(decisions).find(([, decision]) => decision.id === viewing.id);
         if (!entry) return null;
         const [subjectId, decision] = entry;
         const subject = subjectById.get(subjectId);
@@ -1116,6 +1483,7 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
             ada: decision.ada,
             subjectId,
             subjectName: subject ? displayName(subject) : null,
+            target: null,
         };
     })();
     // The sheet stays mounted while it animates out — same dismissable-layer
@@ -1188,7 +1556,7 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
                                 pollState={pollState}
                                 onPoll={() => { void handlePoll(false); }}
                                 polling={isPolling}
-                                onOpenDocument={setViewing}
+                                onOpenDocument={documentId => openSheet(documentId, null)}
                                 onOpenPicker={candidateId => { setPanel(null); setPickerQuery(''); setPickerCandidateId(candidateId); }}
                                 onDismiss={candidateId => { void handleDismiss(candidateId); }}
                                 onKeepHolder={candidateId => { void resolveConflict(candidateId, 'dismiss'); }}
@@ -1200,8 +1568,9 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
                                 <DecisionsTable
                                     rows={visibleRows}
                                     beforeAgenda={beforeAgenda}
-                                    filter={filter}
+                                    filter={effectiveFilter}
                                     missingCount={missingCount}
+                                    auditCount={auditCount}
                                     onFilterChange={setFilter}
                                     openPanelSubjectId={panel?.subjectId ?? null}
                                     onOpenPanel={openPanel}
@@ -1211,37 +1580,119 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
                                     onUndoReject={(subjectId, candidateId) => {
                                         void handleUndoReject(subjectId, candidateId, rejected[subjectId]?.receiptId ?? null);
                                     }}
-                                    onOpenDecision={subjectId => setViewing(decisions[subjectId]?.id ?? null)}
-                                    onOpenProposalDocument={setViewing}
+                                    onOpenDecision={subjectId => {
+                                        const decisionId = decisions[subjectId]?.id;
+                                        if (decisionId) openSheet(decisionId, null);
+                                    }}
+                                    onOpenProposalDocument={openSheet}
                                     busySubjectId={busySubjectId}
+                                    openAuditSubjectId={openAuditSubjectId}
+                                    onToggleAudit={toggleAuditSubject}
+                                    onExplainDerivation={explainDerivation}
                                 />
                             </div>
                         </>
                     )}
 
-                    {sheetView && (
-                        <ConfirmSheet
-                            open={view !== null}
-                            onOpenChange={open => { if (!open) setViewing(null); }}
-                            action="view"
-                            decisionTitle={sheetView.title}
-                            decisionNumber={sheetView.decisionNumber}
-                            subjectName={sheetView.subjectName}
-                            pdfUrl={sheetView.pdfUrl}
-                            ada={sheetView.ada}
-                            subjectDescription={sheetView.subjectId
-                                ? subjectById.get(sheetView.subjectId)?.description ?? null
-                                : null}
-                            agendaItemTitle={sheetView.subjectId
-                                ? subjectById.get(sheetView.subjectId)?.agendaItemTitle ?? null
-                                : null}
-                            busy={false}
-                            extraContent={sheetView.subjectId ? renderExtractedDetails(sheetView.subjectId) : undefined}
-                            onConfirm={() => undefined}
+                    {sheetView && (() => {
+                        const target = sheetView.target;
+                        const subjectId = target?.subjectId ?? sheetView.subjectId;
+                        const subject = subjectId ? subjectById.get(subjectId) : undefined;
+                        const holder = target ? subjectByCandidate.get(target.candidate.id) : undefined;
+                        const movesFromElsewhere = Boolean(target && holder && holder !== target.subjectId && decisions[holder]);
+                        return (
+                            <ConfirmSheet
+                                open={view !== null}
+                                onOpenChange={open => { if (!open) setViewing(null); }}
+                                action={target ? 'assign' : 'view'}
+                                decisionTitle={sheetView.title}
+                                decisionNumber={sheetView.decisionNumber}
+                                // `assignExplain` contracts «σε» with the label's article; `viewExplain` quotes the bare name.
+                                subjectName={target ? (subject ? labelOf(subject) : null) : sheetView.subjectName}
+                                pdfUrl={sheetView.pdfUrl}
+                                ada={sheetView.ada}
+                                subjectDescription={subject?.description ?? null}
+                                agendaItemTitle={subject?.agendaItemTitle ?? null}
+                                meetingId={meeting.id}
+                                cityId={meeting.cityId}
+                                busy={target ? busySubjectId === target.subjectId || busyCandidateId === target.candidate.id : false}
+                                sourceNote={tPage('sheet.notOnDiavgeia')}
+                                confirmLabel={movesFromElsewhere ? tPage('sheet.moveAction') : tPage('sheet.assignAction')}
+                                facts={target ? (
+                                    <CandidateFacts
+                                        publishDate={target.candidate.publishDate}
+                                        declaredDate={target.candidate.meetingDate?.slice(0, 10) ?? null}
+                                        meetingDate={localCalendarDate(new Date(meeting.dateTime), city.timezone)}
+                                        readStatus={target.candidate.readStatus}
+                                        organizationLabel={lookupOrganizations[target.candidate.ada] ?? null}
+                                        proposal={target.candidate.subjectId === target.subjectId
+                                            ? { confidence: target.candidate.confidence, reasoning: target.candidate.reasoning }
+                                            : null}
+                                    />
+                                ) : undefined}
+                                extraContent={!target && sheetView.subjectId ? renderExtractedDetails(sheetView.subjectId) : undefined}
+                                onConfirm={() => {
+                                    if (!target) return;
+                                    setViewing(null);
+                                    // The write reports a failure, and asks a move or a replace, in the
+                                    // row's panel — so the panel has to be open on that row first.
+                                    if (panel?.subjectId !== target.subjectId) {
+                                        openPanel(target.subjectId, decisions[target.subjectId] ? 'change' : 'link');
+                                    }
+                                    if (movesFromElsewhere && holder) {
+                                        setPanel(p => p && { ...p, confirm: { kind: 'move', candidateId: target.candidate.id, from: labelOfId(holder) ?? '' } });
+                                    } else {
+                                        handlePanelPick(target.subjectId, target.candidate.id);
+                                    }
+                                }}
+                                onDismiss={target ? () => { setViewing(null); void handleDismiss(target.candidate.id); } : undefined}
+                            />
+                        );
+                    })()}
+
+                    {panel?.manual && (() => {
+                        const subject = subjectById.get(panel.subjectId);
+                        const entry = panel.manual;
+                        const replaced = decisions[panel.subjectId];
+                        return (
+                            <ConfirmSheet
+                                open
+                                onOpenChange={open => { if (!open) setPanel(p => p && { ...p, manual: null }); }}
+                                action="link"
+                                decisionTitle={entry.title}
+                                decisionNumber={entry.decisionNumber}
+                                subjectName={subject ? labelOf(subject) : null}
+                                pdfUrl={entry.pdfUrl}
+                                ada={null}
+                                sourceNote={tPage('sheet.notOnDiavgeia')}
+                                subjectDescription={subject?.description ?? null}
+                                agendaItemTitle={subject?.agendaItemTitle ?? null}
+                                meetingId={meeting.id}
+                                cityId={meeting.cityId}
+                                busy={busySubjectId === panel.subjectId}
+                                confirmLabel={tPage('sheet.saveAction')}
+                                explainNote={replaced
+                                    ? tPage(replaced.candidateBacked ? 'panel.replaceNote' : 'panel.replaceNoteDestructive', {
+                                        number: decisionNumberOf(replaced, tPage('table.linked')),
+                                    })
+                                    : undefined}
+                                onConfirm={() => { void handleManualSave(panel.subjectId, entry); }}
+                            />
+                        );
+                    })()}
+
+                    {minutes && (
+                        <MinutesPreviewDialog
+                            open={previewOpen}
+                            onOpenChange={setPreviewOpen}
+                            data={minutes}
+                            isSuperAdmin={isSuperAdmin}
                         />
                     )}
 
-                    {minutes && <MinutesPreviewDialog open={previewOpen} onOpenChange={setPreviewOpen} data={minutes} />}
+                    {isSuperAdmin && (
+                        <DerivationDialog open={derivationOpen} onOpenChange={setDerivationOpen} />
+                    )}
                 </div>
                 <aside className="min-w-0">
                     <DecisionsRail
@@ -1250,12 +1701,25 @@ export function MeetingDecisionsPage({ isSuperAdmin }: { isSuperAdmin: boolean }
                         isSuperAdmin={isSuperAdmin}
                         onPreviewMinutes={() => setPreviewOpen(true)}
                         onExportDocx={handleExportDocx}
+                        onExportDecisionsTable={handleExportDecisionsTable}
                         previewDisabled={!minutes}
                         isPolling={isPolling}
-                        onPollSkippingCache={() => { void handlePoll(true); }}
+                        onPollSkippingCache={noDecisions ? null : () => { void handlePoll(true); }}
                         isClearing={isClearing}
                         onResetExtractions={handleClearExtractedData}
                         showResetExtractions={hasLoaded && hasExtractions}
+                        issues={issues}
+                        subjectName={subjectLabel}
+                        personName={personName}
+                        subjectOrder={orderedSubjects.map(subject => subject.id)}
+                        openIssueSubjectId={openAuditSubjectId}
+                        onSelectIssueSubject={selectIssueSubject}
+                        onRederive={handleRederive}
+                        isRederiving={isRederiving}
+                        onExplainDerivation={explainDerivation}
+                        auditMode={auditMode}
+                        onAuditModeChange={setAuditMode}
+                        conventions={conventionsPanel}
                     />
                 </aside>
             </div>

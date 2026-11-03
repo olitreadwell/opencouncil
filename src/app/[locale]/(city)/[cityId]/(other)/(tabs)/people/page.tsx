@@ -1,9 +1,9 @@
 import { notFound } from "next/navigation";
-import { isUserAuthorizedToEdit } from "@/lib/auth";
+import { getCurrentUser, getRoleLimitForCity } from "@/lib/auth";
 import CityPeople from "@/components/cities/CityPeople";
-import { getPartiesForCityCached, getPeopleForCityCached, getAdministrativeBodiesForCityCached, getCityCached } from "@/lib/cache";
+import { getPartiesForCityCached, getPeopleForCityCached, getPublicAdministrativeBodiesForCityCached, getCityCached } from "@/lib/cache";
 import { Metadata } from "next";
-import { buildCanonicalAlternates } from '@/lib/utils/hreflang';
+import { withCanonicalUrl } from '@/lib/utils/hreflang';
 import { getLocalizedName } from "@/lib/formatters/name";
 import { getOgLocale } from '@/i18n/config';
 import { getTranslations } from 'next-intl/server';
@@ -35,7 +35,7 @@ export async function generateMetadata(props: { params: Promise<{ cityId: string
     // Generate OG image URL
     const ogImageUrl = buildOgImageUrl(params.locale, { cityId: params.cityId, pageType: 'people' });
 
-    return {
+    return withCanonicalUrl(`/${params.cityId}/people`, {
         title: t('title', { cityName }),
         description,
         keywords: [...(t.raw('keywords') as string[]), cityName, 'OpenCouncil'],
@@ -61,13 +61,12 @@ export async function generateMetadata(props: { params: Promise<{ cityId: string
             description,
             images: [ogImageUrl],
         },
-        alternates: await buildCanonicalAlternates(`/${params.cityId}/people`),
         other: {
             'people:count': peopleCount.toString(),
             'people:parties': partiesCount.toString(),
             'people:city': city.name,
         }
-    };
+    });
 }
 
 export default async function PeoplePage(
@@ -81,14 +80,22 @@ export default async function PeoplePage(
         cityId
     } = params;
 
-    const [partiesWithPersons, administrativeBodies, allPeople, canEdit] = await Promise.all([
+    const [city, partiesWithPersons, administrativeBodies, allPeople, roleLimit, currentUser] = await Promise.all([
+        getCityCached(cityId),
         getPartiesForCityCached(cityId),
-        getAdministrativeBodiesForCityCached(cityId),
+        getPublicAdministrativeBodiesForCityCached(cityId),
         getPeopleForCityCached(cityId),
-        isUserAuthorizedToEdit({ cityId })
+        // null for a city admin; the bodies of a body admin; empty for a reader
+        getRoleLimitForCity(cityId),
+        // Only a superadmin gets the elected order control, as on /admin/people
+        // before it moved here. This gates the control, not the write: the save
+        // route accepts anyone who may edit the city. Read from the user, the
+        // way the tabs layout above does, rather than through the edit check.
+        getCurrentUser()
     ]);
+    const canEdit = roleLimit === null || roleLimit.size > 0;
 
-    if (!partiesWithPersons) {
+    if (!city || !partiesWithPersons) {
         notFound();
     }
 
@@ -98,7 +105,10 @@ export default async function PeoplePage(
             partiesWithPersons={partiesWithPersons}
             administrativeBodies={administrativeBodies}
             cityId={cityId}
+            cityLanguage={city.language}
             canEdit={canEdit}
+            isSuperAdmin={!!currentUser?.isSuperAdmin}
+            editableBodyIds={roleLimit ? [...roleLimit] : undefined}
         />
     );
 } 

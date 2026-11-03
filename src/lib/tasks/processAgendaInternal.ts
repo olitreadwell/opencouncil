@@ -1,17 +1,21 @@
+import { ConflictError, NotFoundError } from "@/lib/api/errors";
 import { ProcessAgendaRequest } from "../apiTypes";
 import { startTask } from "./tasks";
 import prisma from "../db/prisma";
 import { getTopics } from "../db/topics";
-import { getPartyFromRoles, getRoleNameForPerson } from "../utils";
+import { getPartyFromRoles } from "../utils";
+import { describeRolesAt } from "./speakerRoster";
 import { getPeopleForMeeting } from "../db/people";
 import { getRealmCountry } from "@/lib/realm";
+import { getRoleTitles } from "@/i18n/roleTitles";
+import { formatClockTime } from "@/lib/formatters/time";
 
 /**
  * Core processAgenda logic without auth checks.
  *
  * NOT in a "use server" file — this must not be callable as a Server Action.
  * Only called from:
- *   - The meeting creation API route (after withServiceOrUserAuth)
+ *   - The meeting creation API route (after withUserAuthorizedToEdit)
  *   - requestProcessAgenda (after withUserAuthorizedToEdit)
  */
 export async function requestProcessAgendaInternal(agendaUrl: string, councilMeetingId: string, cityId: string, {
@@ -34,34 +38,44 @@ export async function requestProcessAgendaInternal(agendaUrl: string, councilMee
                 },
                 take: 1
             },
+            administrativeBody: {
+                select: {
+                    name: true,
+                    type: true
+                }
+            },
             city: {
                 select: {
                     name: true,
                     language: true,
-                    realm: true
+                    realm: true,
+                    timezone: true
                 }
             }
         }
     });
 
     if (!councilMeeting) {
-        throw new Error("Council meeting not found");
+        throw new NotFoundError("Council meeting not found");
     }
 
+    // A typed refusal, for the same reason as in requestTranscribeInternal.
     if (!force && councilMeeting.subjects.length > 0) {
         console.log(`Meeting already has subjects`);
-        throw new Error('Meeting already has subjects');
+        throw new ConflictError('The meeting already has subjects. A re-run must set force.');
     }
 
     // Get relevant people for the meeting (filtered by administrative body)
-    const people = await getPeopleForMeeting(cityId, councilMeeting.administrativeBodyId);
+    const people = await getPeopleForMeeting(cityId, councilMeeting.administrativeBodyId, councilMeeting.dateTime);
     // Realm-scoped taxonomy: a French commune gets French topics, not the Greek set.
     const topicLabels = await getTopics(councilMeeting.city.realm);
+
+    const roleTitles = await getRoleTitles(councilMeeting.city.language);
 
     // Build people array with deduplication by ID (keep last entry)
     const peopleMap = new Map();
     for (const p of people) {
-        const roleName = getRoleNameForPerson(p.roles, councilMeeting.dateTime, councilMeeting.administrativeBodyId);
+        const roleName = describeRolesAt(p.roles, councilMeeting.dateTime, councilMeeting.administrativeBodyId, roleTitles) ?? '';
         const party = getPartyFromRoles(p.roles, councilMeeting.dateTime);
 
         peopleMap.set(p.id, {
@@ -82,7 +96,10 @@ export async function requestProcessAgendaInternal(agendaUrl: string, councilMee
         cityName: councilMeeting.city.name,
         cityLanguage: councilMeeting.city.language,
         // Scopes geocoding of the agenda's locations to the right country.
-        country: getRealmCountry(councilMeeting.city.realm)
+        country: getRealmCountry(councilMeeting.city.realm),
+        // A meeting with no body is the council's, as everywhere on the platform.
+        administrativeBody: councilMeeting.administrativeBody ?? { type: 'council' },
+        time: formatClockTime(councilMeeting.dateTime, councilMeeting.city.timezone),
     }
 
     console.log(`Process agenda body: ${JSON.stringify(body)}`);

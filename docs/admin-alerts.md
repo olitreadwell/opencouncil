@@ -6,7 +6,7 @@ OpenCouncil sends real-time admin alerts to Discord for key events:
 - ▶️ **Task started/completed/failed** - With links to admin panel
 - 📋 **pollDecisions batch** - Batch started + aggregated completion summary (replaces per-task alerts)
 - ✅ **Human review completed** - With review statistics (edits, time, efficiency)
-- ✨ **User onboarded** - Via notification preferences, petition, magic link, or admin invite
+- ✨ **User onboarded** - Via notification preferences, petition, the profile form, or admin invite. When the user has signed in, the alert says whether a Google account is linked.
 - 📝 **New petition** - When submitted for a municipality
 - 🔔 **Citizen notification signup** - When users sign up for citizen notifications
 - 📬 **Notifications created** - Summary when notifications are created for a meeting
@@ -143,7 +143,7 @@ Succeeded: 5 | Failed: 0 | Decisions Found: 0
 **User Onboarded:**
 ```
 ✨ User Onboarded
-Municipality: Athens | Source: Notification Preferences
+Municipality: Athens | Source: Notification Preferences | Google Account: Linked
 (PII not transmitted)
 ```
 
@@ -165,6 +165,28 @@ Delivery batch completed for 25 notifications
 📧 Emails Sent: 25 | 💬 Messages Sent: 18 | ❌ Failed: 0
 [View All Notifications](https://...)
 ```
+
+**processAgenda Alerts:**
+
+`processAgenda` uses `discordAlertMode: 'handlerReportsSuccess'`. The generic started and failed alerts stay. The result handler sends the completed alert, in the same format as every task alert, after it writes the meeting record. So the alert names the meeting by its new title, and it adds what the agenda held:
+
+```
+✅ processAgenda - vrilissia
+Completed: oct8_2026
+Task Type: processAgenda | Municipality: Vrilissia
+Meeting: 29η Έκτακτη
+From the invitation:
+  Kind: ordinary
+  Urgent: yes (filled)
+  Number: 29 (filled)
+  Format: byCirculation (filled) «θα πραγματοποιηθεί δια περιφοράς»
+Subjects: 1
+Task ID: `cmh…` | [Open Admin Panel](https://...)
+```
+
+`(filled)` marks a value that processAgenda wrote into the meeting record. The lines show what the invitation states. A value without the mark was not written by this run, and it can differ from the record: the `⚠️ The agenda needs a look` alert then reports the difference. A city outside Greece has no meeting record, so its alert has no `From the invitation` field.
+
+When the agenda has something that a person must decide, a second alert follows, `⚠️ The agenda needs a look`. A problem is an invitation that differs from a value the record holds, an agenda that holds more than one meeting, or a record that the rules refuse to write. Nothing was overwritten.
 
 ## Troubleshooting
 

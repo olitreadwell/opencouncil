@@ -1,3 +1,4 @@
+import type { Transcript } from '@/lib/db/transcript';
 import {
   monthsBetween,
   formatCurrency,
@@ -10,11 +11,15 @@ import {
   subjectToMapFeature,
   sortSubjectsByImportance,
   sortSubjectsBySpeakerContributionCount,
+  sortSubjectsByAgendaIndex,
+  compareAgendaPosition,
   joinTranscriptSegments,
   isRoleActive,
   filterActiveRoles,
   filterInactiveRoles,
   normalizeText,
+  searchTerms,
+  matchesEveryTerm,
   relevanceScore
 } from '../utils';
 import { calculateOfferTotals } from '../pricing';
@@ -533,6 +538,28 @@ describe('sortSubjectsByImportance (appearance)', () => {
 });
 
 describe('joinTranscriptSegments', () => {
+  it('keeps two speaker tags of one person apart when asked, and joins them otherwise', () => {
+    const segment = (speakerTagId: string, personId: string | null, start: number) => ({
+      speakerTagId, speakerTag: { id: speakerTagId, personId }, startTimestamp: start, endTimestamp: start + 10,
+      utterances: [{ id: `u${start}` }], topicLabels: [], summary: null,
+    });
+    const segments = [segment('tag-a', 'anna', 0), segment('tag-a', 'anna', 10), segment('tag-b', 'anna', 20), segment('tag-b', 'anna', 30)];
+
+    expect(joinTranscriptSegments(segments as unknown as Transcript)).toHaveLength(1);
+
+    const apart = joinTranscriptSegments(segments as unknown as Transcript, { sameSpeakerTagOnly: true });
+    expect(apart.map(s => [s.speakerTagId, s.utterances.length])).toEqual([['tag-a', 2], ['tag-b', 2]]);
+  });
+
+  it('never joins segments without a person, with or without the option', () => {
+    const segments = [0, 10].map(start => ({
+      speakerTagId: 'tag-a', speakerTag: { id: 'tag-a', personId: null }, startTimestamp: start, endTimestamp: start + 10,
+      utterances: [], topicLabels: [], summary: null,
+    }));
+    expect(joinTranscriptSegments(segments as unknown as Transcript)).toHaveLength(2);
+    expect(joinTranscriptSegments(segments as unknown as Transcript, { sameSpeakerTagOnly: true })).toHaveLength(2);
+  });
+
   it('should join adjacent segments with the same speaker', () => {
     const segments = [
       {
@@ -855,5 +882,98 @@ describe('calculateOfferTotals', () => {
     expect(result.subtotal).toBe(3700); // 1200 + 500 + 1800 + 200 + 0
     expect(result.discount).toBe(0); // 0% discount
     expect(result.total).toBe(3700); // 3700 - 0
+  });
+
+  it('should price physical presence by offer version', () => {
+    const offer = {
+      id: '4',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      type: 'STANDARD',
+      startDate: new Date('2024-01-01'),
+      endDate: new Date('2024-12-31'),
+      recipientName: 'Test Municipality',
+      platformPrice: 100,
+      ingestionPerHourPrice: 50,
+      hoursToIngest: 10,
+      correctnessGuarantee: false,
+      meetingsToIngest: null,
+      hoursToGuarantee: null,
+      equipmentRentalPrice: null,
+      equipmentRentalName: null,
+      equipmentRentalDescription: null,
+      physicalPresenceHours: 8,
+      discountPercentage: 0,
+      respondToEmail: 'test@example.com',
+      respondToName: 'Test Person',
+      cityId: '1',
+      respondToPhone: '+30123456789',
+      agreed: false,
+      adam: null,
+    } as const;
+
+    expect(calculateOfferTotals({ ...offer, version: 3 }).physicalPresenceTotal).toBe(200); // 8 * 25
+    expect(calculateOfferTotals({ ...offer, version: 4 }).physicalPresenceTotal).toBe(400); // 8 * 50
+  });
+});
+
+describe('compareAgendaPosition', () => {
+  it('orders by section, then by number, and puts subjects without a number last', () => {
+    const items = [
+      { name: 'S2 #1', agendaSectionIndex: 2, agendaItemIndex: 1 },
+      { name: 'S1 #2', agendaSectionIndex: 1, agendaItemIndex: 2 },
+      { name: 'none', agendaSectionIndex: null, agendaItemIndex: null },
+      { name: 'S1 #1', agendaSectionIndex: 1, agendaItemIndex: 1 },
+    ];
+
+    const sorted = [...items].sort(compareAgendaPosition);
+    expect(sorted.map(i => i.name)).toEqual(['S1 #1', 'S1 #2', 'S2 #1', 'none']);
+  });
+
+  it('treats a missing section as section 0, so a one-list agenda keeps plain number order', () => {
+    const items = [
+      { name: '#3', agendaItemIndex: 3 },
+      { name: '#1', agendaItemIndex: 1 },
+      { name: '#2', agendaItemIndex: 2, agendaSectionIndex: null },
+    ];
+
+    const sorted = [...items].sort(compareAgendaPosition);
+    expect(sorted.map(i => i.name)).toEqual(['#1', '#2', '#3']);
+  });
+
+  it('returns 0 for two subjects without a number', () => {
+    expect(compareAgendaPosition({ agendaItemIndex: null }, { agendaItemIndex: null })).toBe(0);
+  });
+});
+
+describe('sortSubjectsByAgendaIndex', () => {
+  it('follows the document: section 1 in full, then section 2, when both start at 1', () => {
+    const subjects = [
+      { name: 'Παρέα', agendaSectionIndex: 2, agendaItemIndex: 1 },
+      { name: 'Στέγη', agendaSectionIndex: 1, agendaItemIndex: 2 },
+      { name: 'Ο ΑΛΛΟΣ', agendaSectionIndex: 2, agendaItemIndex: 2 },
+      { name: 'Γλυπτό', agendaSectionIndex: 1, agendaItemIndex: 1 },
+    ];
+
+    const sorted = sortSubjectsByAgendaIndex(subjects);
+    expect(sorted.map(s => s.name)).toEqual(['Γλυπτό', 'Στέγη', 'Παρέα', 'Ο ΑΛΛΟΣ']);
+  });
+});
+
+describe('searchTerms and matchesEveryTerm', () => {
+  it('splits a query into normalized words, and ignores blank space', () => {
+    expect(searchTerms('  Μαρία   ΠΑΠΑ ')).toEqual(['μαρια', 'παπα']);
+    expect(searchTerms('   ')).toEqual([]);
+  });
+
+  it('needs every word, in any order', () => {
+    const text = normalizeText('Μαρία Παπαδοπούλου');
+    expect(matchesEveryTerm(text, searchTerms('παπα μαρια'))).toBe(true);
+    expect(matchesEveryTerm(text, searchTerms('μαρια γιωργος'))).toBe(false);
+  });
+
+  it('splits on any blank space, such as a tab or a no-break space', () => {
+    expect(searchTerms('μαρια\tπαπα')).toEqual(['μαρια', 'παπα']);
+    expect(searchTerms('μαρια\u00a0παπα')).toEqual(['μαρια', 'παπα']);
   });
 });

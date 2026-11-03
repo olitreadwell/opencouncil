@@ -13,11 +13,13 @@ import {
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { useTranslations } from 'next-intl'
-import { zodResolver } from "@hookform/resolvers/zod"
+import { useZodResolver } from "@/hooks/useLocalizedValidation"
 import { useForm } from "react-hook-form"
-import { z } from "zod"
+import * as z from "zod"
+import { roleDatesInOrder, roleDatesInOrderIssue } from "@/lib/zod-schemas/role"
 import { Loader2, Pencil, Trash2 } from "lucide-react"
-import { Party, AdministrativeBody } from '@prisma/client'
+import { Party } from '@prisma/client'
+import type { PublicAdministrativeBody } from '@/lib/db/types'
 import { RoleWithRelations } from '@/lib/db/types'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -50,39 +52,48 @@ const formSchema = z.object({
     type: z.enum(['city', 'party', 'administrativeBody']),
     partyId: z.string().optional(),
     administrativeBodyId: z.string().optional(),
-})
+}).refine(roleDatesInOrder, roleDatesInOrderIssue)
+
+export type RoleType = z.infer<typeof formSchema>['type']
+const ALL_ROLE_TYPES: RoleType[] = ['city', 'party', 'administrativeBody']
 
 interface RolesListProps {
     personId?: string;
     cityId: string;
     roles: RoleWithRelations[];
     parties: Party[];
-    administrativeBodies: AdministrativeBody[];
+    administrativeBodies: PublicAdministrativeBody[];
     onUpdate: (roles: RoleWithRelations[]) => void;
+    /**
+     * The kinds of role the editor offers, the first one as the default. A
+     * body admin gives roles on their bodies only (#828), so their editor
+     * offers no city role and no party role.
+     */
+    roleTypes?: RoleType[];
 }
 
-export default function RolesList({ personId, cityId, roles, parties, administrativeBodies, onUpdate }: RolesListProps) {
+export default function RolesList({ personId, cityId, roles, parties, administrativeBodies, onUpdate, roleTypes = ALL_ROLE_TYPES }: RolesListProps) {
     const [isDialogOpen, setIsDialogOpen] = useState(false)
     const [startDateOpen, setStartDateOpen] = useState(false)
     const [endDateOpen, setEndDateOpen] = useState(false)
     const [editingRole, setEditingRole] = useState<RoleWithRelations | null>(null)
     const t = useTranslations('RolesList')
 
-    const form = useForm<z.infer<typeof formSchema>>({
-        resolver: zodResolver(formSchema),
+    const form = useForm({
+        resolver: useZodResolver(formSchema),
         defaultValues: {
             name: editingRole?.name || "",
             name_en: editingRole?.name_en || "",
             isHead: editingRole?.isHead || false,
             startDate: editingRole?.startDate || null,
             endDate: editingRole?.endDate || null,
-            type: editingRole?.partyId ? 'party' : editingRole?.administrativeBodyId ? 'administrativeBody' : 'city',
+            type: editingRole?.partyId ? 'party' : editingRole?.administrativeBodyId ? 'administrativeBody' : roleTypes[0],
             partyId: editingRole?.partyId || undefined,
             administrativeBodyId: editingRole?.administrativeBodyId || undefined,
         },
     })
 
-    const handleSubmit = (values: z.infer<typeof formSchema>, e: React.FormEvent) => {
+    const handleSubmit = (values: z.output<typeof formSchema>, e: React.FormEvent) => {
         e.preventDefault(); // Prevent form submission
 
         const administrativeBodyId = values.type === 'administrativeBody' ? values.administrativeBodyId || null : null;
@@ -349,7 +360,7 @@ export default function RolesList({ personId, cityId, roles, parties, administra
                                                             field.onChange(date);
                                                             setStartDateOpen(false);
                                                         }}
-                                                        initialFocus
+                                                        autoFocus
                                                         className="rounded-md border"
                                                     />
                                                 </DialogContent>
@@ -395,7 +406,7 @@ export default function RolesList({ personId, cityId, roles, parties, administra
                                                                 field.onChange(date);
                                                                 setEndDateOpen(false);
                                                             }}
-                                                            initialFocus
+                                                            autoFocus
                                                             className="rounded-md border"
                                                         />
                                                     </DialogContent>

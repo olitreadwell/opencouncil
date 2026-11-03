@@ -5,8 +5,10 @@
 import "server-only";
 import { Prisma, NonAgendaReason, LocationType, Realm } from '@prisma/client';
 import prisma from '@/lib/db/prisma';
-import { PUBLIC_CITY_WHERE } from '@/lib/cityStatus';
+import { publicMeetingWhere } from '@/lib/cityStatus';
 import { DEFAULT_SUBJECT_LIMIT, MAX_SUBJECT_LIMIT } from '@/lib/zod-schemas/subject';
+import { meetingLabelInCity } from '@/lib/meetingName';
+import { meetingNameSelect } from '@/lib/db/types';
 
 /**
  * The wire shape of a subject in the REST API.
@@ -24,6 +26,7 @@ const apiSubjectSelect = {
     cityId: true,
     councilMeetingId: true,
     agendaItemIndex: true,
+    agendaSectionIndex: true,
     agendaItemTitle: true,
     nonAgendaReason: true,
     withdrawn: true,
@@ -37,7 +40,11 @@ const apiSubjectSelect = {
         select: { id: true, name: true, name_en: true },
     },
     councilMeeting: {
-        select: { id: true, name: true, name_en: true, dateTime: true },
+        select: {
+            id: true,
+            ...meetingNameSelect,
+            city: { select: { timezone: true } },
+        },
     },
 } satisfies Prisma.SubjectSelect;
 
@@ -90,16 +97,11 @@ export interface ApiSubjectFilters {
 }
 
 function meetingWhere(realm: Realm, filters: ApiSubjectFilters): Prisma.CouncilMeetingWhereInput {
-    const where: Prisma.CouncilMeetingWhereInput = {};
-
     // The public view carries three constraints, not one. A city ID is not a
     // secret — /api/cities/all hands out every ID, `pending` ones included — so
     // the released flag alone would serve a city we do not publish, and would
     // serve one realm's councils on another realm's domain.
-    if (!filters.includeUnreleased) {
-        where.released = true;
-        where.city = { ...PUBLIC_CITY_WHERE, realm };
-    }
+    const where: Prisma.CouncilMeetingWhereInput = filters.includeUnreleased ? {} : publicMeetingWhere(realm);
 
     if (filters.from || filters.to) {
         where.dateTime = {
@@ -116,7 +118,7 @@ function meetingWhere(realm: Realm, filters: ApiSubjectFilters): Prisma.CouncilM
  *
  * `includeUnreleased` drops the public-city and realm constraints as well as
  * the release constraint: the callers that pass it have authorized for this
- * city (or hold a service key), so they see their own city whatever its status.
+ * city, so they see their own city whatever its status.
  */
 export function buildApiSubjectWhere(
     realm: Realm,
@@ -160,8 +162,8 @@ function toApiSubject(
         description: row.description,
         cityId: row.cityId,
         meetingId: row.councilMeetingId,
-        meetingName: row.councilMeeting.name,
-        meetingNameEn: row.councilMeeting.name_en,
+        meetingName: meetingLabelInCity(row.councilMeeting, 'el'),
+        meetingNameEn: meetingLabelInCity(row.councilMeeting, 'en'),
         meetingDate: row.councilMeeting.dateTime.toISOString(),
         agendaItemIndex: row.agendaItemIndex,
         agendaItemTitle: row.agendaItemTitle,
@@ -192,6 +194,7 @@ export async function getApiSubjects(
         select: apiSubjectSelect,
         orderBy: [
             { councilMeeting: { dateTime: 'desc' } },
+            { agendaSectionIndex: { sort: 'asc', nulls: 'first' } },
             { agendaItemIndex: 'asc' },
             { name: 'asc' },
         ],

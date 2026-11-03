@@ -82,7 +82,8 @@
   },
   "subject": {
     "view": "Voir le sujet",
-    "discussionMinutes": "{min}′ de discussion"
+    "discussionMinutes": "{min}′ de discussion",
+    "loadingDescription": "Chargement de la description complète…"
   },
   "municipality": {
     "subjects": "Sujets",
@@ -108,7 +109,6 @@
     "known": "Si vous le souhaitez, activez les notifications pour suivre les sujets débattus.",
     "unknown": "Malheureusement, elle ne fait pas encore partie de notre réseau. Vous pouvez demander qu'elle le rejoigne et nous vous préviendrons dès que ce sera le cas.",
     "enable": "Activer les notifications",
-    "pickMunicipality": "Choisissez la commune qui vous intéresse, pour recevoir des mises à jour sur ce qui y est débattu",
     "notNow": "Plus tard"
   },
   "explain": {
@@ -148,6 +148,13 @@
     "6m": "6 derniers mois",
     "12m": "12 derniers mois",
     "all": "Toute la période"
+  },
+  "datesPill": {
+    "from": "à partir du {date}",
+    "to": "jusqu'au {date}",
+    "between": "{from} – {to}",
+    "setInFilters": "Dates définies dans les filtres",
+    "clear": "Effacer les dates"
   },
   "bodyType": {
     "council": "Conseil",
@@ -191,23 +198,41 @@
   },
   "info": {
     "title": "Qu'est-ce que c'est ?",
-    "intro": "La carte montre les sujets débattus lors des séances des conseils municipaux. Vous pouvez trouver ceux qui vous intéressent par catégorie, par zone ou directement sur la carte.",
-    "pins": {
-      "title": "Sujets sur la carte",
-      "body": "Chaque point est un sujet. Touchez-le pour ouvrir l'aperçu et lire sa description."
+    "heading": "OpenCouncil utilise l''<em>IA</em> pour écouter les séances publiques des conseils municipaux et les rendre simples et compréhensibles.",
+    "video": {
+      "cta": "Voir la vidéo",
+      "sub": "avec le son",
+      "title": "Qu'est-ce qu'OpenCouncil",
+      "description": "Un film d'une minute sur OpenCouncil et Notis, le voisin numérique qui vous tient informé."
     },
-    "cluster": {
-      "title": "Plusieurs sujets au même endroit",
-      "body": "Quand un endroit regroupe plusieurs sujets, un nombre apparaît. Touchez-le et choisissez celui qui vous intéresse."
+    "how": {
+      "listen": "Écoute la séance",
+      "write": "La transcrit mot à mot",
+      "sort": "La transforme en sujets consultables",
+      "map": "Les place sur la carte",
+      "speaker1": "Maire",
+      "text1": "Dès octobre, la [collecte au centre] change.",
+      "speaker2": "Conseillère",
+      "text2": "Et que fait-on des [chiens errants au port] ?",
+      "topic1": "Propreté",
+      "subject1": "Collecte au centre",
+      "topic2": "Animaux errants",
+      "subject2": "Chiens errants au port",
+      "place1": "Centre",
+      "place2": "Port"
     },
-    "general": {
-      "title": "Sujets d'intérêt général",
-      "body": "Ils n'ont pas de localisation précise ; vous les trouvez sous l'icône de chaque commune."
-    },
-    "moreBody": "Envie d'en savoir plus sur l'administration locale — comment fonctionne le conseil, comment les communes sont financées, et plus encore ?",
-    "moreCta": "En savoir plus",
-    "sampleTopic": "Propreté",
-    "sampleSubject": "Collecte des déchets dans le centre",
-    "sampleDesc": "Le conseil a débattu du nouveau calendrier de collecte et des itinéraires."
+    "startHere": "Par où commencer",
+    "cta": {
+      "map": "Explorer la carte",
+      "mapSub": "Les sujets, là où ils ont été discutés",
+      "city": "Voir une commune",
+      "cityMeetings": "{count, plural, one {# séance} other {# séances}}",
+      "subject": "Voir un sujet très débattu",
+      "notify": "S'abonner aux alertes",
+      "notifySub": "Quand un sujet vous concerne",
+      "more": "En savoir plus",
+      "moreExplain": "Comment fonctionne un conseil municipal",
+      "moreAbout": "Comment fonctionne OpenCouncil"
+    }
   }
 }

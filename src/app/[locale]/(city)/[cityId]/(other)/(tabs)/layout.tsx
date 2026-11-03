@@ -12,7 +12,9 @@ import { isPetitionable } from "@/lib/cityStatus";
 import { getCurrentUser, isUserAuthorizedToEdit } from "@/lib/auth";
 import type { CouncilMeetingWithSubjectPreview } from "@/lib/db/meetings";
 import { getNotificationPreferenceForCity } from "@/lib/db/notifications";
-import { publicMeetingStage, stageSignalsFromPreview } from "@/lib/meetingStage";
+import { countOpenConsultationsForCity } from "@/lib/db/consultations";
+import { stageSignalsFromPreview } from "@/lib/meetingStage";
+import { presentationKey, publicMeetingPresentation } from "@/lib/meetingPresentation";
 import { readerPhoneChannel } from "@/lib/notis/reader";
 
 export default async function TabsLayout(
@@ -39,19 +41,21 @@ export default async function TabsLayout(
     // Both scopes are fetched up front so the band's scope switch is instant. All
     // four are cached and narrow (limit 1), and the council-only pair is what the
     // page shows for cities whose committees meet far more often than the council.
+    // Both bookends take place: a postponed or cancelled meeting is neither the
+    // next nor the latest one, as /latest also skips it.
     // The petition bucket chains on the city: the rail's petition card reads it
     // on a city we do not cover yet, and a supported city has no card to read it.
     const cityPromise = getCityCached(cityId);
     const currentUserPromise = getCurrentUser();
-    const [city, cityMessage, currentUser, canEdit, upcoming, past, councilUpcoming, councilPast, subjectCount, petitionBucket, tStage, notificationPreference] = await Promise.all([
+    const [city, cityMessage, currentUser, canEdit, upcoming, past, councilUpcoming, councilPast, subjectCount, petitionBucket, tStage, notificationPreference, openConsultations] = await Promise.all([
         cityPromise,
         getCityMessageCached(cityId),
         currentUserPromise,
         isUserAuthorizedToEdit({ cityId }),
-        getCouncilMeetingsPreviewPublicCached(cityId, { timeFilter: 'upcoming', limit: 1 }),
-        getCouncilMeetingsPreviewPublicCached(cityId, { timeFilter: 'past', limit: 1 }),
-        getCouncilMeetingsPreviewPublicCached(cityId, { timeFilter: 'upcoming', limit: 1, administrativeBodyTypes: ['council'] }),
-        getCouncilMeetingsPreviewPublicCached(cityId, { timeFilter: 'past', limit: 1, administrativeBodyTypes: ['council'] }),
+        getCouncilMeetingsPreviewPublicCached(cityId, { timeFilter: 'upcoming', limit: 1, takesPlace: true }),
+        getCouncilMeetingsPreviewPublicCached(cityId, { timeFilter: 'past', limit: 1, takesPlace: true }),
+        getCouncilMeetingsPreviewPublicCached(cityId, { timeFilter: 'upcoming', limit: 1, administrativeBodyTypes: ['council'], takesPlace: true }),
+        getCouncilMeetingsPreviewPublicCached(cityId, { timeFilter: 'past', limit: 1, administrativeBodyTypes: ['council'], takesPlace: true }),
         getSubjectCountForCityCached(cityId),
         cityPromise.then(found => found && isPetitionable(found.status) ? getCityPetitionBucketCached(cityId) : null),
         getTranslations({ locale, namespace: 'meetingStage' }),
@@ -60,6 +64,8 @@ export default async function TabsLayout(
         // Depends on the user id, so it chains off currentUserPromise rather
         // than sitting as a plain sibling.
         currentUserPromise.then(user => user ? getNotificationPreferenceForCity(user.id, cityId) : null),
+        // Not cached: it turns with the clock at each end date, and a city has a handful at most.
+        cityPromise.then(found => found?.consultationsEnabled ? countOpenConsultationsForCity(cityId) : 0),
     ]);
     if (!city) {
         notFound();
@@ -81,7 +87,7 @@ export default async function TabsLayout(
     const now = new Date();
     const dated = (meeting: CouncilMeetingWithSubjectPreview | undefined): DatedMeeting | null => {
         if (!meeting) return null;
-        const stage = publicMeetingStage(stageSignalsFromPreview(meeting), now);
+        const stage = presentationKey(publicMeetingPresentation(meeting, stageSignalsFromPreview(meeting), now));
         return { meeting, stage, detail: stageChipDetail(tStage, stage, meeting.dateTime, city.timezone, locale, now) };
     };
 
@@ -97,13 +103,6 @@ export default async function TabsLayout(
         const scheduled = dated(next);
         return { next: scheduled?.stage === 'upcoming' ? scheduled : null, latest: dated(latest) };
     };
-
-    // Whether the city is eligible for the city creator. Read off the counts the
-    // city query already carries: this used to load every party and every person
-    // — each role dragging a full City row behind it — to compare two lengths
-    // against zero. Neither query filters by anything but cityId, so the counts
-    // answer the same question.
-    const hasNoData = city._count.councilMeetings === 0 && city._count.parties === 0 && city._count.persons === 0;
 
     const isSuperAdmin = !!currentUser?.isSuperAdmin;
     // An inactive message is a draft: only superadmins see it, to preview it.
@@ -138,7 +137,6 @@ export default async function TabsLayout(
                         cityMessage={cityMessage}
                         canEdit={canEdit}
                         isSuperAdmin={isSuperAdmin}
-                        hasNoData={hasNoData}
                         notificationPreference={notificationPreference}
                         phoneChannel={phoneChannel}
                         petitionBucket={petitionBucket}
@@ -149,7 +147,7 @@ export default async function TabsLayout(
                 </div>
 
                 <div className="min-w-0 space-y-8 max-lg:order-3 lg:col-start-1 lg:row-start-2">
-                    <CityNavigation cityId={cityId} city={city} />
+                    <CityNavigation cityId={cityId} city={city} openConsultations={openConsultations} />
 
                     <Suspense fallback={
                         <div className="flex justify-center items-center h-32">

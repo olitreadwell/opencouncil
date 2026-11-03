@@ -3,6 +3,9 @@ import { revalidatePath, revalidateTag } from 'next/cache'
 import { uploadFile } from '@/lib/s3'
 import { getPartiesForCity, createParty } from '@/lib/db/parties'
 import { withUserAuthorizedToEdit } from '@/lib/auth'
+import { parseFormData, readFormData } from '@/lib/api/form-data-parser'
+import { partyFormDataSchema } from '@/lib/zod-schemas/party'
+import { handleApiError } from '@/lib/api/errors'
 
 export async function GET(request: Request, props: { params: Promise<{ cityId: string }> }) {
     const params = await props.params;
@@ -14,18 +17,12 @@ export async function POST(request: Request, props: { params: Promise<{ cityId: 
     const params = await props.params;
     try {
         await withUserAuthorizedToEdit({ cityId: params.cityId })
-        const formData = await request.formData()
-
-        const name = formData.get('name') as string
-        const name_en = formData.get('name_en') as string
-        const name_short = formData.get('name_short') as string
-        const name_short_en = formData.get('name_short_en') as string
-        const colorHex = formData.get('colorHex') as string
-        const logo = formData.get('logo') as File | null
+        const { name, name_en, name_short, name_short_en, colorHex, logo } =
+            parseFormData(await readFormData(request), partyFormDataSchema)
 
         let logoUrl: string | undefined = undefined
 
-        if (logo && logo instanceof File) {
+        if (logo) {
             try {
                 const result = await uploadFile(logo, { prefix: 'party-logos' })
                 logoUrl = result.url
@@ -53,7 +50,6 @@ export async function POST(request: Request, props: { params: Promise<{ cityId: 
 
         return NextResponse.json(party)
     } catch (error) {
-        console.error('Error creating party:', error)
-        return NextResponse.json({ error: 'Failed to create party' }, { status: 500 })
+        return handleApiError(error, 'Failed to create party');
     }
 }

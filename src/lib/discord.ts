@@ -10,6 +10,7 @@ import { env } from '@/env.mjs';
 import { formatDate, formatDateTime, formatWeekday } from '@/lib/formatters/time';
 import { formatDurationMs } from '@/lib/formatters/time';
 import { getCityRealm } from '@/lib/db/cityRealm';
+import { hasGoogleAccount } from '@/lib/db/accounts';
 import { realmBaseUrl } from '@/lib/utils/realmBaseUrl';
 import { sendAdminAlert, truncateField } from '@/lib/discord-core';
 import type { ReviewerInfo } from '@/lib/db/reviews';
@@ -103,6 +104,8 @@ export async function sendTaskAdminAlert(data: {
     cityId: string;
     meetingId: string;
     error?: string;
+    /** What the task's result held, shown after the meeting. */
+    details?: { name: string; value: string; inline?: boolean }[];
 }): Promise<void> {
     const config = TASK_STATUS_CONFIG[data.status];
 
@@ -128,6 +131,7 @@ export async function sendTaskAdminAlert(data: {
                 value: data.meetingName,
                 inline: false,
             },
+            ...(data.details ?? []).map((detail) => ({ ...detail, value: truncateField(detail.value), inline: detail.inline ?? false })),
             {
                 name: 'Task ID',
                 value: `\`${data.taskId}\``,
@@ -153,14 +157,31 @@ export async function sendTaskAdminAlert(data: {
 export async function sendUserOnboardedAdminAlert(data: {
     cityId?: string;
     cityName: string;
-    onboardingSource: 'notification_preferences' | 'petition' | 'admin_invite' | 'magic_link';
+    onboardingSource: 'notification_preferences' | 'petition' | 'admin_invite' | 'profile';
+    /**
+     * The user, when they have signed in: the alert then says whether a
+     * Google account is linked. Absent for an admin invite, and for a signup
+     * that created the user. A database session does not record which
+     * provider opened it, so the link is the signal we have.
+     */
+    signedInUserId?: string;
 }): Promise<void> {
     const sourceLabels = {
         notification_preferences: 'Notification Preferences',
         petition: 'Petition',
         admin_invite: 'Admin Invite',
-        magic_link: 'Magic Link',
+        profile: 'Profile Form',
     };
+    // Looked up here, off the caller's save path: a failed lookup costs the
+    // field, not the save.
+    let googleLinked: boolean | null = null;
+    if (data.signedInUserId) {
+        try {
+            googleLinked = await hasGoogleAccount(data.signedInUserId);
+        } catch (error) {
+            console.error('Could not read the linked accounts for the onboarding alert:', error);
+        }
+    }
 
     const title = data.cityId
         ? `✨ User Onboarded - ${data.cityId}`
@@ -181,6 +202,11 @@ export async function sendUserOnboardedAdminAlert(data: {
                 value: sourceLabels[data.onboardingSource],
                 inline: true,
             },
+            ...(googleLinked === null ? [] : [{
+                name: 'Google Account',
+                value: googleLinked ? 'Linked' : 'Not linked',
+                inline: true,
+            }]),
         ],
         footer: {
             text: 'PII not transmitted for privacy',
@@ -345,6 +371,40 @@ export async function sendNotificationsCreatedAdminAlert(data: {
 }
 
 /**
+ * Send admin alert when the app failed to create the notifications of a meeting
+ * by itself (after a task, or on its release). Nothing retries them: an admin
+ * creates them from the meeting's admin panel. It takes ids only, because the
+ * failure may be the read of the meeting itself.
+ */
+export async function sendNotificationsFailedAdminAlert(data: {
+    cityId: string;
+    meetingId: string;
+    /** The notification type, or `release` when the release path failed before it chose one. */
+    notificationType: string;
+    error: string;
+}): Promise<void> {
+    const meetingAdminUrl = await meetingUrl(data, '/admin');
+
+    await sendAdminAlert({
+        title: `❌ Notifications Not Created - ${data.cityId}`,
+        description: `${data.notificationType} notifications for ${data.meetingId} failed. Create them from the admin panel.`,
+        color: 0xe74c3c, // Red
+        fields: [
+            {
+                name: 'Error',
+                value: truncateField(data.error),
+                inline: false,
+            },
+            {
+                name: 'Admin Panel',
+                value: `[Open Meeting Admin](${meetingAdminUrl})`,
+                inline: false,
+            },
+        ],
+    });
+}
+
+/**
  * Send admin alert when notifications are sent/released
  */
 export async function sendNotificationsSentAdminAlert(data: {
@@ -355,6 +415,8 @@ export async function sendNotificationsSentAdminAlert(data: {
     notificationCount: number;
     emailsSent: number;
     failed: number;
+    // Failed sends whose deliveries stay pending, so a re-release retries them.
+    leftPending: number;
 }): Promise<void> {
     // Only send if we actually sent some notifications
     if (data.emailsSent === 0 && data.failed === 0) {
@@ -388,7 +450,9 @@ export async function sendNotificationsSentAdminAlert(data: {
             },
             {
                 name: '❌ Failed',
-                value: data.failed.toString(),
+                value: data.leftPending > 0
+                    ? `${data.failed} (${data.leftPending} left pending, re-release from Manage Notifications)`
+                    : data.failed.toString(),
                 inline: true,
             },
             {
@@ -961,6 +1025,33 @@ export async function sendLivestreamMultipleMeetingsAlert(data: {
                 value: `[Open Meeting Admin](${meetingAdminUrl})`,
                 inline: false,
             },
+        ],
+    });
+}
+
+/**
+ * processAgenda read something in the agenda that a person must decide: the
+ * invitation differs from the meeting record, or the agenda holds more than
+ * one meeting, which a record cannot. Nothing was overwritten.
+ */
+export async function sendAgendaReadingAlert(data: {
+    cityId: string;
+    cityName: string;
+    meetingId: string;
+    meetingName: string;
+    problems: string[];
+}): Promise<void> {
+    const meetingAdminUrl = await meetingUrl(data, '/admin');
+
+    await sendAdminAlert({
+        title: `⚠️ The agenda needs a look - ${data.cityId}`,
+        description: `processAgenda read the agenda of ${data.meetingId}; nothing was overwritten`,
+        color: 0xf39c12, // Yellow/orange
+        fields: [
+            { name: 'Municipality', value: data.cityName, inline: true },
+            { name: 'Meeting', value: data.meetingName, inline: false },
+            { name: 'To decide', value: truncateField(data.problems.join('\n')), inline: false },
+            { name: 'Admin Panel', value: `[Open Meeting Admin](${meetingAdminUrl})`, inline: false },
         ],
     });
 }

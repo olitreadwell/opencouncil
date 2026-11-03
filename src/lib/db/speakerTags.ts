@@ -1,58 +1,62 @@
-"use server";
-import { SpeakerTag, Person } from '@prisma/client';
+// Not a Server Action module: the browser reaches what it needs, assignSpeaker
+// and getSpeakerIdentificationsForMeeting, through src/lib/actions/speakerTags.ts.
+import "server-only";
+import { Prisma, SpeakerTag } from '@prisma/client';
 import prisma from "./prisma";
 import { withUserAuthorizedToEdit } from '../auth';
 
-export async function getSpeakerTag(id: string): Promise<(SpeakerTag & { person: Person | null }) | null> {
-    const speakerTag = await prisma.speakerTag.findUnique({
-        where: { id },
-        include: {
-            person: true,
-            speakerSegments: true,
-        }
+/** A reviewer's edit of who speaks: a person, or no person (then the tag shows its label). Without a label, the tag keeps the label it has. */
+export type SpeakerEdit = { personId: string | null; label?: string };
+
+/**
+ * `allSegments` changes the segment's speaker tag, so every segment that shares
+ * the tag changes. `thisSegment` moves the segment to a new tag, so the other
+ * segments keep the old one.
+ */
+export type SpeakerAssignmentScope = 'allSegments' | 'thisSegment';
+
+const speakerIdentificationSelect = {
+    speakerTagId: true,
+    method: true,
+    personId: true,
+    actionable: true,
+    confidence: true,
+    evidence: true,
+} satisfies Prisma.SpeakerIdentificationSelect;
+
+export type SpeakerTagIdentification = Prisma.SpeakerIdentificationGetPayload<{ select: typeof speakerIdentificationSelect }>;
+
+/**
+ * What each method says about the speakers of a meeting, for the reviewer's
+ * editor. This is the only read of speaker identifications that leaves the
+ * server, and it requires edit rights.
+ */
+export async function getSpeakerIdentificationsForMeeting(cityId: string, meetingId: string): Promise<SpeakerTagIdentification[]> {
+    await withUserAuthorizedToEdit({ cityId, councilMeetingId: meetingId });
+    return prisma.speakerIdentification.findMany({
+        where: { speakerTag: { speakerSegments: { some: { cityId, meetingId } } } },
+        select: speakerIdentificationSelect,
     });
-    return speakerTag;
 }
 
-export async function updateSpeakerTag(id: string, data: Partial<Omit<SpeakerTag, 'id' | 'createdAt' | 'updatedAt'>>): Promise<SpeakerTag> {
-    const speakerTag = await prisma.speakerTag.findFirst({
-        where: { id },
-        include: {
-            speakerSegments: {
-                take: 1,
-            }
-        }
-    });
-
-    if (!speakerTag || !speakerTag.speakerSegments[0]) {
-        throw new Error('Speaker tag not found');
-    }
-
-    await withUserAuthorizedToEdit({ cityId: speakerTag.speakerSegments[0].cityId });
-    const updatedSpeakerTag = await prisma.speakerTag.update({
-        where: { id },
-        data,
-    });
-    return updatedSpeakerTag;
-}
-
-export async function getSpeakerTagsForCityCouncilMeeting(cityCouncilMeetingId: string): Promise<SpeakerTag[]> {
-    const speakerTags = await prisma.speakerTag.findMany({
-        where: {
-            speakerSegments: {
-                some: {
-                    meetingId: cityCouncilMeetingId
-                }
-            }
-        },
-        orderBy: {
-            createdAt: 'asc',
-        },
-    });
-    return speakerTags;
-}
-
-export async function assignSpeakerSegmentToNewSpeakerTag(speakerSegmentId: string) {
+/**
+ * Sets who speaks in a segment: the write behind the transcript editor's
+ * speaker picker. The segment keeps its id in both scopes, so its summary,
+ * topic labels and voiceprints stay attached.
+ *
+ * Either scope makes the tag the reviewer's (`personSetBy: 'user'`): a typed
+ * label says who the speaker is as much as a chosen person does, and from then
+ * on no automatic pass reassigns it. A tag made for one segment starts without
+ * identifications, which describe the diarization speaker the segment was
+ * taken from.
+ *
+ * Returns the speaker tag the segment has after the change.
+ */
+export async function assignSpeaker(
+    speakerSegmentId: string,
+    { personId, label }: SpeakerEdit,
+    scope: SpeakerAssignmentScope
+): Promise<SpeakerTag> {
     const speakerSegment = await prisma.speakerSegment.findUnique({
         where: { id: speakerSegmentId },
         include: { speakerTag: true }
@@ -62,88 +66,35 @@ export async function assignSpeakerSegmentToNewSpeakerTag(speakerSegmentId: stri
         throw new Error('Speaker segment not found');
     }
 
-    await withUserAuthorizedToEdit({ cityId: speakerSegment.cityId });
+    await withUserAuthorizedToEdit({ cityId: speakerSegment.cityId, councilMeetingId: speakerSegment.meetingId });
 
-    const newSpeakerTag = await prisma.speakerTag.create({
+    // Edit rights are per city, and so are people: a meeting's speaker is a
+    // person of the meeting's city.
+    if (personId !== null) {
+        const person = await prisma.person.findFirst({
+            where: { id: personId, cityId: speakerSegment.cityId },
+            select: { id: true }
+        });
+        if (!person) {
+            throw new Error('Person not found in this city');
+        }
+    }
+
+    if (scope === 'allSegments') {
+        return prisma.speakerTag.update({
+            where: { id: speakerSegment.speakerTagId },
+            data: { personId, ...(label !== undefined && { label }), personSetBy: 'user' }
+        });
+    }
+
+    return prisma.speakerTag.create({
         data: {
-            label: "New " + speakerSegment.speakerTag.label,
+            label: label ?? speakerSegment.speakerTag.label,
+            personId,
+            personSetBy: 'user',
             speakerSegments: {
                 connect: { id: speakerSegmentId }
             }
         }
     });
-
-    await prisma.speakerSegment.update({
-        where: { id: speakerSegmentId },
-        data: { speakerTagId: newSpeakerTag.id }
-    });
-
-    return newSpeakerTag;
-}
-
-export async function createEmptySpeakerSegmentAfter(
-    afterSegmentId: string,
-    speakerTagId: string,
-    cityId: string,
-    meetingId: string
-) {
-    await withUserAuthorizedToEdit({ cityId });
-    // First get the segment we're inserting after to get its end timestamp
-    const afterSegment = await prisma.speakerSegment.findUnique({
-        where: { id: afterSegmentId },
-        include: { utterances: true }
-    });
-
-    if (!afterSegment) {
-        throw new Error('Segment not found');
-    }
-
-    // Create a new segment starting at the end of the previous one
-    // We'll create it with a 10 second duration initially
-    const startTimestamp = afterSegment.endTimestamp;
-    const endTimestamp = startTimestamp + 10;
-
-    // Create the new segment
-    const newSegment = await prisma.speakerSegment.create({
-        data: {
-            startTimestamp,
-            endTimestamp,
-            cityId,
-            meetingId,
-            speakerTagId,
-            // Create an initial empty utterance
-            utterances: {
-                create: {
-                    startTimestamp,
-                    endTimestamp,
-                    text: '',
-                    lastModifiedBy: 'user'
-                }
-            }
-        },
-        include: {
-            utterances: true,
-            speakerTag: {
-                include: {
-                    person: {
-                        include: {
-                            roles: {
-                                include: {
-                                    party: true
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            summary: true,
-            topicLabels: {
-                include: {
-                    topic: true
-                }
-            }
-        }
-    });
-
-    return newSegment;
 }

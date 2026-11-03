@@ -4,6 +4,7 @@ import React, { Suspense } from "react"
 import PlausibleAnalytics from "@/components/analytics/PlausibleAnalytics"
 import PostHogPageView from "@/components/analytics/PostHogPageView"
 import PostHogAuthSync from "@/components/analytics/PostHogAuthSync"
+import ServiceWorkerRegistration from "@/components/pwa/ServiceWorkerRegistration"
 import { SessionProvider } from "next-auth/react"
 import { Toaster } from "@/components/ui/toaster";
 import { inter, roboto, robotoMono } from "@/lib/fonts";
@@ -11,7 +12,9 @@ import { routing, LOCALE_OVERRIDE_HEADER } from "@/i18n/routing";
 import { getLocale, getTranslations } from "next-intl/server";
 import { headers } from "next/headers";
 import { Metadata } from "next";
-import { getMetadataBaseFromRequest, getRealmBaseUrlFromRequest } from "@/lib/realm.server";
+import { getMetadataBaseFromRequest } from "@/lib/realm.server";
+import { siteOpenGraph } from "@/lib/og/siteOpenGraph";
+import { appleStartupImages } from "@/lib/pwa/splash";
 
 export async function generateMetadata(): Promise<Metadata> {
     // metadataBase is the realm's canonical domain (resolved from the request
@@ -20,10 +23,7 @@ export async function generateMetadata(): Promise<Metadata> {
     // get resolved against this base per host. On a preview host it is the
     // preview's own origin instead, so an OG-image change is reviewable on its
     // own PR — see getMetadataBaseFromRequest.
-    const [baseUrl, metadataBase] = await Promise.all([
-        getRealmBaseUrlFromRequest(),
-        getMetadataBaseFromRequest(),
-    ]);
+    const metadataBase = await getMetadataBaseFromRequest();
 
     return {
         title: 'OpenCouncil',
@@ -38,22 +38,18 @@ export async function generateMetadata(): Promise<Metadata> {
                 { url: '/favicon.svg', type: 'image/svg+xml' },
                 { url: '/favicon.ico', sizes: '250x250' },
             ],
+            apple: '/icons/apple-touch-icon.png',
+        },
+        // iOS reads these instead of the manifest: without them "Add to Home
+        // Screen" opens the site in a Safari tab, not as a standalone app.
+        appleWebApp: {
+            capable: true,
+            title: 'OpenCouncil',
+            statusBarStyle: 'default',
+            startupImage: appleStartupImages(),
         },
         metadataBase: new URL(metadataBase),
-        openGraph: {
-            title: 'OpenCouncil',
-            description: 'Ανοιχτή τοπική αυτοδιοίκηση',
-            type: 'website',
-            url: baseUrl,
-            images: [
-                {
-                    url: '/oc-theme.png',
-                    width: 500,
-                    height: 500,
-                    alt: 'OpenCouncil Logo',
-                },
-            ],
-        },
+        openGraph: siteOpenGraph,
         twitter: {
             card: 'summary_large_image',
             title: 'OpenCouncil',
@@ -77,6 +73,9 @@ export const viewport = {
     // and in-app WebViews) assume the page simply hasn't been updated and algorithmically invert
     // it, which darkens some surfaces and not others. `only light` is the documented opt-out.
     colorScheme: 'only light',
+    // The installed app's title bar (Android) and the browser UI on mobile
+    // take this colour; white matches the header.
+    themeColor: '#ffffff',
 }
 
 export default async function RootLayout(
@@ -119,6 +118,9 @@ export default async function RootLayout(
                 <SessionProvider>
                     <PlausibleAnalytics>
                         {children}
+                        {/* The only Toaster (see single-toaster.test.ts). It sits above
+                            src/app/error.tsx and the [locale] segment, so an open toast
+                            survives a render error and a locale switch. */}
                         <Toaster />
                     </PlausibleAnalytics>
                     {/* useSearchParams requires a Suspense boundary in layouts */}
@@ -126,6 +128,7 @@ export default async function RootLayout(
                         <PostHogPageView />
                     </Suspense>
                     <PostHogAuthSync />
+                    <ServiceWorkerRegistration />
                 </SessionProvider>
             </body>
         </html>

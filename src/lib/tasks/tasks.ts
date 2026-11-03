@@ -6,7 +6,10 @@ import "server-only";
 
 import { TaskUpdate } from '../apiTypes';
 import prisma from '@/lib/db/prisma';
-import { MeetingTaskType, TASK_CONFIG, TaskAlreadyExistsError, TaskBlockedReason, getDiscordAlertMode } from '@/lib/tasks/types';
+import { lockKey } from '@/lib/db/advisoryLock';
+import { MeetingTaskType, TASK_CONFIG, TaskAlreadyExistsError, TaskBlockedReason, getDiscordAlertMode, taskScope, type TaskConfig } from '@/lib/tasks/types';
+import { PipelineBusyError } from '@/lib/tasks/types';
+import { findConflictingTask } from './pipelineRules';
 import { withUserAuthorizedToEdit } from '../auth';
 import { env } from '@/env.mjs';
 import { sendTaskAdminAlert } from '@/lib/discord';
@@ -14,6 +17,11 @@ import { Prisma, TaskStatus } from '@prisma/client';
 import { revalidateTag } from 'next/cache';
 import { taskHandlers, taskTerminalHooks } from './registry';
 import { mintCallbackToken } from './callbackToken';
+import { errorDetail, errorMessage } from '@/lib/utils/errors';
+import { meetingNameSelect } from '@/lib/db/types';
+import { meetingLabelInCity } from '@/lib/meetingName';
+import { notifySubscribersOfTask } from '@/lib/notifications/meetingNotifications';
+import { isNewsPhase } from '@/lib/notifications/freshness';
 
 export interface TaskIdempotencyResult {
     proceed: boolean;
@@ -21,18 +29,41 @@ export interface TaskIdempotencyResult {
     blockedReason?: TaskBlockedReason;
 }
 
+/**
+ * Whether a task of this type may start on the meeting now.
+ *
+ * A task that is still running blocks a second one whatever `force` says:
+ * two of them cost twice and their results collide. `force` lifts only the
+ * block of a task that already succeeded, which is what a re-run is.
+ *
+ * `db` lets startTask run the read inside the transaction that holds the
+ * meeting lock; the other callers only report, and read outside it.
+ */
 export async function checkTaskIdempotency(
     taskType: MeetingTaskType,
     cityId: string,
     councilMeetingId: string,
-    options: { force?: boolean } = {}
+    options: { force?: boolean } = {},
+    db: Prisma.TransactionClient | typeof prisma = prisma
 ): Promise<TaskIdempotencyResult> {
+    const runningTask = await db.taskStatus.findFirst({
+        where: {
+            councilMeetingId,
+            cityId,
+            type: taskType,
+            status: { notIn: ['failed', 'succeeded'] },
+        },
+    });
+
+    if (runningTask) {
+        return { proceed: false, existingTask: runningTask, blockedReason: 'already_running' };
+    }
+
     if (options.force) {
         return { proceed: true, existingTask: null };
     }
 
-    // Check for already-succeeded task
-    const succeededTask = await prisma.taskStatus.findFirst({
+    const succeededTask = await db.taskStatus.findFirst({
         where: {
             councilMeetingId,
             cityId,
@@ -44,20 +75,6 @@ export async function checkTaskIdempotency(
 
     if (succeededTask) {
         return { proceed: false, existingTask: succeededTask, blockedReason: 'already_succeeded' };
-    }
-
-    // Check for currently running task
-    const runningTask = await prisma.taskStatus.findFirst({
-        where: {
-            councilMeetingId,
-            cityId,
-            type: taskType,
-            status: { notIn: ['failed', 'succeeded'] },
-        },
-    });
-
-    if (runningTask) {
-        return { proceed: false, existingTask: runningTask, blockedReason: 'already_running' };
     }
 
     return { proceed: true, existingTask: null };
@@ -75,46 +92,84 @@ export interface TaskVersionsFilter {
 const taskStatusWithMeetingInclude = {
     councilMeeting: {
         select: {
-            name_en: true,
+            ...meetingNameSelect,
             city: {
                 select: {
-                    name_en: true
+                    name_en: true,
+                    timezone: true,
                 }
             }
         }
     }
 } satisfies Prisma.TaskStatusInclude;
 
-export const startTask = async (taskType: MeetingTaskType, requestBody: any, councilMeetingId: string, cityId: string, options: { force?: boolean; silent?: boolean } = {}) => {
-    // Only enforce idempotency for core pipeline tasks — non-pipeline tasks
-    // (generateHighlight, generateVoiceprint, etc.) can legitimately run multiple times
-    if (TASK_CONFIG[taskType].requiredForPipeline) {
-        const idempotency = await checkTaskIdempotency(taskType, cityId, councilMeetingId, options);
-        if (!idempotency.proceed) {
-            // No default: a new blocked reason must fail here rather than reach the
-            // reviewer relabelled as "already running"
-            if (!idempotency.blockedReason) {
-                throw new Error(`checkTaskIdempotency blocked ${taskType} for ${cityId}/${councilMeetingId} without a reason`);
-            }
-            throw new TaskAlreadyExistsError(taskType, idempotency.blockedReason);
-        }
-    }
+type TaskStatusWithMeeting = Prisma.TaskStatusGetPayload<{ include: typeof taskStatusWithMeetingInclude }>;
 
-    // Create new task in database
-    const newTask = await prisma.taskStatus.create({
-        data: {
-            type: taskType,
-            status: 'pending',
-            requestBody: JSON.stringify(requestBody),
-            councilMeeting: { connect: { cityId_id: { cityId, id: councilMeetingId } } }
-        },
-        include: taskStatusWithMeetingInclude
+/** The task fields that every task admin alert carries. */
+function taskAlertTarget(task: TaskStatusWithMeeting) {
+    return {
+        taskType: task.type,
+        cityName: task.councilMeeting.city.name_en,
+        meetingName: meetingLabelInCity(task.councilMeeting, 'en'),
+        taskId: task.id,
+        cityId: task.cityId,
+        meetingId: task.councilMeetingId,
+    };
+}
+
+export const startTask = async (taskType: MeetingTaskType, requestBody: any, councilMeetingId: string, cityId: string, options: { force?: boolean; silent?: boolean } = {}) => {
+    const config: TaskConfig = TASK_CONFIG[taskType];
+
+    // Admission and the row that records it happen under one lock per
+    // meeting, for every caller: the admin page, the cron, the auto-triggers
+    // and the MCP tools. Two calls that arrive together then serialize here,
+    // and the second one reads the row the first one committed. Checks
+    // outside this transaction would let both pass and both pay.
+    const newTask = await prisma.$transaction(async (tx) => {
+        await lockKey(tx, `${cityId}:${councilMeetingId}`);
+
+        // A step that would work on rows another running step is about to
+        // replace is refused, force or not. The automatic fixTranscript after a
+        // transcribe is not affected: findConflictingTask does not count a task
+        // whose result has arrived, and the transcribe handler that starts the
+        // fixTranscript runs after that arrival.
+        const conflicting = await findConflictingTask(taskType, cityId, councilMeetingId, tx);
+        if (conflicting) {
+            throw new PipelineBusyError(taskType, conflicting.type as MeetingTaskType);
+        }
+
+        // One run at a time for every task that is one per meeting, and a
+        // re-run after success needs force. processAgenda included: a run
+        // that found no subjects still succeeded, and a caller that repeats
+        // it without force pays for the same answer.
+        if (!config.concurrentRuns) {
+            const idempotency = await checkTaskIdempotency(taskType, cityId, councilMeetingId, options, tx);
+            if (!idempotency.proceed) {
+                // No default: a new blocked reason must fail here rather than reach the
+                // reviewer relabelled as "already running"
+                if (!idempotency.blockedReason) {
+                    throw new Error(`checkTaskIdempotency blocked ${taskType} for ${cityId}/${councilMeetingId} without a reason`);
+                }
+                throw new TaskAlreadyExistsError(taskType, idempotency.blockedReason);
+            }
+        }
+
+        return tx.taskStatus.create({
+            data: {
+                type: taskType,
+                status: 'pending',
+                requestBody: JSON.stringify(requestBody),
+                councilMeeting: { connect: { cityId_id: { cityId, id: councilMeetingId } } }
+            },
+            include: taskStatusWithMeetingInclude
+        });
     });
 
     // Prepare callback URL; the task server posts back to it verbatim, so the
     // token authenticates the callback without any task-server involvement
     const callbackUrl = `${env.NEXTAUTH_URL}/api/cities/${cityId}/meetings/${councilMeetingId}/taskStatuses/${newTask.id}?token=${mintCallbackToken(newTask.id)}`;
-    console.log(`Callback URL: ${callbackUrl}`);
+    // The token stays out of the log: whoever reads the log could forge the callback.
+    console.log(`Callback URL: ${callbackUrl.split('?')[0]}`);
 
     // Add callback URL to request body
     const fullRequestBody = { ...requestBody, callbackUrl };
@@ -123,7 +178,7 @@ export const startTask = async (taskType: MeetingTaskType, requestBody: any, cou
     let response;
     let error;
     try {
-        console.log(`Calling ${env.TASK_API_URL}/${taskType} with body ${JSON.stringify(fullRequestBody)}`);
+        console.log(`Calling ${env.TASK_API_URL}/${taskType} with body ${JSON.stringify({ ...requestBody, callbackUrl: callbackUrl.split('?')[0] })}`);
         response = await fetch(`${env.TASK_API_URL}/${taskType}`, {
             method: 'POST',
             headers: {
@@ -139,26 +194,26 @@ export const startTask = async (taskType: MeetingTaskType, requestBody: any, cou
 
 
     if (error || !response || !response.ok) {
-        let errorMessage = 'no response body';
+        let reason = 'no response body';
         if (response) {
             console.log(`Status: ${response.status}`);
             const responseText = await response.text();
             try {
                 const body = JSON.parse(responseText);
-                errorMessage = body.error || responseText;
+                reason = body.error || responseText;
             } catch (e) {
-                errorMessage = responseText;
+                reason = responseText;
             }
         } else if (error) {
-            errorMessage = (error as Error).message;
+            reason = errorMessage(error);
         }
 
-        const fullError = `Failed to start task: ${response?.statusText} (${errorMessage})`;
+        const fullError = `Failed to start task: ${response?.statusText} (${reason})`;
 
         // Update task status to failed with error details
         await prisma.taskStatus.update({
             where: { id: newTask.id },
-            data: { status: 'failed', responseBody: fullError }
+            data: { status: 'failed', failureReason: fullError }
         });
 
         throw new Error(fullError);
@@ -176,7 +231,7 @@ export const startTask = async (taskType: MeetingTaskType, requestBody: any, cou
             status: 'started',
             taskType: taskType,
             cityName: newTask.councilMeeting.city.name_en,
-            meetingName: newTask.councilMeeting.name_en,
+            meetingName: meetingLabelInCity(newTask.councilMeeting, 'en'),
             taskId: newTask.id,
             cityId: cityId,
             meetingId: councilMeetingId,
@@ -184,6 +239,32 @@ export const startTask = async (taskType: MeetingTaskType, requestBody: any, cou
     }
 
     return newTask;
+}
+
+/**
+ * The stage a task shows between the arrival of its result and the end of the
+ * handler that writes it. The panel shows the stage of a pending task.
+ */
+export const RESULT_PERSISTING_STAGE = 'persisting results';
+
+/**
+ * How long a claim (a pending task with a payload) is left alone before a
+ * replay may finish it. The handler may still be running: the claim write is
+ * the row's last update until the flip, so a young claim is a live one.
+ * Above the 10-minute transaction budget of the transcribe handler.
+ */
+export const CLAIM_REPLAY_AFTER_MS = 15 * 60_000;
+
+/**
+ * Record that a result handler threw. `responseBody` stays as it is: it holds the
+ * task-server payload, which `processTaskResponse` replays once the handler is
+ * fixed.
+ */
+async function recordProcessingFailure(taskId: string, error: unknown, version?: number) {
+    await prisma.taskStatus.update({
+        where: { id: taskId },
+        data: { status: 'failed', failureReason: errorDetail(error), version },
+    });
 }
 
 export const handleTaskUpdate = async <T>(taskId: string, update: TaskUpdate<T>, processResult: (taskId: string, result: T, options?: { force?: boolean }) => Promise<void>, options?: { force?: boolean }) => {
@@ -199,103 +280,131 @@ export const handleTaskUpdate = async <T>(taskId: string, update: TaskUpdate<T>,
     }
 
     // Check if generic Discord alerts should be sent for this task type
-    const sendGenericAlerts = getDiscordAlertMode(task.type) !== 'none';
+    const alertMode = getDiscordAlertMode(task.type);
+    const sendGenericAlerts = alertMode !== 'none';
 
     if (update.status === 'success') {
-        const updatedTask = await prisma.taskStatus.update({
-            where: { id: taskId },
-            data: { status: 'succeeded', responseBody: JSON.stringify(update.result), version: update.version }
-        });
-
-        if (update.result) {
-            try {
-                await processResult(taskId, update.result, options);
-
-                // Send Discord admin alert for successful completion AFTER processing succeeds
-                if (sendGenericAlerts) {
-                    sendTaskAdminAlert({
-                        status: 'completed',
-                        taskType: task.type,
-                        cityName: task.councilMeeting.city.name_en,
-                        meetingName: task.councilMeeting.name_en,
-                        taskId: task.id,
-                        cityId: task.cityId,
-                        meetingId: task.councilMeetingId,
-                    });
-                }
-
-                // Revalidate cache only for successful tasks that affect meeting data
-                if (updatedTask.cityId && shouldRevalidateForTaskType(updatedTask.type as MeetingTaskType)) {
-                    try {
-                        revalidateTag(`city:${updatedTask.cityId}:meetings`, 'max');
-                    } catch (revalidateError) {
-                        console.error(`Error revalidating cache for task ${taskId}:`, revalidateError);
-                    }
-                }
-            } catch (error) {
-                console.error(`Error processing result for task ${taskId}:`, error);
-                const originalResponse = JSON.stringify(update.result);
-                const errorDetail = `Processing error: ${(error as Error).message}\n\n--- Original task server response ---\n${originalResponse}`;
-                await prisma.taskStatus.update({
-                    where: { id: taskId },
-                    data: { status: 'failed', responseBody: errorDetail, version: update.version }
-                });
-
-                // Send Discord admin alert for processing failure
-                if (sendGenericAlerts) {
-                    sendTaskAdminAlert({
-                        status: 'failed',
-                        taskType: task.type,
-                        cityName: task.councilMeeting.city.name_en,
-                        meetingName: task.councilMeeting.name_en,
-                        taskId: task.id,
-                        cityId: task.cityId,
-                        meetingId: task.councilMeetingId,
-                        error: (error as Error).message,
-                    });
-                }
+        // The task server retries a callback that times out, while the first
+        // request is still processing. A second run of the result handler is
+        // not safe (summarize replaces the non-agenda subjects), so only the
+        // first success callback for a task proceeds.
+        //
+        // The claim is the payload: responseBody is null until the first
+        // success callback writes it. The status stays as it was until the
+        // handler has written the results, because `succeeded` is read from
+        // outside as "the results are there". Notis fans a meeting out to its
+        // readers on that status; when the flip came before the handler, it
+        // built the brief of the 8/10 Athens council from 63 agenda subjects
+        // with no discussion time and none of the 20 non-agenda subjects.
+        if (!update.result) {
+            // Nothing to write: the status is the whole claim. A task whose
+            // payload already arrived is being written; a stray result-less
+            // success must not flip it early.
+            const claimed = await prisma.taskStatus.updateMany({
+                where: { id: taskId, status: { not: 'succeeded' }, responseBody: null },
+                data: { status: 'succeeded', failureReason: null, version: update.version }
+            });
+            if (claimed.count === 0) {
+                console.warn(`Ignoring duplicate success callback for task ${taskId}`);
+                return;
             }
-        } else {
             console.log(`No result for task ${taskId}`);
 
             // Task succeeded but has no result to process - still send completion admin alert
             if (sendGenericAlerts) {
-                sendTaskAdminAlert({
-                    status: 'completed',
-                    taskType: task.type,
-                    cityName: task.councilMeeting.city.name_en,
-                    meetingName: task.councilMeeting.name_en,
-                    taskId: task.id,
-                    cityId: task.cityId,
-                    meetingId: task.councilMeetingId,
-                });
+                sendTaskAdminAlert({ status: 'completed', ...taskAlertTarget(task) });
+            }
+        } else {
+            const claimed = await prisma.taskStatus.updateMany({
+                where: { id: taskId, status: { not: 'succeeded' }, responseBody: null },
+                data: {
+                    responseBody: JSON.stringify(update.result),
+                    stage: RESULT_PERSISTING_STAGE,
+                    failureReason: null,
+                    version: update.version,
+                }
+            });
+            if (claimed.count === 0) {
+                console.warn(`Ignoring duplicate success callback for task ${taskId}`);
+                return;
+            }
+
+            let written = false;
+            try {
+                await processResult(taskId, update.result, options);
+                written = true;
+            } catch (error) {
+                console.error(`Error processing result for task ${taskId}:`, error);
+                await recordProcessingFailure(taskId, error, update.version);
+
+                // Send Discord admin alert for processing failure
+                if (sendGenericAlerts) {
+                    sendTaskAdminAlert({ status: 'failed', ...taskAlertTarget(task), error: errorMessage(error) });
+                }
+            }
+
+            if (written) {
+                // The results are written: only now does the task read as
+                // succeeded. The stage goes back to the task server's last
+                // report, which is what the row showed before the claim. A
+                // failure of this write is not a failure of the handler: the
+                // rows are there, so it is logged, and the alert and the cache
+                // revalidation still run.
+                let flipped = false;
+                try {
+                    await prisma.taskStatus.updateMany({
+                        where: { id: taskId },
+                        data: { status: 'succeeded', stage: task.stage }
+                    });
+                    flipped = true;
+                } catch (flipError) {
+                    console.error(`Error marking task ${taskId} succeeded after its results were written:`, flipError);
+                }
+                if (flipped) await notifyIfNews(task);
+
+                // Send Discord admin alert for successful completion AFTER processing succeeds
+                if (alertMode === 'all') {
+                    sendTaskAdminAlert({ status: 'completed', ...taskAlertTarget(task) });
+                }
+
+                // Revalidate cache only for successful tasks that affect meeting data
+                if (task.cityId && shouldRevalidateForTaskType(task.type as MeetingTaskType)) {
+                    try {
+                        revalidateTag(`city:${task.cityId}:meetings`, 'max');
+                    } catch (revalidateError) {
+                        console.error(`Error revalidating cache for task ${taskId}:`, revalidateError);
+                    }
+                }
             }
         }
     } else if (update.status === 'error') {
-        await prisma.taskStatus.update({
-            where: { id: taskId },
-            data: { status: 'failed', responseBody: update.error, version: update.version }
+        // A task whose result already arrived (responseBody set) is being
+        // written by its handler; a late error callback does not fail it.
+        const claimed = await prisma.taskStatus.updateMany({
+            where: { id: taskId, status: { notIn: ['succeeded', 'failed'] }, responseBody: null },
+            data: { status: 'failed', failureReason: update.error, version: update.version }
         });
+        if (claimed.count === 0) {
+            console.warn(
+                task.responseBody != null
+                    ? `Ignoring error callback for task ${taskId}: its result already arrived`
+                    : `Ignoring error callback for task ${taskId}, which is already ${task.status}`,
+            );
+            return;
+        }
 
         // Send Discord admin alert for task failure
         if (sendGenericAlerts) {
-            sendTaskAdminAlert({
-                status: 'failed',
-                taskType: task.type,
-                cityName: task.councilMeeting.city.name_en,
-                meetingName: task.councilMeeting.name_en,
-                taskId: task.id,
-                cityId: task.cityId,
-                meetingId: task.councilMeetingId,
-                error: update.error,
-            });
+            sendTaskAdminAlert({ status: 'failed', ...taskAlertTarget(task), error: update.error });
         }
     } else if (update.status === 'processing') {
-        // Use updateMany with WHERE clause to atomically prevent overwriting terminal states
+        // Use updateMany with WHERE clause to atomically prevent overwriting
+        // terminal states, or the claim of a result that already arrived.
         await prisma.taskStatus.updateMany({
             where: {
                 id: taskId,
-                status: { notIn: ['succeeded', 'failed'] }
+                status: { notIn: ['succeeded', 'failed'] },
+                responseBody: null,
             },
             data: { status: 'pending', stage: update.stage, percentComplete: update.progressPercent, version: update.version }
         });
@@ -338,14 +447,76 @@ export const processTaskResponse = async (taskType: string, taskId: string, opti
 
     // The caller supplies the task id, so the gate is what stops one city's
     // admin from replaying a result onto another city's meeting.
-    await withUserAuthorizedToEdit({ cityId: task.cityId });
+    await withUserAuthorizedToEdit(taskScope(task));
 
-    const handler = taskHandlers[taskType];
+    // The gate checked the stored type, so the handler must be that type's.
+    // A body admin could otherwise name a city-only type and run its handler
+    // on a task of their meeting.
+    if (taskType !== task.type) {
+        throw new Error(`Task ${taskId} is a ${task.type} task, not ${taskType}`);
+    }
+    const handler = taskHandlers[task.type];
     if (!handler) {
-        throw new Error(`Unsupported task type: ${taskType}`);
+        throw new Error(`Unsupported task type: ${task.type}`);
     }
 
-    await handler(taskId, JSON.parse(task.responseBody!), options);
+    // Only a task whose result arrived has anything to replay. The success
+    // callback's claim writes responseBody, so a null here means the task
+    // server never reported a result: a pending task can still receive its
+    // callback, and a failed task without a payload has nothing to replay.
+    // A pending task WITH a payload is a claim whose handler never finished
+    // (the request was cut mid-write); the replay is how it finishes.
+    if (task.responseBody === null) {
+        throw new Error(`Task ${taskId} has no result to replay (status ${task.status})`);
+    }
+    if (task.status !== 'succeeded' && task.status !== 'failed') {
+        const ageMs = Date.now() - task.updatedAt.getTime();
+        if (ageMs < CLAIM_REPLAY_AFTER_MS) {
+            throw new Error(
+                `Task ${taskId} is still persisting its result (claimed ${Math.round(ageMs / 60_000)} min ago); ` +
+                `replay it after ${CLAIM_REPLAY_AFTER_MS / 60_000} minutes if it does not finish`,
+            );
+        }
+    }
+
+    // A row from before the failureReason column can hold failure text here
+    // instead of a payload. Parse before the handler runs, so that a replay of
+    // such a row does not record a parse error as the failure of the task.
+    let payload: unknown;
+    try {
+        payload = JSON.parse(task.responseBody);
+    } catch {
+        throw new Error(`Task ${taskId} has no result to replay: responseBody is not a task payload`);
+    }
+
+    // The handler runs on a succeeded task too (a forced re-run), but a
+    // replay never demotes a succeeded task: both writes skip it. A failed
+    // task, or a claim whose handler never finished, takes the replay's
+    // outcome.
+    try {
+        await handler(taskId, payload, options);
+    } catch (error) {
+        await prisma.taskStatus.updateMany({
+            where: { id: taskId, status: { not: 'succeeded' } },
+            data: { status: 'failed', failureReason: errorDetail(error) },
+        });
+        throw error;
+    }
+    const { count } = await prisma.taskStatus.updateMany({
+        where: { id: taskId, status: { not: 'succeeded' } },
+        data: { status: 'succeeded', failureReason: null },
+    });
+    // A replay of a task that already read as succeeded is not news again.
+    if (count > 0) await notifyIfNews(task);
+}
+
+/**
+ * processAgenda and summarize tell the subscribers once the task reads as
+ * succeeded, never from inside the handler: see notifySubscribersOfTask.
+ * It never throws.
+ */
+async function notifyIfNews(task: { type: string; cityId: string; councilMeetingId: string }): Promise<void> {
+    if (isNewsPhase(task.type)) await notifySubscribersOfTask(task.cityId, task.councilMeetingId, task.type);
 }
 
 export const getHighestVersionsForTasks = async (taskTypes: MeetingTaskType[]): Promise<Record<string, number | null>> => {

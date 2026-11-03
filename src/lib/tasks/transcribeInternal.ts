@@ -1,9 +1,12 @@
 import { TranscribeRequest, Voiceprint } from "../apiTypes";
+import { ConflictError, NotFoundError } from "@/lib/api/errors";
 import { startTask } from "./tasks";
 import { Prisma } from "@prisma/client";
+import { transcriptionRefusal } from "@/lib/meetingLifecycleRules";
 import prisma from "../db/prisma";
-import { getPeopleForMeeting } from "@/lib/db/people";
+import { getPeopleWhoMaySpeak } from "@/lib/db/people";
 import { getRoleTypePriority } from "../utils";
+import { voiceprintPriorityGroup } from "./voiceprintPriority";
 import { getStatisticsFor } from "../statistics";
 
 /**
@@ -76,22 +79,30 @@ export async function requestTranscribeInternal(youtubeUrl: string, councilMeeti
     });
 
     if (!councilMeeting) {
-        throw new Error("Council meeting not found");
+        throw new NotFoundError("Council meeting not found");
     }
 
-    if (councilMeeting.speakerSegments.length > 0) {
-        if (force) {
-            await deleteExistingSpeakerData(councilMeetingId, cityId);
-        } else {
-            console.log(`Meeting already has speaker segments`);
-            throw new Error('Meeting already has speaker segments');
-        }
+    // The admin button and the livestream cron both reach this function, so
+    // the refusal does not depend on the UI.
+    const refusal = transcriptionRefusal(councilMeeting);
+    if (refusal) {
+        throw new ConflictError(refusal);
+    }
+
+    // A typed refusal, so every caller — the admin page, the cron, a tool —
+    // can show it as it is instead of as an internal error. With force the
+    // old transcript stays until the new one lands: handleTranscribeResult
+    // deletes it inside the import transaction, so a job the task server
+    // refuses leaves the meeting as it was.
+    if (councilMeeting.speakerSegments.length > 0 && !force) {
+        console.log(`Meeting already has speaker segments`);
+        throw new ConflictError('The meeting already has a transcript. A re-run must set force, which replaces it, with its highlights.');
     }
 
     const city = councilMeeting.city;
 
-    // Get voiceprints for relevant people based on meeting's administrative body
-    const people = await getPeopleForMeeting(cityId, councilMeeting.administrativeBodyId);
+    // Voiceprints of the people who may speak at this meeting
+    const people = await getPeopleWhoMaySpeak(cityId, councilMeeting.administrativeBodyId, councilMeeting.dateTime);
     const voicePrintRows = await prisma.voicePrint.findMany({
         where: { personId: { in: people.map(person => person.id) } },
         orderBy: { createdAt: 'desc' },
@@ -107,16 +118,20 @@ export async function requestTranscribeInternal(youtubeUrl: string, councilMeeti
         .filter(person => embeddingByPerson.has(person.id));
 
     // Pyannote.ai supports max 50 voiceprints per request.
-    // When over the limit, people are already sorted by role priority from getPeopleForMeeting
-    // (mayors, deputy mayors, council heads, etc.). Use speaking time as tiebreaker within
-    // the same role priority tier.
+    // When over the limit: the mayor and the other city-level roles first, then the
+    // current members of the body that is meeting, then everyone else (see
+    // voiceprintPriorityGroup). Within each group by role priority (council heads,
+    // party leaders, etc.), with speaking time as tiebreaker.
     const MAX_VOICEPRINTS = 50;
     if (peopleWithVoiceprints.length > MAX_VOICEPRINTS) {
         const stats = await getStatisticsFor({ cityId }, ["person"]);
         const speakingByPerson = new Map(
             (stats.people ?? []).map(s => [s.item.id, s.speakingSeconds])
         );
+        const group = (person: typeof people[number]) =>
+            voiceprintPriorityGroup(person, councilMeeting.administrativeBodyId, councilMeeting.dateTime);
         peopleWithVoiceprints.sort((a, b) => {
+            if (group(a) !== group(b)) return group(a) - group(b);
             const priorityA = Math.min(...a.roles.map(getRoleTypePriority));
             const priorityB = Math.min(...b.roles.map(getRoleTypePriority));
             if (priorityA !== priorityB) return priorityA - priorityB;
@@ -124,7 +139,7 @@ export async function requestTranscribeInternal(youtubeUrl: string, councilMeeti
         });
         console.warn(
             `Found ${peopleWithVoiceprints.length} voiceprints but pyannote.ai supports max ${MAX_VOICEPRINTS}, ` +
-            `sending top by role priority + speaking time`
+            `sending city-level roles and the meeting body's members first, then by role priority + speaking time`
         );
     }
 
@@ -137,10 +152,13 @@ export async function requestTranscribeInternal(youtubeUrl: string, councilMeeti
 
     console.log(`Sending ${voiceprints.length} voiceprints for meeting (${peopleWithVoiceprints.length} total with voiceprints)`);
 
-    const body: Omit<TranscribeRequest, 'callbackUrl'> = {
+    // `force` rides in the stored request so the callback can hand it to the
+    // result handler; the task server ignores it.
+    const body: Omit<TranscribeRequest, 'callbackUrl'> & { force?: boolean } = {
         youtubeUrl,
         voiceprints: voiceprints.length > 0 ? voiceprints : undefined,
         cityLanguage: city.language,
+        ...(force && { force }),
     }
 
     await prisma.councilMeeting.update({
@@ -158,3 +176,4 @@ export async function requestTranscribeInternal(youtubeUrl: string, councilMeeti
     console.log(`Transcribe body: ${JSON.stringify(body)}`);
     return startTask('transcribe', body, councilMeetingId, cityId, { force });
 }
+

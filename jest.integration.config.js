@@ -2,11 +2,16 @@ module.exports = {
     preset: 'ts-jest',
     testEnvironment: 'node',
     testMatch: ['<rootDir>/tests/integration/**/*.test.ts'],
+    // One PostgreSQL server for the whole run: see tests/helpers/test-db.ts.
+    globalSetup: '<rootDir>/tests/global-setup-integration.ts',
+    globalTeardown: '<rootDir>/tests/global-teardown-integration.ts',
     setupFilesAfterEnv: ['<rootDir>/tests/setup-integration.ts'],
-    maxWorkers: '50%',
+    // 4 workers on a 16-core machine ran the suite as fast as 8 or 16 and used
+    // about 30% less CPU than 8.
+    maxWorkers: '25%',
     // Prevent Jest from scanning large build directories
-    modulePathIgnorePatterns: ['<rootDir>/.next/', '<rootDir>/node_modules/'],
-    testPathIgnorePatterns: ['<rootDir>/.next/', '<rootDir>/node_modules/'],
+    modulePathIgnorePatterns: ['<rootDir>/.next/', '<rootDir>/node_modules/', '<rootDir>/.claude/worktrees/'],
+    testPathIgnorePatterns: ['<rootDir>/.next/', '<rootDir>/node_modules/', '<rootDir>/.claude/worktrees/'],
     moduleNameMapper: {
         // Next.js bundler marker modules with no runtime content — same
         // mapping as jest.config.js.
@@ -22,10 +27,19 @@ module.exports = {
         '^next-intl/server$': '<rootDir>/tests/mocks/nextIntlServer.ts',
         '^@/(.*)$': '<rootDir>/src/$1',
     },
-    // @auth/prisma-adapter is ESM-only (no CJS build), so requiring it from the
-    // CommonJS test runner fails. Transform just that package; everything else in
-    // node_modules stays untransformed.
-    transformIgnorePatterns: ['/node_modules/(?!@auth/prisma-adapter/)'],
+    // @auth/prisma-adapter and the ICU formatting chain (intl-messageformat,
+    // icu-minify, the @formatjs/* and @schummar/* packages, as in jest.config.js)
+    // are ESM-only, so requiring them from the CommonJS test runner fails. The poll
+    // request renders the conventions text through intl-messageformat, so every
+    // suite that loads pollDecisions needs it. Transform just these packages;
+    // everything else in node_modules stays untransformed.
+    //
+    // gaxios (the HTTP client of the Google API clients) loads node-fetch with a dynamic
+    // import(), which the CommonJS runner rejects without
+    // --experimental-vm-modules. Transforming gaxios turns that import() into a
+    // require(). node-fetch and its dependencies are ESM-only. gaxios can sit
+    // under googleapis-common, so that prefix is allowed too.
+    transformIgnorePatterns: ['/node_modules/(?!(googleapis-common/node_modules/)?(@auth/prisma-adapter|intl-messageformat|icu-minify|@formatjs|@schummar|gaxios|node-fetch|fetch-blob|formdata-polyfill|data-uri-to-buffer|node-domexception)/)'],
     transform: {
         '^.+\\.(ts|tsx)$': ['ts-jest', {
             tsconfig: 'tsconfig.json',

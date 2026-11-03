@@ -22,9 +22,8 @@ interface HighlightCompleteCopy {
     noteSuccess: string;
     noteFailure: string;
     thanks: string;
-    /** Fallbacks for a highlight/meeting with no stored name. */
+    /** Fallback for a highlight with no stored name. */
     untitled: string;
-    meetingOn: (date: string) => string;
 }
 
 /**
@@ -33,7 +32,7 @@ interface HighlightCompleteCopy {
  * A local table for consistency with the auth email rather than out of necessity:
  * this one renders from a plain route handler, which `next/headers` is fine in,
  * and `getTranslations({ locale })` short-circuits `getRequestLocale()` when given
- * a locale — `lib/mcp/data.ts` already relies on that. So a future third email
+ * a locale — `src/lib/mcp/data.ts` already relies on that. So a future third email
  * could legitimately live in `messages/` instead; only the auth email is forced
  * out of it by the proxy's module graph.
  */
@@ -57,7 +56,26 @@ const COPY: Record<EmailLocale, HighlightCompleteCopy> = {
         noteFailure: 'Παρακαλούμε δοκιμάστε ξανά να δημιουργήσετε το στιγμιότυπο. Αν το πρόβλημα συνεχιστεί, επικοινωνήστε μαζί μας στο hello@opencouncil.gr',
         thanks: 'Ευχαριστούμε που χρησιμοποιείτε το OpenCouncil!',
         untitled: 'Χωρίς τίτλο',
-        meetingOn: (date) => `Συνεδρίαση ${date}`,
+    },
+    en: {
+        subjectSuccess: 'Your highlight is ready!',
+        subjectFailure: 'There was a problem creating your highlight',
+        headingSuccess: '✓ Your highlight is ready!',
+        headingFailure: '✕ Something went wrong',
+        greeting: (name) => `Hello ${name},`,
+        bodySuccess: 'Your video highlight was created successfully and is ready to watch!',
+        bodyFailure: 'Unfortunately, we ran into a problem while creating your video highlight.',
+        detailsHeading: 'Highlight details',
+        labelTitle: 'Title',
+        labelMeeting: 'Meeting',
+        labelCity: 'Municipality',
+        labelDuration: 'Duration',
+        ctaSuccess: 'View the highlight',
+        ctaFailure: 'Try again',
+        noteSuccess: 'You can download the video or share it with others from the highlight page.',
+        noteFailure: 'Please try creating the highlight again. If the problem continues, contact us at hello@opencouncil.gr',
+        thanks: 'Thank you for using OpenCouncil!',
+        untitled: 'Untitled',
     },
     fr: {
         subjectSuccess: 'Votre extrait est prêt !',
@@ -78,7 +96,6 @@ const COPY: Record<EmailLocale, HighlightCompleteCopy> = {
         noteFailure: "Veuillez réessayer de créer l'extrait. Si le problème persiste, contactez-nous à hello@opencouncil.gr",
         thanks: "Merci d'utiliser OpenCouncil !",
         untitled: 'Sans titre',
-        meetingOn: (date) => `Séance du ${date}`,
     },
     sr: {
         subjectSuccess: 'Ваш истакнути исечак је спреман!',
@@ -99,7 +116,6 @@ const COPY: Record<EmailLocale, HighlightCompleteCopy> = {
         noteFailure: 'Молимо покушајте поново да направите исечак. Ако се проблем настави, контактирајте нас на hello@opencouncil.gr',
         thanks: 'Хвала што користите OpenCouncil!',
         untitled: 'Без наслова',
-        meetingOn: (date) => `Седница ${date}`,
     },
 };
 

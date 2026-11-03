@@ -1,8 +1,9 @@
 import { NextResponse } from 'next/server'
-import { AdministrativeBodyType } from '@prisma/client'
 import { getRealm } from '@/lib/realm.server'
-import { getGeneralSubjects, getMapSubjects } from '@/lib/db/subject'
+import { getGeneralSubjects, getMapSubjects, parseMapSubjectFilters, quickRangeStart } from '@/lib/db/subject'
 import { searchSubjectsInRealm } from '@/lib/search/core'
+import { openDateRange } from '@/lib/search/dateRange'
+import { queryFlag } from '@/lib/zod-schemas/primitives'
 import { SUBJECT_DOT_THRESHOLD } from '@/lib/landing/landingCore'
 
 // Per-query, and every query is different. Nothing to cache.
@@ -13,20 +14,12 @@ export const dynamic = 'force-dynamic';
  *
  * Tied to the threshold at which the marker layer degrades pins to plain dots,
  * because that is the reason for the cap: past it a larger set buys no fidelity
- * — and it costs, since the layer rebuilds on every viewport change, its packing
- * pass is roughly quadratic, and each pin mounts its own root. Measured against
+ * — and it costs, since every pin near the viewport is an HTML marker the map
+ * repositions on every frame of a gesture. Measured against
  * the production index, the broadest single-word queries land in the low
  * hundreds, so the cap bites rarely and the response says when it did.
  */
 const MAX_RESULTS = SUBJECT_DOT_THRESHOLD;
-
-const isBodyType = (b: string): b is AdministrativeBodyType =>
-    (Object.values(AdministrativeBodyType) as string[]).includes(b);
-
-const list = (value: string | null) => (value || '').split(',').filter(Boolean);
-
-/** The lower bound for a date filter that names only its end. Matches mcpSearch. */
-const OPEN_RANGE_START = '1970-01-01';
 
 /**
  * Search, answered in the landing map's own shape.
@@ -48,28 +41,34 @@ export async function GET(request: Request) {
         }
 
         const realm = await getRealm();
-        const dateFrom = searchParams.get('dateFrom');
-        const dateTo = searchParams.get('dateTo');
+        // The map's own parser, so the search reads the filters exactly as the
+        // map endpoints it is searching over do.
+        const filters = parseMapSubjectFilters(searchParams);
+        const now = new Date();
+        // Either bound alone is a real filter — the map's own endpoints
+        // honour one, so a search over them must too, or committing would
+        // widen the window the reader just set. A missing end is now, as
+        // in those endpoints.
+        const dateRange = openDateRange(filters.dateFrom, filters.dateTo, now.toISOString());
+        // The quick-range pill (daysBack / monthsBack), as the map endpoints
+        // read it: explicit dates replace it. Without it a search under
+        // "14 days" returned subjects of any year.
+        const windowStart = dateRange ? undefined : quickRangeStart(filters, now);
 
         const { hits, total, dropped, derivedFilters } = await searchSubjectsInRealm({
             query,
-            cityIds: list(searchParams.get('cityIds')),
-            topicIds: list(searchParams.get('topicIds')),
-            adminBodyTypes: list(searchParams.get('bodyType')).filter(isBodyType),
-            // Either bound alone is a real filter — the map's own endpoints
-            // honour one, so a search over them must too, or committing would
-            // widen the window the reader just set. The missing bound stays
-            // open rather than collapsing the range onto the one that is set.
-            dateRange: dateFrom || dateTo
-                ? { start: dateFrom ?? OPEN_RANGE_START, end: dateTo ?? new Date().toISOString() }
-                : undefined,
+            cityIds: filters.cityIds,
+            topicIds: filters.topicIds,
+            administrativeBodyTypes: filters.bodyTypes,
+            dateRange,
+            fallbackDateRange: windowStart && { start: windowStart.toISOString(), end: now.toISOString() },
             config: {
                 enableSemanticSearch: true,
                 size: MAX_RESULTS,
                 // Reading the query text for filters is worth a model call once,
                 // when the reader commits the search. A caller re-running the
                 // same text after changing a filter already holds what it gave.
-                extractFilters: searchParams.get('extract') !== 'false',
+                extractFilters: queryFlag.catch(true).parse(searchParams.get('extract') ?? undefined),
             },
         }, realm);
 

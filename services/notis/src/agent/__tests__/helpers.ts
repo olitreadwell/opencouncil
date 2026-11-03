@@ -58,8 +58,12 @@ export function meetingEvent(overrides: Partial<Extract<WakeEvent, { type: "meet
     at: FIXED_NOW.toISOString(),
     cityId: "athens",
     meetingId: "m1",
-    meetingName: "Συνεδρίαση ΔΣ Αθήνας",
+    meetingName: null,
+    meetingKind: "ordinary",
+    urgent: false,
+    sessionNumber: 3,
     meetingDate: "2026-03-09",
+    adminBody: "Δημοτικό Συμβούλιο",
     brief: makeBrief(),
     ...overrides,
   };
@@ -99,7 +103,13 @@ export function makeDeps(anthropic: AnthropicLike, overrides: Partial<Deps> = {}
       contextPack: "CONTEXT PACK",
       editorial: "EDITORIAL PROMPT", compaction: "COMPACT",
     },
-    config: { model: "claude-sonnet-5", maxTurns: 8, mcpUrl: "https://example.test/mcp", effort: "low" as const },
+    config: {
+      model: "claude-sonnet-5",
+      maxTurns: 8,
+      mcpUrl: "https://example.test/mcp",
+      effort: "low" as const,
+      reactiveEffort: "medium" as const,
+    },
     mcp: { call: async () => null },
     ...overrides,
   };

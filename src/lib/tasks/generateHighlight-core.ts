@@ -1,7 +1,9 @@
 import prisma from '@/lib/db/prisma';
 import { startTask } from './tasks';
+import { generateHighlightOptionsSchema } from './generateHighlightOptions';
 import { GenerateHighlightRequest } from '@/lib/apiTypes';
-import { getSpeakerDisplayInfo } from '@/lib/utils';
+import { getSpeakerDisplayInfo, getRoleTitle } from '@/lib/utils/roles';
+import { getRoleTitles } from '@/i18n/roleTitles';
 
 // NOT a "use server" module: this performs no authorization, so exposing it as
 // a server action would let anyone render any highlight. Callers must check
@@ -16,11 +18,15 @@ export type GenerateHighlightOptions = Pick<
     force?: boolean;
 };
 
-export async function requestGenerateHighlightCore(highlightId: string, options?: GenerateHighlightOptions) {
+export async function requestGenerateHighlightCore(highlightId: string, rawOptions?: GenerateHighlightOptions) {
+    // Every caller (the API route, the MCP server) passes through here, so the
+    // schema runs here even when the route already ran it.
+    const options = rawOptions === undefined ? undefined : generateHighlightOptionsSchema.parse(rawOptions);
+
     const highlight = await prisma.highlight.findUnique({
         where: { id: highlightId },
         include: {
-            meeting: true,
+            meeting: { include: { city: { select: { language: true } } } },
             highlightedUtterances: {
                 orderBy: {
                     utterance: {
@@ -37,7 +43,7 @@ export async function requestGenerateHighlightCore(highlightId: string, options?
                                             person: {
                                                 include: {
                                                     roles: {
-                                                        include: { party: true },
+                                                        include: { party: true, administrativeBody: { select: { type: true } } },
                                                     },
                                                 },
                                             },
@@ -60,6 +66,8 @@ export async function requestGenerateHighlightCore(highlightId: string, options?
         throw new Error('Meeting media not found: videoUrl is required');
     }
 
+    const roleTitles = await getRoleTitles(highlight.meeting.city.language);
+
     const utterances = highlight.highlightedUtterances.map(hu => {
         const u = hu.utterance;
         const speakerTag = u.speakerSegment.speakerTag;
@@ -77,11 +85,9 @@ export async function requestGenerateHighlightCore(highlightId: string, options?
                 partyLabel = party.name_short || party.name;
             }
 
-            if (role) {
-                roleLabel = role.name || undefined;
-            } else if (isIndependent) {
-                roleLabel = "Ανεξάρτητος Δημοτικός Σύμβουλος";
-            }
+            // getSpeakerLabels' rule without simplifyRoleName: the overlay has room for the deputy mayor's portfolio.
+            roleLabel = (role ? getRoleTitle(role, roleTitles) : null)
+                ?? (isIndependent ? roleTitles.t('independentCouncilMember') : undefined);
         }
 
         return {

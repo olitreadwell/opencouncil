@@ -1,8 +1,9 @@
 import { estypes } from '@elastic/elasticsearch';
-import { SearchRequest, ExtractedFilters, Location } from './types';
+import { SearchRequest, ExtractedFilters, Location, type QueryContainer } from './types';
 import { env } from '@/env.mjs';
 import { MATCH_START, MATCH_END, MATCH_FIELDS } from './constants';
 import type { AdministrativeBodyType } from '@prisma/client';
+import { DEFAULT_SCORE_PROFILE, type QueryProfile } from './profile';
 
 // Score added ONCE to a subject pinned within an AI-extracted location's radius
 // (see buildLocationClause). Small next to the lexical field tiers (FIELD_TIER):
@@ -11,76 +12,30 @@ import type { AdministrativeBodyType } from '@prisma/client';
 const LOCATION_BOOST = 2;
 
 /**
- * Similarity cutoff for the semantic fallback clause, measured against the
- * production index (scripts/search-eval.ts). The gate is the BEST of the two
- * sub-field similarities (see buildSemanticFallbackQuery), so the value is a
+ * The semantic fallback gates on a similarity cutoff and maps what passes into
+ * BM25 space (see buildSemanticFallbackQuery). The cutoff and the scale belong
+ * to the embedding model behind the index, so they live in ./profile.ts, one
+ * entry per model with the measurements that produced it. The runtime reads
+ * the model off the live index (resolveIndexProfile) and hands the profile in;
+ * a build-time default (DEFAULT_SCORE_PROFILE) covers callers without one.
+ *
+ * The gate is the BEST of the two sub-field similarities, so the cutoff is a
  * plain normalized cosine in [0, 1] and means what it says: "the closest thing
- * this document has to say scores at least this well".
- *
- * It replaces an earlier cutoff of 3.23 applied to the BOOSTED SUM of the two
- * sub-fields. That was unusable by construction: the sub-field boosts (2.0 and
- * 1.5) cap each field's contribution, so the sum could only reach 3.23 when
- * BOTH fields scored near their ceiling. It read as a quality bar and behaved
- * as an agreement bar — a perfect title match contributes at most ~1.95, so it
- * still needed the description to supply ~0.85 similarity to pass, whatever the
- * title said. Measured consequences on the live index (Aug 2026, 9.1k released
- * docs):
- *   - "ηλεκτρικά πατίνια" — a logged user query with the HIGHEST title
- *     similarity of any on-topic query measured (0.9546) — returned zero
- *     semantic hits, because its descriptions disagreed.
- *   - "χώροι για παρκάρισμα" admitted `Μίσθωση χώρου για Λούνα Παρκ` (leasing
- *     space for a funfair) while rejecting `Ανάκληση θέσης πάρκινγκ ΑμεΑ`,
- *     `Κόκκινα κολωνάκια και χώροι στάθμευσης` and `Ηλεκτρικά πατίνια -
- *     Παρκάρισμα σε πεζοδρόμια`. Their title scores differed by 0.5%;
- *     description agreement decided.
- *   - The whole arm admitted 1-10 documents per query out of 9,116.
- *
- * Calibration of the current value, over 12 on-topic, 11 paraphrase and 26
- * off-topic queries (the off-topic set drawn from the SearchQuery table):
- *   - on-topic best hit:    0.9399 - 0.9546
- *   - paraphrase best hit:  0.9314 - 0.9499
- *   - off-topic best hit:   0.8968 - 0.9300, plus one outlier at 0.9389
- * The bands touch, so no cutoff is perfectly separating. 0.930 sits just under
- * the paraphrase floor: it keeps 12/12 on-topic and 11/11 paraphrase queries,
- * and admits one off-topic query ("23ερ ε σ=", a keyboard mash whose digits
- * anchor to a street number in `Ανοιχτό σκάμμα Ευελπίδων 23`) with 2 documents.
- * The old sum cutoff scored 11/12 and 10/11 for 0 off-topic — it bought that
- * last junk query by throttling every real query's recall 3-5x.
- *
- * Re-measured Aug 2026 at 9,181 released docs, which is 65 more than the
- * calibration above saw. The bands have moved apart, and the value moved with
- * them, from 0.930 to 0.934:
- *   - The off-topic ceiling ROSE. "ηνκξκ", a logged keyboard mash, reaches
- *     0.9319 against one subject (`Μεταστέγαση ΕΝΕΓΙΛ`), so 0.930 stopped
- *     emptying it. The nearest neighbour of a mash is arbitrary, so expect this
- *     ceiling to keep moving as the index grows.
- *   - The paraphrase floor ROSE further, to somewhere in [0.936, 0.940): every
- *     paraphrase query still returns at 0.936, and "λεφτά για τον αθλητισμό"
- *     empties at 0.940.
- * That leaves a separating window where the calibration above had none. 0.934
- * sits in the middle of it: ~0.002 above the junk ceiling and ~0.002 below the
- * paraphrase floor, so neither side is one document away from crossing.
- *
- * The cost is paraphrase DEPTH, not paraphrase recall — no query goes empty,
- * but the thinnest one ("χώροι για παρκάρισμα") returns 9 documents at 0.930,
- * 6 at 0.932 and 2 at 0.936. That is why this sits mid-window instead of at the
- * top of it: the arm exists for recall, and the junk it admits is one document
- * on one query.
- *
- * Re-run the sweep when the eval suite starts to fail on either side:
- *
- *     SKIP_ENV_VALIDATION=1 npx tsx scripts/search-eval.ts --min-score 0.934
+ * this document has to say scores at least this well". It replaced a cutoff
+ * on the BOOSTED SUM of the two sub-fields, which read as a quality bar and
+ * behaved as an agreement bar: a perfect title match still needed the
+ * description to agree, so "ηλεκτρικά πατίνια", the on-topic query with the
+ * highest title similarity ever measured, returned zero semantic hits.
  *
  * Do not normalize before applying this: `minmax` maps the best hit to exactly
  * 1.0 for every query, which makes any fractional cutoff unable to empty the
  * results.
  */
-const DEFAULT_SEMANTIC_MIN_SCORE = 0.934;
 
 /**
  * Mapping of the similarity into BM25 space for the dis_max fallback
  * (see buildSemanticFallbackQuery): mapped = BASE + (raw - cutoff) * SCALE.
- * Calibrated against the flattened lexical tiers (FIELD_TIER):
+ * BASE is calibrated against the flattened lexical tiers (FIELD_TIER):
  *   - Weak stem-coincidence lexical matches (both stems of a 2-term query
  *     landing in one long description, e.g. bar licenses matching
  *     "ζώα χωρίς ιδιοκτήτη" via ζω/ιδιοκτητ) flatten to ~24-30
@@ -88,13 +43,12 @@ const DEFAULT_SEMANTIC_MIN_SCORE = 0.934;
  *     band, so a genuine paraphrase-only match competes with them.
  *   - A real name match flattens to ~58+ (nameTerm + namePhrase), so the
  *     mapped ceiling stays below any title match.
- * SCALE spreads the useful similarity band over ~8 points so semantic ordering
- * still matters among paraphrase-only hits. That band is ~0.025 wide (cutoff
- * to the observed 0.955 ceiling), where the old boosted-sum band was ~0.08 —
- * hence the 3.2x larger scale for the same mapped spread.
+ * SCALE spreads the model's useful similarity band, cutoff to observed
+ * ceiling, over ~8 points so semantic ordering still matters among
+ * paraphrase-only hits. The band width is a property of the model, so SCALE
+ * is part of the ScoreProfile (./profile.ts).
  */
 const SEMANTIC_MAPPED_BASE = 26;
-const SEMANTIC_MAPPED_SCALE = 320;
 
 /**
  * A single-term query matches on its term; a 2-term query requires both terms
@@ -149,8 +103,8 @@ const COVERAGE_GATE_FIELDS = [
 
 /**
  * The gate's threshold for the one entity field that cannot join the union
- * above: speaker_person_name is nested, so it stands as its own alternative and
- * decides eligibility ALONE (see buildCoverageGate).
+ * above: the speaker's name (SPEAKER_NAME_FIELDS) is nested, so it stands as
+ * its own alternative and decides eligibility ALONE (see buildCoverageGate).
  *
  * That is the per-field threshold this whole split was built to remove, so it
  * cannot take LEXICAL_MINIMUM_SHOULD_MATCH: at 2-of-3, the two-word name
@@ -168,6 +122,29 @@ const COVERAGE_GATE_FIELDS = [
  * a legitimate contribution to the document's coverage.
  */
 const SPEAKER_NAME_GATE_MINIMUM_SHOULD_MATCH = '100%';
+
+/**
+ * The names a contribution's speaker is known by: the Person's name for a
+ * linked speaker, and speaker_name, the display name the contribution carries
+ * for a speaker with no Person record. Matched with best_fields, so each field
+ * takes the threshold on its own and the better one scores, which keeps a
+ * linked speaker's match what it was with the name field alone.
+ */
+const SPEAKER_NAME_FIELDS = [
+    'speaker_contributions.speaker_person_name',
+    'speaker_contributions.speaker_name'
+] as const;
+
+function buildSpeakerNameMatch(text: string, minimumShouldMatch: string | number): QueryContainer {
+    return {
+        multi_match: {
+            query: text,
+            fields: [...SPEAKER_NAME_FIELDS],
+            type: 'best_fields',
+            minimum_should_match: minimumShouldMatch
+        }
+    };
+}
 
 /**
  * Share of a field's tier awarded for covering only part of the query.
@@ -360,9 +337,9 @@ const FIELD_TIER = {
 // replace discards the raw BM25 magnitude; the log term keeps its ordering as
 // a within-tier tiebreak.
 function flattenToTier(
-    query: estypes.QueryDslQueryContainer,
+    query: QueryContainer,
     tier: { base: number; k: number }
-): estypes.QueryDslQueryContainer {
+): QueryContainer {
     return {
         function_score: {
             query,
@@ -400,7 +377,7 @@ function scaleTier(tier: { base: number; k: number }, factor: number): { base: n
 // acronym at all — scored 28, the whole introducer tier, for half a match.
 // dis_max with tie_breaker 0 keeps whichever spelling the index holds and
 // discards the rest, so the field totals its tier exactly, as FIELD_TIER says.
-function anySpelling(clauses: estypes.QueryDslQueryContainer[]): estypes.QueryDslQueryContainer {
+function anySpelling(clauses: QueryContainer[]): QueryContainer {
     return clauses.length === 1
         ? clauses[0]
         : { dis_max: { queries: clauses, tie_breaker: 0 } };
@@ -410,9 +387,9 @@ function anySpelling(clauses: estypes.QueryDslQueryContainer[]): estypes.QueryDs
 // `build` takes the minimum_should_match to apply, so each caller keeps its own
 // clause shape (plain match, nested, alternate spelling).
 function coverageClauses(
-    build: (minimumShouldMatch: string | number) => estypes.QueryDslQueryContainer,
+    build: (minimumShouldMatch: string | number) => QueryContainer,
     tier: { base: number; k: number }
-): estypes.QueryDslQueryContainer[] {
+): QueryContainer[] {
     return [
         flattenToTier(
             build(LEXICAL_MINIMUM_SHOULD_MATCH),
@@ -569,8 +546,8 @@ function buildRankingFunction(): estypes.QueryDslFunctionScoreContainer {
 // among text matches, never a sort key of its own. The filter-only browse path
 // therefore does not use it at all (see buildSearchQuery).
 function applyRanking(
-    query: estypes.QueryDslQueryContainer
-): estypes.QueryDslQueryContainer {
+    query: QueryContainer
+): QueryContainer {
     return {
         function_score: {
             query,
@@ -580,16 +557,47 @@ function applyRanking(
     };
 }
 
-// Build filters for the search query
-export function buildFilters(request: SearchRequest): estypes.QueryDslQueryContainer[] {
-    const filters: estypes.QueryDslQueryContainer[] = [];
+/**
+ * What a reader may see, as filters. Every query that returns subjects to a
+ * reader starts from these: the search (buildFilters) and the related
+ * subjects (buildRelatedSubjectsQuery). A rule about visibility belongs here,
+ * so that neither query can show what the other hides.
+ */
+export function subjectVisibilityFilters(): QueryContainer[] {
+    return [{ term: { 'meeting_released': true } }];
+}
 
-    // Always filter for released meetings only
-    filters.push({
-        term: {
-            'meeting_released': true
+/**
+ * A subject is relevant to a person or a party if they EITHER introduced it OR
+ * spoke in it. The two clauses must be OR-combined inside a single
+ * `bool.should`; pushing them as separate entries in the top-level `filter`
+ * array would AND them, which almost never matches — the introducer rarely
+ * speaks in the same subject, and many subjects have no introducer.
+ */
+function introducedOrSpokeFilter(
+    ids: string[],
+    introducedByField: string,
+    speakerField: string
+): QueryContainer {
+    return {
+        bool: {
+            should: [
+                { terms: { [introducedByField]: ids } },
+                {
+                    nested: {
+                        path: 'speaker_contributions',
+                        query: { terms: { [speakerField]: ids } }
+                    }
+                }
+            ],
+            minimum_should_match: 1
         }
-    });
+    };
+}
+
+// Build filters for the search query
+export function buildFilters(request: SearchRequest): QueryContainer[] {
+    const filters: QueryContainer[] = subjectVisibilityFilters();
 
     // Add city filter if specified
     if (request.cityIds && request.cityIds.length > 0) {
@@ -600,66 +608,54 @@ export function buildFilters(request: SearchRequest): estypes.QueryDslQueryConta
         });
     }
 
-    // Add person filter if specified.
-    // A subject is relevant to a person if they EITHER introduced it OR spoke in it.
-    // These two clauses must be OR-combined inside a single `bool.should`; pushing
-    // them as separate entries in the top-level `filter` array would AND them, which
-    // almost never matches (the person rarely both introduces and speaks in the same
-    // subject) and breaks search on every person profile page.
     if (request.personIds && request.personIds.length > 0) {
-        filters.push({
-            bool: {
-                should: [
-                    // Introduced by the person
-                    {
-                        terms: {
-                            'introduced_by_person_id': request.personIds
-                        }
-                    },
-                    // Spoke in the subject (nested speaker contributions)
-                    {
-                        nested: {
-                            path: 'speaker_contributions',
-                            query: {
-                                terms: {
-                                    'speaker_contributions.speaker_person_id': request.personIds
-                                }
-                            }
-                        }
-                    }
-                ],
-                minimum_should_match: 1
-            }
-        });
+        filters.push(introducedOrSpokeFilter(
+            request.personIds,
+            'introduced_by_person_id',
+            'speaker_contributions.speaker_person_id'
+        ));
     }
 
-    // Add party filter if specified
+    // The search page adds a person's party whenever it filters by that person,
+    // so a party filter narrower than the person's own would hide subjects the
+    // person spoke in.
     if (request.partyIds && request.partyIds.length > 0) {
-        filters.push({
-            terms: {
-                'introduced_by_party_id': request.partyIds
-            }
-        });
+        filters.push(introducedOrSpokeFilter(
+            request.partyIds,
+            'introduced_by_party_id',
+            'speaker_contributions.speaker_party_id'
+        ));
     }
 
     // Add administrative body filter if specified. The two clauses are
-    // independent: `adminBodyIds` selects named bodies, `adminBodyTypes` selects
-    // every body of a type. The UI sets both when the user picks a named body,
-    // and they agree — a body has exactly one type.
-    if (request.adminBodyIds && request.adminBodyIds.length > 0) {
+    // independent: `administrativeBodyIds` selects named bodies,
+    // `administrativeBodyTypes` selects every body of a type. The UI sets both
+    // when the user picks a named body, and they agree — a body has exactly
+    // one type.
+    if (request.administrativeBodyIds && request.administrativeBodyIds.length > 0) {
         filters.push({
             terms: {
-                'administrative_body_id': request.adminBodyIds
+                'administrative_body_id': request.administrativeBodyIds
             }
         });
     }
 
-    if (request.adminBodyTypes && request.adminBodyTypes.length > 0) {
-        filters.push({
+    // A meeting with no body is indexed with no type and reads as the council's,
+    // as in meetingBodyTypeWhere, so asking for the council admits it too.
+    if (request.administrativeBodyTypes && request.administrativeBodyTypes.length > 0) {
+        const ofTypes: QueryContainer = {
             terms: {
-                'administrative_body_type': request.adminBodyTypes
+                'administrative_body_type': request.administrativeBodyTypes
             }
-        });
+        };
+        filters.push(request.administrativeBodyTypes.includes('council')
+            ? {
+                bool: {
+                    should: [ofTypes, { bool: { must_not: { exists: { field: 'administrative_body_type' } } } }],
+                    minimum_should_match: 1
+                }
+            }
+            : ofTypes);
     }
 
     // Add topic filter if specified
@@ -683,12 +679,20 @@ export function buildFilters(request: SearchRequest): estypes.QueryDslQueryConta
         });
     }
 
+    // The caller asked for this place, so a subject without a pin is dropped.
+    const locationFilter = buildLocationClause(request.location && [request.location]);
+    if (locationFilter) {
+        filters.push(locationFilter);
+    }
+
     return filters;
 }
 
-// Location proximity, as ONE clause: "pinned near any of the extracted
-// locations". Only the AI filter-extraction path produces `locations` (no UI,
-// API or MCP caller passes them).
+// Location proximity, as ONE clause: "pinned near any of these locations".
+// It has two callers. The scored path uses it as a proximity boost for the
+// locations the AI filter extraction read out of the query text, which never
+// reach the caller's SearchRequest. buildFilters uses it as a hard filter for
+// `location`, a place the caller asked for explicitly.
 //
 // The collapse is not cosmetic. processFilters geocodes the extracted name in
 // EVERY municipality (it calls getCities() with no realm argument), and adjacent
@@ -701,12 +705,13 @@ export function buildFilters(request: SearchRequest): estypes.QueryDslQueryConta
 // awarded once for being near the place — however many points the geocoder
 // returned for it.
 //
-// It must NOT become a hard filter on a text search: only ~45% of subjects carry
-// a location pin, and a geo_distance filter drops every pin-less document. A
-// query like "παλαιστίνη" — extracted as a location and geocoded somewhere —
-// would then return zero results even though subjects carry it in the title. The
-// scored path wraps this clause in a constant_score under `should`, so nearby
-// pinned subjects rank higher and everything else still matches on text alone.
+// An EXTRACTED location must NOT become a hard filter on a text search: only
+// ~45% of subjects carry a location pin, and a geo_distance filter drops every
+// pin-less document. A query like "παλαιστίνη" — extracted as a location and
+// geocoded somewhere — would then return zero results even though subjects
+// carry it in the title. The scored path wraps this clause in a constant_score
+// under `should`, so nearby pinned subjects rank higher and everything else
+// still matches on text alone.
 //
 // The radius is in METRES (Location.radiusMeters), so the geo_distance unit
 // suffix must be `m`. Reading it as `km` made the clause useless without
@@ -716,7 +721,7 @@ export function buildFilters(request: SearchRequest): estypes.QueryDslQueryConta
 // no proximity signal left in it.
 function buildLocationClause(
     locations: Location[] | undefined
-): estypes.QueryDslQueryContainer | undefined {
+): QueryContainer | undefined {
     if (!locations || locations.length === 0) return undefined;
     return {
         bool: {
@@ -725,7 +730,9 @@ function buildLocationClause(
                     distance: `${loc.radiusMeters}m`,
                     'location_geojson': {
                         lat: loc.point.lat,
-                        lon: loc.point.lon
+                        // Elasticsearch's geo_point object names the
+                        // longitude `lon`; the app names it `lng`.
+                        lon: loc.point.lng
                     }
                 }
             })),
@@ -744,7 +751,7 @@ function buildTranscriptMatch(
     field: string,
     queryText: string,
     minimumShouldMatch: string | number = LEXICAL_MINIMUM_SHOULD_MATCH
-): estypes.QueryDslQueryContainer {
+): QueryContainer {
     return {
         match: {
             [field]: {
@@ -810,7 +817,7 @@ function spellingsOf(text: string): string[] {
 // The name field's typo-tolerant match. Shared so the coverage gate and the
 // scoring clause cannot drift apart: the gate is exact-only without it, and a
 // typo query would be rejected before the clause built to recover it can score.
-function buildFuzzyNameMatch(text: string): estypes.QueryDslQueryContainer {
+function buildFuzzyNameMatch(text: string): QueryContainer {
     return {
         match: {
             'name': {
@@ -848,7 +855,7 @@ function buildFuzzyNameMatch(text: string): estypes.QueryDslQueryContainer {
  * reject a query whose only index spelling is a variant (Δ.Ε.Υ.Α.Χ. is indexed
  * plain) before its variant clauses could score it.
  */
-function buildCoverageGate(queryText: string): estypes.QueryDslQueryContainer {
+function buildCoverageGate(queryText: string): QueryContainer {
     const spellings = spellingsOf(queryText);
     return {
         bool: {
@@ -868,14 +875,7 @@ function buildCoverageGate(queryText: string): estypes.QueryDslQueryContainer {
                             bool: {
                                 should: [
                                     buildTranscriptMatch('speaker_contributions.text', text),
-                                    {
-                                        match: {
-                                            'speaker_contributions.speaker_person_name': {
-                                                query: text,
-                                                minimum_should_match: SPEAKER_NAME_GATE_MINIMUM_SHOULD_MATCH
-                                            }
-                                        }
-                                    }
+                                    buildSpeakerNameMatch(text, SPEAKER_NAME_GATE_MINIMUM_SHOULD_MATCH)
                                 ],
                                 minimum_should_match: 1
                             }
@@ -892,7 +892,7 @@ function buildCoverageGate(queryText: string): estypes.QueryDslQueryContainer {
 function buildLexicalShouldClauses(
     queryText: string,
     extractedFilters: ExtractedFilters
-): estypes.QueryDslQueryContainer[] {
+): QueryContainer[] {
     // Name and description sit in different tiers, so each field gets its own
     // clause (a shared best_fields multi_match could not carry two bases).
     // Matching several fields sums their tiers — more evidence, higher score —
@@ -915,11 +915,11 @@ function buildLexicalShouldClauses(
     // punctuation, which both mis-ranks and drops documents (see spellingsOf).
     const spellings = spellingsOf(queryText);
     const perSpelling = (
-        build: (text: string) => estypes.QueryDslQueryContainer
-    ): estypes.QueryDslQueryContainer => anySpelling(spellings.map(build));
+        build: (text: string) => QueryContainer
+    ): QueryContainer => anySpelling(spellings.map(build));
 
     const termClause = (field: string, texts: string[]) =>
-        (minimumShouldMatch: string | number): estypes.QueryDslQueryContainer =>
+        (minimumShouldMatch: string | number): QueryContainer =>
             anySpelling(texts.map(text => ({
                 match: {
                     [field]: {
@@ -1007,14 +1007,7 @@ function buildLexicalShouldClauses(
             minimumShouldMatch => perSpelling(text => ({
                 nested: {
                     path: 'speaker_contributions',
-                    query: {
-                        match: {
-                            'speaker_contributions.speaker_person_name': {
-                                query: text,
-                                minimum_should_match: minimumShouldMatch
-                            }
-                        }
-                    }
+                    query: buildSpeakerNameMatch(text, minimumShouldMatch)
                 }
             })),
             FIELD_TIER.speakerName
@@ -1029,7 +1022,7 @@ function buildLexicalShouldClauses(
 //
 // The two sub-fields combine with dis_max (score = MAX of the two), not by
 // summing a boosted `bool.should`. The sum made the cutoff an agreement test
-// rather than a quality test — see DEFAULT_SEMANTIC_MIN_SCORE for the measured
+// rather than a quality test — see ./profile.ts for the measured
 // damage. Under max, each field is judged on its own: a document whose title
 // paraphrases the query passes on the title alone, and the score carries a
 // plain similarity that the cutoff can be reasoned about in.
@@ -1053,7 +1046,7 @@ function buildLexicalShouldClauses(
 //     20-40, so any bonus big enough to lift a paraphrase-only match over
 //     junk would also flip the strong matches.
 // Under dis_max the semantic path is mapped into the description-tier score
-// range (SEMANTIC_MAPPED_BASE + margin * SEMANTIC_MAPPED_SCALE) and max()
+// range (SEMANTIC_MAPPED_BASE + margin * the profile's scale) and max()
 // structurally caps its power: a document with a strong lexical score keeps
 // it unchanged, a paraphrase-only document enters at description strength —
 // above transcript-only mentions and weak stem-coincidence matches, below
@@ -1062,9 +1055,10 @@ function buildLexicalShouldClauses(
 // match, and the lexical side never matched in the first place.
 function buildSemanticFallbackQuery(
     queryText: string,
-    semanticMinScore: number
-): estypes.QueryDslQueryContainer {
-    const semanticQuery: estypes.QueryDslQueryContainer = {
+    semanticMinScore: number,
+    semanticMappedScale: number
+): QueryContainer {
+    const semanticQuery: QueryContainer = {
         dis_max: {
             queries: [
                 {
@@ -1103,7 +1097,7 @@ function buildSemanticFallbackQuery(
                             params: {
                                 base: SEMANTIC_MAPPED_BASE,
                                 cutoff: semanticMinScore,
-                                scale: SEMANTIC_MAPPED_SCALE
+                                scale: semanticMappedScale
                             }
                         }
                     }
@@ -1121,13 +1115,16 @@ function buildSemanticFallbackQuery(
 // Build the search query
 export function buildSearchQuery(
     request: SearchRequest,
-    extractedFilters: ExtractedFilters
+    extractedFilters: ExtractedFilters,
+    extractedLocations?: Location[],
+    profile: QueryProfile = DEFAULT_SCORE_PROFILE
 ): estypes.SearchRequest {
     // `request` already carries the AI-extracted city ids and date range: the
     // caller merges them (search() in ./index.ts). Merging them again here
     // would put the raw extracted city ids back, past the realm cap the caller
     // applies to them, and let a query name a municipality of another realm.
-    // `extractedFilters` is still read below for the location-name clause.
+    // `extractedFilters` is still read below for the location-name clause, and
+    // `extractedLocations` (the geocoded places) only for the proximity boost.
     //
     // Filter-only search: no query text to rank on, so skip the text clauses
     // (they require a query) and return the filtered set newest-first. Used e.g.
@@ -1135,19 +1132,15 @@ export function buildSearchQuery(
     const queryText = request.query?.trim().replace(APOSTROPHE_VARIANTS, "'");
     const filters = buildFilters(request);
     if (!queryText) {
-        // With no text to score, a location can only act as a filter — so the
-        // clause enters in filter context, where it contributes no score.
-        // Unreachable today (locations only come from AI extraction, which
-        // requires query text), but kept so an explicit filter-only location
-        // request stays a location browse rather than being ignored.
-        const locationClause = buildLocationClause(request.locations);
-        const browseFilters = locationClause ? [...filters, locationClause] : filters;
+        // An extracted location only boosts, and with no text there is nothing
+        // to extract from. A caller's place reaches this path as the
+        // `location` in `filters`.
         return {
-            index: env.ELASTICSEARCH_INDEX,
+            index: profile.index ?? env.ELASTICSEARCH_INDEX,
             size: request.config?.size || 10,
             from: request.config?.from || 0,
             track_total_hits: true,
-            query: { bool: { filter: browseFilters } },
+            query: { bool: { filter: filters } },
             // Newest first, NOT the ranking function. That function is calibrated as
             // a tiebreak between text matches (see RANKING_SCRIPT), so it cannot
             // order a browse listing: its administrative-body span (up to 1.15)
@@ -1176,14 +1169,14 @@ export function buildSearchQuery(
     // the tiered should-clauses carry all of the scoring. minimum_should_match
     // stays 1 so a document that somehow clears the gate without any scoring
     // clause cannot enter at score 0.
-    const lexicalBool: estypes.QueryDslQueryContainer = {
+    const lexicalBool: QueryContainer = {
         bool: {
             filter: [buildCoverageGate(queryText)],
             should: buildLexicalShouldClauses(queryText, extractedFilters),
             minimum_should_match: 1
         }
     };
-    const textCore: estypes.QueryDslQueryContainer = {
+    const textCore: QueryContainer = {
         bool: {
             must: [
                 request.config?.enableSemanticSearch
@@ -1193,7 +1186,8 @@ export function buildSearchQuery(
                                 lexicalBool,
                                 buildSemanticFallbackQuery(
                                     queryText,
-                                    request.config.semanticMinScore ?? DEFAULT_SEMANTIC_MIN_SCORE
+                                    request.config.semanticMinScore ?? profile.semanticMinScore,
+                                    profile.semanticMappedScale
                                 )
                             ],
                             // Pure max: any tie_breaker share of the semantic score
@@ -1212,8 +1206,8 @@ export function buildSearchQuery(
     // surface. constant_score awards LOCATION_BOOST once for being near the
     // place: the geo clauses sit in ITS filter context, where the number of
     // points the geocoder returned for one place cannot reach the score.
-    const locationClause = buildLocationClause(request.locations);
-    const scoredQuery: estypes.QueryDslQueryContainer = locationClause
+    const locationClause = buildLocationClause(extractedLocations);
+    const scoredQuery: QueryContainer = locationClause
         ? {
             bool: {
                 must: [textCore],
@@ -1223,7 +1217,7 @@ export function buildSearchQuery(
         : textCore;
 
     return {
-        index: env.ELASTICSEARCH_INDEX,
+        index: profile.index ?? env.ELASTICSEARCH_INDEX,
         size: request.config?.size || 10,
         from: request.config?.from || 0,
         track_total_hits: true,

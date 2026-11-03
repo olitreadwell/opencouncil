@@ -1,25 +1,54 @@
-// Server-only (NOT a "use server" action). getTaskStatusDirect skips the user
-// gate on purpose — its sole caller, the taskStatuses callback route, is hit by
-// the task server with no session: possession of the unguessable taskStatusId
-// is the authorization, so a user-session gate cannot live inside the function.
-// Keeping it off the Server Action surface is what prevents a client from
-// invoking it directly to probe task ids.
+// Server-only (NOT a "use server" action). getTaskStatusDirect and
+// deleteTaskStatusDirect skip the user gate on purpose. Their only caller is the
+// taskStatuses route, which settles access itself: POST/PUT come from the task
+// server with no session and carry an HMAC token, DELETE checks
+// isUserAuthorizedToEdit before it deletes, and GET is public but redacts task
+// bodies for non-editors. Keeping them off the Server Action surface is what
+// prevents a client from invoking them directly to probe or delete task ids.
 import "server-only";
-import type { TaskStatus } from '@prisma/client';
+import type { Prisma, TaskStatus } from '@prisma/client';
 import prisma from "./prisma";
+import { TASK_CONFIG } from '@/lib/tasks/types';
+import type { ProcessAgendaResult, Subject } from '@/lib/apiTypes';
 
-export async function getTaskStatusDirect(taskStatusId: string): Promise<TaskStatus | null> {
-    return prisma.taskStatus.findUnique({
-        where: { id: taskStatusId },
-    });
+/** The meeting a task belongs to, as named by the callback route's path. */
+export type TaskStatusScope = Pick<TaskStatus, 'cityId' | 'councilMeetingId'>;
+
+/**
+ * A task in another city or meeting matches nothing, so the route answers 404 and
+ * does not reveal that the task exists. The fields are copied, not spread, so a
+ * wider object cannot add filters to the query.
+ */
+function scopedTaskStatus(taskStatusId: string, scope: TaskStatusScope): Prisma.TaskStatusWhereInput {
+    return { id: taskStatusId, cityId: scope.cityId, councilMeetingId: scope.councilMeetingId };
+}
+
+export async function getTaskStatusDirect(taskStatusId: string, scope: TaskStatusScope): Promise<TaskStatus | null> {
+    return prisma.taskStatus.findFirst({ where: scopedTaskStatus(taskStatusId, scope) });
 }
 
 /**
- * Error bodies of a meeting's most recent failed transcribes, newest first.
+ * Delete a task inside its tenant, unless it was updated after `notUpdatedAfter`.
+ * Returns the number of rows removed: 0 means a concurrent delete removed the task,
+ * or a callback updated it after the caller's own check.
+ */
+export async function deleteTaskStatusDirect(
+    taskStatusId: string,
+    scope: TaskStatusScope,
+    notUpdatedAfter: Date
+): Promise<number> {
+    const { count } = await prisma.taskStatus.deleteMany({
+        where: { ...scopedTaskStatus(taskStatusId, scope), updatedAt: { lte: notUpdatedAfter } },
+    });
+    return count;
+}
+
+/**
+ * Failure reasons of a meeting's most recent failed transcribes, newest first.
  *
- * Selects `responseBody` only for FAILED rows: on a failure it holds just the error
- * string, but on a succeeded transcribe it holds the whole result, and `requestBody`
- * holds up to 50 voiceprint embeddings. Widening either would make this expensive.
+ * Selects `failureReason` only. `responseBody` holds the whole result of a
+ * transcribe, and `requestBody` holds up to 50 voiceprint embeddings. Reading
+ * either would make this expensive.
  *
  * No user gate, for the same reason as getTaskStatusDirect: the caller is the
  * poll-livestreams cron, which runs with no session.
@@ -31,10 +60,110 @@ export async function getRecentTranscribeFailureErrors(
 ): Promise<string[]> {
     const rows = await prisma.taskStatus.findMany({
         where: { cityId, councilMeetingId, type: 'transcribe', status: 'failed' },
-        select: { responseBody: true },
+        select: { failureReason: true },
         orderBy: { createdAt: 'desc' },
         take: limit,
     });
 
-    return rows.map(row => row.responseBody ?? '');
+    return rows.map(row => row.failureReason ?? '');
+}
+
+const meetingTaskSelect = {
+    id: true,
+    type: true,
+    status: true,
+    stage: true,
+    percentComplete: true,
+    createdAt: true,
+    updatedAt: true,
+    version: true,
+} satisfies Prisma.TaskStatusSelect;
+
+export type MeetingTaskRow = Prisma.TaskStatusGetPayload<{ select: typeof meetingTaskSelect }> & {
+    /** The failure reason of a failed task; null otherwise. */
+    error: string | null;
+};
+
+/**
+ * The newest rows of each task type. A meeting that was reprocessed many
+ * times, or polled for decisions on a schedule, holds far more rows than a
+ * reader of its status needs.
+ */
+export const MEETING_TASKS_PER_TYPE = 5;
+
+const MEETING_TASK_TYPES = Object.keys(TASK_CONFIG);
+
+/**
+ * The tasks of a meeting, newest first, capped per type, with the failure
+ * reason of the failed ones. The bodies stay out of the first read for the
+ * reason given above; the failed rows are read again for `failureReason` alone.
+ *
+ * No user gate: the MCP server authorizes with a token before it calls this.
+ */
+export async function getTasksForMeetingDirect(cityId: string, councilMeetingId: string): Promise<MeetingTaskRow[]> {
+    // One bounded, indexed read per type instead of the whole history: a
+    // meeting polled for decisions on a schedule holds hundreds of rows.
+    const perType = await Promise.all(
+        MEETING_TASK_TYPES.map(type => prisma.taskStatus.findMany({
+            where: { cityId, councilMeetingId, type },
+            select: meetingTaskSelect,
+            orderBy: { createdAt: 'desc' },
+            take: MEETING_TASKS_PER_TYPE,
+        }))
+    );
+    const rows = perType.flat().sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+
+    const failedIds = rows.filter(row => row.status === 'failed').map(row => row.id);
+    const errors = failedIds.length === 0
+        ? []
+        : await prisma.taskStatus.findMany({
+            where: { id: { in: failedIds } },
+            select: { id: true, failureReason: true },
+        });
+    const errorById = new Map(errors.map(row => [row.id, row.failureReason]));
+
+    return rows.map(row => ({ ...row, error: errorById.get(row.id) ?? null }));
+}
+
+/**
+ * The subjects of the newest succeeded processAgenda result for a meeting, by
+ * createdAt. A replay of an older run writes its subjects again but leaves the
+ * newer run as the newest one, so the two can differ until processAgenda runs
+ * again.
+ *
+ * No user gate: the callers of getSummarizeRequestBody authorize first.
+ * requestSummarize and batchRerunTask check the user, and the MCP admin tools
+ * check a token before they call startMeetingTask.
+ */
+export async function getLatestProcessAgendaSubjects(cityId: string, councilMeetingId: string): Promise<Subject[]> {
+    const task = await prisma.taskStatus.findFirst({
+        where: { cityId, councilMeetingId, type: 'processAgenda', status: 'succeeded', responseBody: { not: null } },
+        orderBy: { createdAt: 'desc' },
+        select: { responseBody: true },
+    });
+    if (!task?.responseBody) return [];
+    const result = JSON.parse(task.responseBody) as Partial<ProcessAgendaResult>;
+    return Array.isArray(result.subjects) ? result.subjects : [];
+}
+
+/**
+ * When each of the given task types last succeeded for a meeting. Only a
+ * succeeded task counts: a claimed one is still writing its results, and its
+ * callback decides about notifications itself once it succeeds.
+ */
+export async function getLastSucceededTaskTimes<T extends string>(
+    cityId: string,
+    councilMeetingId: string,
+    types: readonly T[],
+): Promise<Partial<Record<T, Date>>> {
+    const rows = await prisma.taskStatus.groupBy({
+        by: ['type'],
+        where: { cityId, councilMeetingId, status: 'succeeded', type: { in: [...types] } },
+        _max: { updatedAt: true },
+    });
+    const times: Partial<Record<T, Date>> = {};
+    for (const row of rows) {
+        if (row._max.updatedAt) times[row.type as T] = row._max.updatedAt;
+    }
+    return times;
 }

@@ -5,6 +5,13 @@ import type {
 } from "../../generated/main-client";
 import type { Prisma, PrismaClient } from "../../generated/client";
 import { normalizeMobilePhone } from "@opencouncil/ui/lib/phone";
+// What is news: one rule for WhatsApp here and for the app's email notifications.
+import {
+  classifyEvent,
+  EVENT_LOOKBACK_MS,
+  STALE_MEETING_MS,
+  type EventDisposition,
+} from "@opencouncil/ui/lib/meeting-news";
 import { editorialPass } from "@/agent/editorialPass";
 import { seedProfileFromPreferences } from "@/agent/profileSeed";
 import {
@@ -34,6 +41,10 @@ import {
   hasSetting,
   putSetting,
 } from "./settings";
+
+/** How long a meeting event waits before its wake, so that sibling meetings
+ *  of the same city (summarized minutes apart) coalesce into one wake. */
+export const MEETING_SETTLE_MS = 45 * 60_000;
 
 /**
  * The poller — every link between OpenCouncil and notis is a pull from
@@ -115,19 +126,6 @@ export const MAX_EVENTS_PER_TICK = 4;
  * WhatsApp messaging tier, which is lower than this on the first two rungs.
  */
 export const MAX_ENROLLMENTS_PER_TICK = 8;
-/** How far back the event feed looks. completedAt moves on task-row
- *  rewrites, so this is a coarse window — dedup is by meeting and phase. */
-export const EVENT_LOOKBACK_MS = 7 * 24 * 60 * 60_000;
-/**
- * A meeting older than this is never news, whatever its task rows say.
- * completedAt is TaskStatus.updatedAt underneath: a re-run (batchRerun
- * --force writes NEW succeeded rows) or any client-side touch of old rows
- * re-enters them into the lookback, and the meeting-identity dedup only
- * protects meetings notis has already recorded — pre-launch history is not.
- * Without this guard one maintenance script would pay an editorial pass per
- * old meeting and WhatsApp whole cohorts about years-old news.
- */
-export const STALE_MEETING_MS = 30 * 24 * 60 * 60_000;
 /**
  * How long a meeting with no subjects is left alone before it counts as
  * genuinely empty. A task marks itself succeeded before it finishes writing
@@ -509,48 +507,6 @@ async function fireScheduledWakes(
 }
 
 /**
- * What the poller does with one meeting event, decided by its type and the
- * MEETING's own date — never by when the task finished. The table:
- *
- * | event          | meeting ahead | meeting past      |
- * |----------------|---------------|-------------------|
- * | processAgenda  | fanout        | late-agenda       |
- * | summarize      | future-summary| fanout            |
- *
- * `stale` overrides both for a meeting older than STALE_MEETING_MS. That is
- * a blast-radius floor, not part of the semantics above: completedAt is
- * TaskStatus.updatedAt, so one `batchRerun --force` over the archive would
- * otherwise pay an editorial pass per meeting and WhatsApp whole cohorts
- * about years-old news. Dedup does not cover it — a meeting notis never
- * recorded (pre-launch history) has no processed row to match.
- *
- * - `late-agenda`: a processAgenda task that succeeded after the meeting was
- *   held (a late upload, a backfill, batchRerun --force). Fanning it out
- *   would preview a meeting that already happened, against an archive that
- *   by then carries the transcript. The summarize event is that meeting's
- *   real news and arrives on its own.
- * - `future-summary`: a meeting cannot be summarized before it happens, so
- *   this is a data error — almost always a wrong CouncilMeeting.dateTime.
- *   The poller alarms and sends nothing. Unlike the other two it is NOT
- *   consumed, so correcting the date lets the same event fan out — but only
- *   while the task row is still inside EVENT_LOOKBACK_MS. completedAt is
- *   TaskStatus.updatedAt and does not move when CouncilMeeting.dateTime is
- *   fixed, so a later fix needs the summarize task re-run. The alarm says so.
- */
-export type EventDisposition = "fanout" | "stale" | "late-agenda" | "future-summary";
-
-export function classifyEvent(
-  row: Pick<MeetingEventRow, "type" | "meetingDate">,
-  at: Date,
-  staleBefore: Date,
-): EventDisposition {
-  if (row.meetingDate < staleBefore) return "stale";
-  const ahead = row.meetingDate > at;
-  if (row.type === "processAgenda") return ahead ? "fanout" : "late-agenda";
-  return ahead ? "future-summary" : "fanout";
-}
-
-/**
  * Record an event as consumed without a wake — the same row seedOnly writes,
  * with no brief and no fan-out. Returns false when a concurrent tick got
  * there first.
@@ -564,6 +520,9 @@ async function consumeEvent(db: PrismaClient, row: MeetingEventRow): Promise<boo
         cityId: row.cityId,
         meetingId: row.meetingId,
         meetingName: row.meetingName,
+        meetingKind: row.meetingKind,
+        urgent: row.urgent,
+        sessionNumber: row.sessionNumber,
         meetingDate: row.meetingDate,
         adminBodyName: row.adminBodyName,
       },
@@ -733,11 +692,13 @@ async function processMeetingEvents(
     // The meeting holds nothing to rank. Two very different things look like
     // this, and the difference is time.
     //
-    // A task sets its status to succeeded BEFORE it writes its subjects, and
-    // the event feed reads that status, so a real meeting looks empty for a
-    // few seconds after its event appears. Leave those alone. The next tick
-    // sees the subjects and fans out as normal — which is what the old 400
-    // did by accident, and what consuming here would have destroyed.
+    // The main app now sets a task to succeeded only after its handler has
+    // written the subjects. Before that change the status flipped first, and
+    // a real meeting looked empty for a few seconds after its event appeared;
+    // a deployment that still runs the old order, or any other reason the
+    // rows lag the status, gets the same grace. Leave those alone. The next
+    // tick sees the subjects and fans out as normal — which is what the old
+    // 400 did by accident, and what consuming here would have destroyed.
     //
     // Past the settle window the emptiness is the meeting's own: a λογοδοσία
     // session whose agenda has no numbered items, or an extraction that found
@@ -764,11 +725,26 @@ async function processMeetingEvents(
       cityId: row.cityId,
       meetingId: row.meetingId,
       meetingName: row.meetingName,
+      meetingKind: row.meetingKind,
+      urgent: row.urgent,
+      sessionNumber: row.sessionNumber,
       meetingDate: row.meetingDate.toISOString(),
       adminBody: row.adminBodyName,
       brief,
     };
-    const runAfter = clampToActiveHours(now(), rng);
+    // Let sibling events settle before the wake runs: two sessions of one
+    // council day are summarized minutes apart, and each woke the reader on
+    // its own — 215 second pushes within an hour in six weeks, 142 of them
+    // on one Athens evening. Delayed, the second event merges into the
+    // first event's pending batch row and the reader gets one wake. Not
+    // across 23:00, though: a settle that lands in quiet hours would become
+    // an eleven-hour hold. And an agenda whose meeting starts inside the
+    // settle window goes out now, or it previews a session already running.
+    const tick = now();
+    const settled = new Date(tick.getTime() + MEETING_SETTLE_MS);
+    const startsSoon =
+      phase === "agenda" && row.meetingDate.getTime() - tick.getTime() < MEETING_SETTLE_MS;
+    const runAfter = clampToActiveHours(isQuietHour(settled) || startsSoon ? tick : settled, rng);
 
     try {
       // This transaction scales with the audience: one processed-event row plus
@@ -787,6 +763,9 @@ async function processMeetingEvents(
               cityId: row.cityId,
               meetingId: row.meetingId,
               meetingName: row.meetingName,
+              meetingKind: row.meetingKind,
+              urgent: row.urgent,
+              sessionNumber: row.sessionNumber,
               meetingDate: row.meetingDate,
               adminBodyName: row.adminBodyName,
               brief: brief as unknown as Prisma.InputJsonValue,

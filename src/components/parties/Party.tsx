@@ -4,16 +4,18 @@ import { captureEvent } from '@/lib/analytics/capture';
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import FormSheet from '../FormSheet';
 import PartyForm from './PartyForm';
-import { City, Person, Role, AdministrativeBody, AdministrativeBodyType } from '@prisma/client';
+import { City, Person, Role, AdministrativeBodyType } from '@prisma/client';
 import { ImageOrInitials } from '../ImageOrInitials';
 import { Button } from '../ui/button';
 import { PartyWithPersons } from '@/lib/db/parties';
 import { useRouter } from 'next/navigation';
+import { useSession } from 'next-auth/react';
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog';
 import { toast } from '@/hooks/use-toast';
 import { Breadcrumb, BreadcrumbList, BreadcrumbItem, BreadcrumbLink, BreadcrumbSeparator } from '@/components/ui/breadcrumb';
 import { Link } from '@/i18n/routing';
 import { getLatestContributionsForParty } from '@/lib/db/contributions';
-import { ContributionForPerson } from '@/lib/db/types';
+import { ContributionForPerson, type PublicAdministrativeBody } from '@/lib/db/types';
 import { ContributionCard, ContributionCardSkeleton } from '@/components/meetings/subject/ContributionCard';
 import { isUserAuthorizedToEdit } from '@/lib/actions/auth';
 import { getAdministrativeBodyTypesForPeople, filterPersonByAdminBodyTypes } from '@/lib/utils/administrativeBodies';
@@ -21,7 +23,8 @@ import { motion } from 'framer-motion';
 import PersonCard from '../persons/PersonCard';
 import { cn, filterActiveRoles, formatDateRange, isRoleActive, getDateRangeFromRoles } from '@/lib/utils';
 import { TWO_COLUMN_GRID_NARROW_RAIL } from '@/components/ui/surface-card';
-import { isActivePartyMember, isPartyRole } from '@/lib/utils/roles';
+import { getRoleTitle, isActivePartyMember, isPartyRole } from '@/lib/utils/roles';
+import { useRoleTitles } from '@/hooks/useRoleTitles';
 import { sortInactivePartyMembers, sortPartyMembers, sortPeople } from '@/lib/sorting/people';
 import { BadgePicker } from '../ui/badge-picker';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -31,7 +34,8 @@ import { RailCard, RailMeterRow } from '@/components/ui/rail-card';
 import { EntityHeader, FactDot } from '@/components/EntityHeader';
 import { ContributionsHead } from '@/components/ContributionsHead';
 import { GoverningPartyChip } from '@/components/parties/GoverningPartyChip';
-import { partyComposition } from '@/lib/party/composition';
+import { partyComposition, type BodySeatTotals } from '@/lib/party/composition';
+import { meetingLabel } from '@/lib/meetingName';
 
 type RoleWithPerson = Role & {
     person: Person;
@@ -57,10 +61,11 @@ function PartyMembersTab({
     party: PartyWithPersons,
     people: PersonWithRelations[],
     canEdit: boolean,
-    administrativeBodies: AdministrativeBody[]
+    administrativeBodies: PublicAdministrativeBody[]
 }) {
     const t = useTranslations('Party');
     const tCommon = useTranslations('Common');
+    const roleTitles = useRoleTitles(city.language);
     const [selectedTypes, setSelectedTypes] = useState<AdministrativeBodyType[]>([]);
 
     // The picker sits in the current-members header and offers the bodies those
@@ -135,6 +140,7 @@ function PartyMembersTab({
                             <PersonCard
                                 key={person.id}
                                 item={person}
+                                cityLanguage={city.language}
                                 editable={canEdit}
                                 analyticsSurface="party_members"
                             />
@@ -177,12 +183,10 @@ function PartyMembersTab({
                                                 <div className="text-xs sm:text-sm text-muted-foreground">
                                                     {/* History-wide by design: this row is a past member, and
                                                         every role it describes has ended. */}
-                                                    {person.roles
+                                                    {[...new Set(person.roles
                                                         .filter(role => isPartyRole(role, party.id))
-                                                        .some(role => role.isHead) && t('partyLeader')}
-                                                    {person.roles
-                                                        .filter(role => isPartyRole(role, party.id) && role.name)
-                                                        .map(role => role.name)
+                                                        .map(role => getRoleTitle(role, roleTitles))
+                                                        .filter(Boolean))]
                                                         .join(', ')}
                                                 </div>
                                             </div>
@@ -206,6 +210,7 @@ function PartyMembersTab({
 
 // Segments Tab Component
 function SegmentsTab({
+    cityLanguage,
     typeOptions,
     selectedType,
     onSelectType,
@@ -216,8 +221,10 @@ function SegmentsTab({
     searchQuery,
     setSearchQuery,
     handleSearch,
-    allLabel
+    allLabel,
+    timezone
 }: {
+    cityLanguage: string,
     typeOptions: { value: AdministrativeBodyType; label: string }[],
     selectedType: AdministrativeBodyType | null,
     onSelectType: (type: AdministrativeBodyType | null) => void,
@@ -228,7 +235,8 @@ function SegmentsTab({
     searchQuery: string,
     setSearchQuery: (query: string) => void,
     handleSearch: (e: React.FormEvent) => void,
-    allLabel: string
+    allLabel: string,
+    timezone: string
 }) {
     const t = useTranslations('Party');
     const tCommon = useTranslations('Common');
@@ -284,6 +292,7 @@ function SegmentsTab({
                                 transition={{ delay: 0.1 * index }}
                             >
                                 <ContributionCard
+                                    cityLanguage={cityLanguage}
                                     contribution={contribution}
                                     subjectId={contribution.subject.id}
                                     meeting={{
@@ -293,7 +302,8 @@ function SegmentsTab({
                                     }}
                                     speaker={contribution.speaker}
                                     contextHeader={{
-                                        meetingName: contribution.subject.councilMeeting.name,
+                                        // The card prints the date next to it.
+                                        meetingName: meetingLabel(contribution.subject.councilMeeting, 'el', timezone, { date: false }),
                                         adminBodyName: contribution.subject.councilMeeting.administrativeBody?.name ?? null,
                                         meetingDate: contribution.subject.councilMeeting.dateTime,
                                         subjectName: contribution.subject.name,
@@ -351,10 +361,12 @@ function SegmentsTab({
     );
 }
 
-export default function PartyC({ city, party, administrativeBodies }: {
+export default function PartyC({ city, party, administrativeBodies, seatTotals }: {
     city: City,
     party: PartyWithPersons,
-    administrativeBodies: AdministrativeBody[],
+    administrativeBodies: PublicAdministrativeBody[],
+    /** Every active seat in the city, per type of body — the whole each composition bar measures against. */
+    seatTotals: BodySeatTotals,
 }) {
     const t = useTranslations('Party');
     const tCommon = useTranslations('Common');
@@ -366,6 +378,9 @@ export default function PartyC({ city, party, administrativeBodies }: {
     const [page, setPage] = useState(1);
     const [totalCount, setTotalCount] = useState(0);
     const [canEdit, setCanEdit] = useState(false);
+    const [confirmingDelete, setConfirmingDelete] = useState(false);
+    const { data: session } = useSession();
+    const isSuperAdmin = session?.user?.isSuperAdmin ?? false;
     const [selectedAdminBodyType, setSelectedAdminBodyType] = useState<AdministrativeBodyType | null>(null);
     const [isLoadingContributions, setIsLoadingContributions] = useState(false);
 
@@ -399,12 +414,14 @@ export default function PartyC({ city, party, administrativeBodies }: {
     // Seats per body and the governing-party standing — the same derivation the
     // city overview's cards run, so the two surfaces can never disagree.
     const composition = useMemo(() => partyComposition(party), [party]);
+    // Each bar is the party's share of the seats on that type of body. Scaled
+    // against the card's largest row instead, one bar was always full, whatever
+    // the party held.
     const compositionRows = useMemo(() => [
-        { key: 'council', label: tCommon('adminBodyType_council'), count: composition.council },
-        { key: 'committee', label: tCommon('adminBodyType_committee'), count: composition.committee },
-        { key: 'community', label: tCommon('adminBodyType_community'), count: composition.community },
-    ].filter(row => row.count > 0), [composition, tCommon]);
-    const compositionMax = Math.max(1, ...compositionRows.map(row => row.count));
+        { key: 'council', label: tCommon('adminBodyType_council'), count: composition.council, total: seatTotals.council },
+        { key: 'committee', label: tCommon('adminBodyType_committee'), count: composition.committee, total: seatTotals.committee },
+        { key: 'community', label: tCommon('adminBodyType_community'), count: composition.community, total: seatTotals.community },
+    ].filter(row => row.count > 0), [composition, seatTotals, tCommon]);
 
     useEffect(() => {
         const checkEditPermissions = async () => {
@@ -420,14 +437,14 @@ export default function PartyC({ city, party, administrativeBodies }: {
                 setIsLoadingContributions(true);
                 setContributions([]);
                 setPage(1);
-                const { results, totalCount } = await getLatestContributionsForParty(
+                const { results, total } = await getLatestContributionsForParty(
                     party.id,
                     1,
                     5,
                     selectedAdminBodyType
                 );
                 setContributions(results);
-                setTotalCount(totalCount);
+                setTotalCount(total);
             } catch (error) {
                 console.error('Error fetching contributions:', error);
             } finally {
@@ -477,6 +494,7 @@ export default function PartyC({ city, party, administrativeBodies }: {
                 toast({
                     title: t('partyDeleted', { name: party.name }),
                 });
+                setConfirmingDelete(false);
                 router.push(`/${city.id}`);
             } else {
                 const errorData = await response.json();
@@ -602,9 +620,21 @@ export default function PartyC({ city, party, administrativeBodies }: {
                                     triggerSize="sm"
                                     triggerClassName={adminToolClass}
                                 />
-                                <AdminToolButton destructive onClick={onDelete}>
-                                    {t('deleteParty')}
-                                </AdminToolButton>
+                                {isSuperAdmin && (
+                                    <>
+                                        <AdminToolButton destructive onClick={() => setConfirmingDelete(true)}>
+                                            {t('deleteParty')}
+                                        </AdminToolButton>
+                                        <ConfirmDeleteDialog
+                                            open={confirmingDelete}
+                                            onOpenChange={setConfirmingDelete}
+                                            title={t('deleteParty')}
+                                            description={t('deletePartyConfirm')}
+                                            itemName={party.name}
+                                            onConfirm={onDelete}
+                                        />
+                                    </>
+                                )}
                             </AdminStrip>
                         )}
                     />
@@ -638,6 +668,7 @@ export default function PartyC({ city, party, administrativeBodies }: {
 
                             <TabsContent value="contributions" className="mt-6">
                                 <SegmentsTab
+                                    cityLanguage={city.language}
                                     typeOptions={typeOptions}
                                     selectedType={selectedAdminBodyType}
                                     onSelectType={handleAdminBodyTypeSelect}
@@ -649,6 +680,7 @@ export default function PartyC({ city, party, administrativeBodies }: {
                                     setSearchQuery={setSearchQuery}
                                     handleSearch={handleSearch}
                                     allLabel={tCommon('allMeetings')}
+                                    timezone={city.timezone}
                                 />
                             </TabsContent>
                         </Tabs>
@@ -660,8 +692,8 @@ export default function PartyC({ city, party, administrativeBodies }: {
                                         <RailMeterRow
                                             key={row.key}
                                             label={row.label}
-                                            value={row.count}
-                                            ratio={row.count / compositionMax}
+                                            value={`${row.count}/${row.total}`}
+                                            ratio={row.count / row.total}
                                             color={party.colorHex}
                                         />
                                     ))}

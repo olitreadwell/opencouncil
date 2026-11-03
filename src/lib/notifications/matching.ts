@@ -1,6 +1,7 @@
 import "server-only";
 
 import { calculateProximityMatches } from '@/lib/db/notifications';
+import type { SubjectImportance } from '@/lib/zod-schemas/notification';
 
 interface Subject {
     id: string;
@@ -14,10 +15,6 @@ interface UserPreference {
     interests: { id: string }[];
 }
 
-interface SubjectImportance {
-    topicImportance: 'doNotNotify' | 'normal' | 'high';
-    proximityImportance: 'none' | 'near' | 'wide';
-}
 
 interface SubjectMatch {
     subjectId: string;
@@ -85,7 +82,16 @@ export async function matchUsersToSubjects(
 
                 if (isNearby) {
                     matches.add({ subjectId: subject.id, reason: 'proximity' });
+                    continue;
                 }
+            }
+
+            // Rule 5: A reader who picked no topic left the choice open: the
+            // signup calls topics optional hints, and its summary says «Όλα τα
+            // θέματα». Every normal-importance topic counts. Checked after
+            // proximity, so a subject near the reader keeps that reason.
+            if (topicImportance === 'normal' && subject.topicId && userPref.interests.length === 0) {
+                matches.add({ subjectId: subject.id, reason: 'topic' });
             }
         }
     }

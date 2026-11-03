@@ -105,7 +105,7 @@ function taskRows(bulk: unknown[], failureErrors: string[] = []) {
     mockTaskFindMany.mockImplementation((args: { where?: { status?: string } } = {}) =>
         Promise.resolve(
             args.where?.status === 'failed'
-                ? failureErrors.map(responseBody => ({ responseBody }))
+                ? failureErrors.map(failureReason => ({ failureReason }))
                 : bulk,
         ),
     );
@@ -138,6 +138,23 @@ describe('pollLivestreamsForRecentMeetings', () => {
         const summary = await pollLivestreamsForRecentMeetings();
         expect(summary.candidates).toBe(0);
         expect(mockMeetingFindMany).not.toHaveBeenCalled();
+    });
+
+    it('takes candidates only in supported cities', async () => {
+        mockMeetingFindMany.mockResolvedValue([]);
+        await pollLivestreamsForRecentMeetings();
+        expect(mockMeetingFindMany.mock.calls[0][0].where).toMatchObject({ city: { status: 'supported' } });
+    });
+
+    it('never takes a postponed, cancelled or by-circulation meeting as a candidate', async () => {
+        mockMeetingFindMany.mockResolvedValue([]);
+        await pollLivestreamsForRecentMeetings();
+        // A postponed meeting in the window would take the stream of its new meeting.
+        expect(mockMeetingFindMany.mock.calls[0][0].where).toMatchObject({
+            scheduleStatus: { in: ['scheduled'] },
+            // A meeting of unstated format can have a stream.
+            OR: [{ format: null }, { format: { in: ['inPerson', 'remote', 'hybrid'] } }],
+        });
     });
 
     it('triggers transcription and alerts on a confident match', async () => {

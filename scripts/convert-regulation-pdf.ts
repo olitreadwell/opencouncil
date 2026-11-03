@@ -1,12 +1,10 @@
 #!/usr/bin/env tsx
 
 import fs from 'fs';
-import path from 'path';
-import pdfParse from 'pdf-parse';
+import { PDFParse } from 'pdf-parse';
 import Anthropic from '@anthropic-ai/sdk';
-import Ajv from 'ajv';
-import addFormats from 'ajv-formats';
 import dotenv from 'dotenv';
+import { validateRegulation } from './lib/regulation-schema';
 
 // Load environment variables
 dotenv.config();
@@ -31,28 +29,15 @@ interface RegulationData {
 }
 
 class RegulationConverter {
-    private schema: any;
-    private ajv: Ajv;
-
-    constructor() {
-        // Load and setup JSON schema validation
-        const schemaPath = path.join(process.cwd(), 'json-schemas/regulation.schema.json');
-        this.schema = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
-
-        this.ajv = new Ajv({
-            allErrors: true,
-            strict: false,
-        });
-        addFormats(this.ajv);
-    }
-
     async convertPdfToJson(pdfPath: string, outputPath: string): Promise<void> {
         try {
             console.log('📄 Reading PDF file...');
             const pdfBuffer = fs.readFileSync(pdfPath);
-            const pdfData = await pdfParse(pdfBuffer);
+            const parser = new PDFParse({ data: new Uint8Array(pdfBuffer) });
+            // v2 appends "-- N of M --" to each page by default; keep v1's plain page text for chunking.
+            const pdfData = await parser.getText({ pageJoiner: '' }).finally(() => parser.destroy());
 
-            console.log(`📊 PDF parsed successfully. Total pages: ${pdfData.numpages}`);
+            console.log(`📊 PDF parsed successfully. Total pages: ${pdfData.total}`);
             console.log(`📝 Total text length: ${pdfData.text.length} characters`);
 
             // Split text into manageable chunks
@@ -82,7 +67,6 @@ class RegulationConverter {
 
             if (!isValid) {
                 console.error('❌ Schema validation failed:');
-                console.error('Validation errors:', JSON.stringify(this.ajv.errors, null, 2));
                 console.error('Generated regulation structure:', JSON.stringify(regulation, null, 2).substring(0, 1000) + '...');
 
                 // Save the invalid JSON for debugging
@@ -557,23 +541,12 @@ Return the complete regulation JSON that validates against the schema.`;
     }
 
     private validateAgainstSchema(data: any): boolean {
-        const validate = this.ajv.compile(this.schema);
-        const isValid = validate(data);
-
-        if (!isValid && validate.errors) {
+        const { valid, errors } = validateRegulation(data);
+        if (!valid) {
             console.error('📋 Detailed validation errors:');
-            validate.errors.forEach((error, index) => {
-                console.error(`${index + 1}. ${error.instancePath || 'root'}: ${error.message}`);
-                if (error.data !== undefined) {
-                    console.error(`   Data: ${JSON.stringify(error.data)}`);
-                }
-                if (error.params) {
-                    console.error(`   Params: ${JSON.stringify(error.params)}`);
-                }
-            });
+            errors.forEach((error, index) => console.error(`${index + 1}. ${error}`));
         }
-
-        return isValid;
+        return valid;
     }
 
     private delay(ms: number): Promise<void> {

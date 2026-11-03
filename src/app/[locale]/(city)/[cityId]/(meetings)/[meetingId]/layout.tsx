@@ -30,6 +30,7 @@ import { getLocalizedName } from '@/lib/formatters/name';
 import { buildOgImageUrl } from '@/lib/og/locale';
 import { getRealm } from '@/lib/realm.server';
 import { hasExplainPage } from '@/lib/explain/availability';
+import { meetingDisplayName, meetingLabel } from '@/lib/meetingName';
 
 export async function generateImageMetadata(
     props: {
@@ -44,7 +45,7 @@ export async function generateImageMetadata(
         return [];
     }
 
-    const meetingName = getLocalizedName(data.meeting, locale);
+    const meetingName = meetingDisplayName(data.meeting, locale, data.city.timezone);
 
     return [
         {
@@ -86,13 +87,16 @@ export async function generateMetadata(
     }
 
     // Create an optimized title between 30-60 characters
-    const optimizedTitle = `${getLocalizedName(data.city, locale)} - ${getLocalizedName(data.meeting, locale)} | OpenCouncil`;
+    const optimizedTitle = `${getLocalizedName(data.city, locale)} - ${meetingLabel(data.meeting, locale, data.city.timezone)} | OpenCouncil`;
 
     // Use the hero text for description, which is already optimized for Greek audience
     const description = "To OpenCouncil χρησιμοποιεί τεχνητή νοημοσύνη για να παρακολουθεί τα δημοτικά συμβούλια και να τα κάνει απλά και κατανοητά";
 
     const imageUrl = buildOgImageUrl(locale, { meetingId, cityId });
 
+    // The meeting, its transcript, map and highlights take this metadata, with
+    // or without a ?t= timestamp. A layout cannot read the query, so it states
+    // no og:url, and Facebook keys a share on the URL that was shared.
     return {
         title: optimizedTitle,
         description,
@@ -104,7 +108,7 @@ export async function generateMetadata(
                 url: imageUrl,
                 width: 1200,
                 height: 630,
-                alt: `${getLocalizedName(data.meeting, locale)} - ${getLocalizedName(data.city, locale)}`
+                alt: `${meetingLabel(data.meeting, locale, data.city.timezone)} - ${getLocalizedName(data.city, locale)}`
             }]
         },
         twitter: {
@@ -137,7 +141,7 @@ export default async function CouncilMeetingPage(
     } = props;
 
     const currentUserPromise = getCurrentUser();
-    const editablePromise = isUserAuthorizedToEdit({ cityId });
+    const editablePromise = isUserAuthorizedToEdit({ cityId, councilMeetingId: meetingId });
     const realmPromise = getRealm();
     const [currentUser, editable, data, notificationPreference, realm, adjacent, tMeeting] = await Promise.all([
         currentUserPromise,
@@ -213,14 +217,14 @@ export default async function CouncilMeetingPage(
                                         },
                                         ...(adminBodyPath ? [adminBodyPath] : []),
                                         {
-                                            name: getLocalizedName(data.meeting, locale),
+                                            name: meetingDisplayName(data.meeting, locale, data.city.timezone),
                                             link: `/${cityId}/${meetingId}`,
                                             addon: <MeetingHeaderStage />
                                         }
                                     ]}
                                     neighbours={{
-                                        previous: adjacent.previous && { href: `/${cityId}/${adjacent.previous.id}`, label: `${tMeeting('previousMeeting')}: ${getLocalizedName(adjacent.previous, locale)}` },
-                                        next: adjacent.next && { href: `/${cityId}/${adjacent.next.id}`, label: `${tMeeting('nextMeeting')}: ${getLocalizedName(adjacent.next, locale)}` },
+                                        previous: adjacent.previous && { href: `/${cityId}/${adjacent.previous.id}`, label: `${tMeeting('previousMeeting')}: ${meetingLabel(adjacent.previous, locale, data.city.timezone)}` },
+                                        next: adjacent.next && { href: `/${cityId}/${adjacent.next.id}`, label: `${tMeeting('nextMeeting')}: ${meetingLabel(adjacent.next, locale, data.city.timezone)}` },
                                     }}
                                     showSidebarTrigger={true}
                                     inset={true}
@@ -248,8 +252,9 @@ export default async function CouncilMeetingPage(
                                 <EditingModeBar />
                                 <div className="relative flex-1 overflow-auto" data-scroll-container>
                                     {/* Reserve the dock's height only when a dock renders; the
-                                        phone dock also grows by the home-indicator inset. */}
-                                    <div className={hasPlayback ? 'pb-[var(--playback-dock-clearance)] max-md:pb-[calc(var(--playback-dock-clearance-mobile)+env(safe-area-inset-bottom))]' : undefined}>
+                                        phone dock also grows by the home-indicator inset. The
+                                        transcript's reveal reads this padding as the dock's cover. */}
+                                    <div data-scroll-content className={hasPlayback ? 'pb-[var(--playback-dock-clearance)] max-md:pb-[calc(var(--playback-dock-clearance-mobile)+env(safe-area-inset-bottom))]' : undefined}>
                                         <Suspense>
                                             {children}
                                         </Suspense>

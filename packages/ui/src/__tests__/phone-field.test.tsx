@@ -6,9 +6,13 @@ import { PhoneField, PhoneFieldValidity } from '../phone-field';
 function Harness({
     initialValue = '',
     onValidityChange,
+    mobileOnly,
+    defaultCountry,
 }: {
     initialValue?: string;
     onValidityChange?: (validity: PhoneFieldValidity) => void;
+    mobileOnly?: boolean;
+    defaultCountry?: string;
 }) {
     const [value, setValue] = useState(initialValue);
     return (
@@ -20,11 +24,24 @@ function Harness({
             activePlaceholder="Your phone"
             invalidMessage="Enter a valid phone"
             notMobileMessage="Enter a mobile number"
+            mobileOnly={mobileOnly}
+            defaultCountry={defaultCountry}
         />
     );
 }
 
 describe('PhoneField', () => {
+    it('uses the supplied country for an empty number', () => {
+        render(<Harness defaultCountry="de" />);
+        fireEvent.focus(screen.getByPlaceholderText('Add phone'));
+        expect(screen.getByRole('combobox')).toHaveAttribute('title', 'Germany');
+        expect(screen.getByPlaceholderText('Your phone')).toHaveValue('+49 ');
+    });
+
+    it('preserves the country of an existing international number', () => {
+        render(<Harness defaultCountry="fi" initialValue="+4915123456789" />);
+        expect(screen.getByRole('combobox')).toHaveAttribute('title', 'Germany');
+    });
     it('renders the inactive placeholder input by default when value is empty', () => {
         render(<Harness />);
         const input = screen.getByPlaceholderText('Add phone');
@@ -131,6 +148,19 @@ describe('PhoneField — one rule with the server', () => {
             reason: 'landline',
         });
         expect(screen.getByText('Enter a mobile number')).toBeInTheDocument();
+    });
+
+    it('accepts a landline when the field is not mobile-only', () => {
+        const onValidityChange = jest.fn();
+        render(<Harness initialValue="+302106459454" mobileOnly={false} onValidityChange={onValidityChange} />);
+        expect(onValidityChange).toHaveBeenLastCalledWith({
+            isActive: true,
+            isEmpty: false,
+            isValid: true,
+            reason: null,
+        });
+        expect(screen.queryByText('Enter a mobile number')).not.toBeInTheDocument();
+        expect(screen.queryByText('Enter a valid phone')).not.toBeInTheDocument();
     });
 
     it('accepts a foreign mobile', () => {

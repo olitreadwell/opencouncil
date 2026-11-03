@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from 'zod';
 import {
   cityFormSchema,
   baseCityFormSchema,
@@ -52,6 +52,20 @@ describe('cityFormSchema (Frontend)', () => {
     const parsed = cityFormSchema.parse(validCityData);
     expect(parsed.id).toBe('athens');
     expect(parsed.name).toBe('Αθήνα');
+  });
+
+  it('accepts a Bosnian-language city in the Bosnia realm', () => {
+    expect(cityFormSchema.parse({
+      ...validCityData,
+      id: 'sarajevo',
+      name: 'Sarajevo',
+      name_en: 'Sarajevo',
+      name_municipality: 'Grad Sarajevo',
+      name_municipality_en: 'City of Sarajevo',
+      timezone: 'Europe/Sarajevo',
+      language: 'bs',
+      realm: 'bosnia',
+    })).toMatchObject({ id: 'sarajevo', language: 'bs', realm: 'bosnia' });
   });
 
   it('should reject invalid city ID format (uppercase)', () => {
@@ -154,6 +168,13 @@ describe('createCityFormDataSchema (Backend POST)', () => {
   it('should validate required fields', () => {
     const { name, ...missingName } = validCreateData;
     expect(() => createCityFormDataSchema.parse(missingName)).toThrow();
+  });
+
+  // Every page of the city formats its dates in this zone, and Intl throws on
+  // a name that it does not know.
+  it('should reject a time zone that Intl does not know', () => {
+    expect(() => createCityFormDataSchema.parse({ ...validCreateData, timezone: 'Athens' })).toThrow(/IANA/);
+    expect(() => createCityFormDataSchema.parse({ ...validCreateData, timezone: 'Europe/Paris' })).not.toThrow();
   });
 });
 
@@ -306,28 +327,33 @@ describe('Integration: FormData with Schemas', () => {
 });
 
 describe('Edge cases: Boolean string transforms', () => {
-  it('should treat empty string as false for boolean fields', () => {
-    const parsed = createCityFormDataSchema.parse({
+  it('should reject an empty string for a required boolean field', () => {
+    expect(createCityFormDataSchema.safeParse({
       id: 'athens',
       ...validFormDataBase,
       supportsNotifications: '',
-      consultationsEnabled: '',
+      consultationsEnabled: 'false',
       logoImage: createMockFile(),
-    });
-    expect(parsed.supportsNotifications).toBe(false);
-    expect(parsed.consultationsEnabled).toBe(false);
+    }).success).toBe(false);
   });
 
-  it('should treat any non-"true" string as false', () => {
+  it('should read the stringbool lists and reject any other string', () => {
     const parsed = createCityFormDataSchema.parse({
       id: 'athens',
       ...validFormDataBase,
       supportsNotifications: '1',
-      consultationsEnabled: 'yes',
+      consultationsEnabled: 'no',
       logoImage: createMockFile(),
     });
-    expect(parsed.supportsNotifications).toBe(false);
+    expect(parsed.supportsNotifications).toBe(true);
     expect(parsed.consultationsEnabled).toBe(false);
+    expect(createCityFormDataSchema.safeParse({
+      id: 'athens',
+      ...validFormDataBase,
+      supportsNotifications: 'maybe',
+      consultationsEnabled: 'false',
+      logoImage: createMockFile(),
+    }).success).toBe(false);
   });
 });
 
@@ -359,14 +385,13 @@ describe('File edge cases', () => {
     expect(parsed.logoImage.size).toBe(0);
   });
 
-  it('should handle File without explicit type', () => {
-    const parsed = createCityFormDataSchema.parse({
+  // The route refused it before too, after the parse: '' is not a logo type.
+  it('should reject a File without explicit type', () => {
+    expect(createCityFormDataSchema.safeParse({
       id: 'athens',
       ...validFormDataBase,
       logoImage: new File(['content'], 'logo.png'),
-    });
-    expect(parsed.logoImage).toBeInstanceOf(File);
-    expect(parsed.logoImage.name).toBe('logo.png');
+    }).success).toBe(false);
   });
 });
 
@@ -383,5 +408,11 @@ describe('CITY_DEFAULTS alignment', () => {
       language: 'el',
       realm: 'greece',
     });
+  });
+});
+
+describe('European meeting language acceptance', () => {
+  it.each('en cy ga da no is et lv lt cs sk hu sl hr ro bg mk mt lb uk ru tr sq eu'.split(' '))('accepts the meeting language %s independently of the UI locale', language => {
+    expect(baseCityFormSchema.parse({ ...validFrontendBase, language }).language).toBe(language);
   });
 });

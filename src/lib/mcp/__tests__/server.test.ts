@@ -12,6 +12,13 @@ jest.mock('../data', () =>
     })
 );
 
+// The admin tools close over ../adminData in the same way.
+jest.mock('../adminData', () =>
+    new Proxy({ __esModule: true } as Record<string, unknown>, {
+        get: (target, prop: string) => (target[prop] ??= jest.fn()),
+    })
+);
+
 // auth.ts reaches Prisma (and through it env.mjs, which jest won't transform).
 // Same stub gate.test.ts uses; registration never touches the client.
 jest.mock('../../db/prisma', () => ({ __esModule: true, default: {} }));
@@ -21,19 +28,25 @@ import type { McpServer, ServerContext } from '@modelcontextprotocol/server';
 import { registerOpenCouncilServer } from '../server';
 import { mcpRealmStore, requestContext } from '../realm-context';
 import type { McpIdentity } from '../auth';
+import type { McpAdminAccess } from '../adminAccess';
 import * as data from '../data';
+import * as adminData from '../adminData';
 
 const HIGHLIGHT_TOOLS = [
     'create_highlight', 'generate_highlight_video', 'list_highlights',
     'set_highlight_showcase', 'get_highlight',
 ];
-const USER: McpIdentity = { type: 'user', userId: 'u1' };
-const SERVICE: McpIdentity = { type: 'service', keyName: 'bot' };
+const USER: McpIdentity = { userId: 'u1' };
 
-const CATEGORIES = ['discovery', 'directory', 'meetings', 'highlights'];
+const CATEGORIES = ['discovery', 'directory', 'meetings', 'highlights', 'admin'];
+
+const MEETING_ADMIN_TOOLS = ['create_meeting', 'update_meeting', 'create_upload_url', 'complete_upload', 'start_task'];
+const SUPERADMIN_TOOLS = ['publish_city_demo', 'set_city_boundary', 'list_realms', 'create_city', 'populate_city'];
+const CITY_ADMIN: McpAdminAccess = { superadmin: false, cityIds: new Set(['athens']), bodyIds: new Set() };
+const SUPERADMIN: McpAdminAccess = { superadmin: true, cityIds: new Set(), bodyIds: new Set() };
 
 type RecordedToolConfig = {
-    annotations?: { readOnlyHint?: boolean };
+    annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
     _meta?: { category?: string };
     description?: string;
     inputSchema?: { parse: (value: unknown) => unknown };
@@ -45,7 +58,10 @@ const ctxFor = (identity: McpIdentity) =>
     ({ http: { authInfo: { extra: { identity } } } }) as unknown as ServerContext;
 
 /** What a connection with this identity would see in tools/list & prompts/list. */
-function advertised(identity: McpIdentity, { inRequestScope = true } = {}) {
+function advertised(
+    identity: McpIdentity,
+    { inRequestScope = true, adminAccess = null }: { inRequestScope?: boolean; adminAccess?: McpAdminAccess | null } = {}
+) {
     const tools: string[] = [];
     const prompts: string[] = [];
     const meta: Record<string, RecordedToolConfig> = {};
@@ -61,7 +77,7 @@ function advertised(identity: McpIdentity, { inRequestScope = true } = {}) {
 
     const register = () => registerOpenCouncilServer(recorder);
     if (inRequestScope) {
-        mcpRealmStore.run(requestContext(Realm.greece, 'opencouncil.gr', identity), register);
+        mcpRealmStore.run(requestContext(Realm.greece, 'opencouncil.gr', identity, { adminAccess }), register);
     } else {
         register();
     }
@@ -86,16 +102,82 @@ describe('highlight tools are advertised only on authenticated connections', () 
         expect(advertised(null).tools.filter((n) => n.includes('highlight'))).toEqual([]);
     });
 
-    it('advertises the suite to service keys as well as user tokens', () => {
-        // Guards a later `identity?.type === 'user'` narrowing quietly stripping
-        // the suite from admin-panel sk_ keys.
-        expect(advertised(SERVICE).tools).toEqual(advertised(USER).tools);
-        expect(advertised(SERVICE).prompts).toEqual(advertised(USER).prompts);
-    });
-
     it('fails closed when there is no request scope at all', () => {
         expect(advertised(null, { inRequestScope: false }).tools)
             .toEqual(advertised(null).tools);
+    });
+});
+
+describe('admin tools are advertised by admin access', () => {
+
+    it('withholds the whole suite from a caller with no admin access', () => {
+        const admin = [...MEETING_ADMIN_TOOLS, ...SUPERADMIN_TOOLS];
+        expect(advertised(null).tools.filter(n => admin.includes(n))).toEqual([]);
+        expect(advertised(USER).tools.filter(n => admin.includes(n))).toEqual([]);
+        // The identity alone decides nothing: the route resolves the access.
+        expect(advertised(USER).tools.filter(n => admin.includes(n))).toEqual([]);
+    });
+
+    it('gives a city administrator the meeting tools only', () => {
+        const base = advertised(USER).tools;
+        const cityAdmin = advertised(USER, { adminAccess: CITY_ADMIN }).tools;
+        expect(cityAdmin.filter(n => !base.includes(n))).toEqual(MEETING_ADMIN_TOOLS);
+    });
+
+    it('gives a superadmin the city and user tools as well', () => {
+        const base = advertised(USER).tools;
+        const superadmin = advertised(USER, { adminAccess: SUPERADMIN }).tools;
+        expect(superadmin.filter(n => !base.includes(n))).toEqual([...MEETING_ADMIN_TOOLS, ...SUPERADMIN_TOOLS]);
+    });
+
+    it('offers no tool that deletes a meeting', () => {
+        const { tools } = advertised(USER, { adminAccess: SUPERADMIN });
+        expect(tools.filter(n => /delete.*meeting|meeting.*delete/.test(n))).toEqual([]);
+    });
+
+    it('marks the writes that lose data as destructive', () => {
+        const { meta } = advertised(USER, { adminAccess: SUPERADMIN });
+        const destructive = Object.keys(meta).filter(name => meta[name].annotations?.destructiveHint === true);
+        // start_task with force deletes a transcript.
+        expect(destructive).toEqual(['start_task']);
+    });
+
+    it('forwards the caller identity to the data layer', async () => {
+        const { handlers } = advertised(USER, { adminAccess: SUPERADMIN });
+        await handlers.start_task({ cityId: 'athens', meetingId: 'm1', type: 'transcribe' } as never, ctxFor(USER));
+        expect(adminData.mcpStartTask).toHaveBeenCalledWith(USER, { cityId: 'athens', meetingId: 'm1', type: 'transcribe' });
+    });
+
+    it('accepts only the four pipeline steps for start_task', () => {
+        const { meta } = advertised(USER, { adminAccess: CITY_ADMIN });
+        const base = { cityId: 'athens', meetingId: 'm1' };
+        expect(() => meta.start_task.inputSchema?.parse({ ...base, type: 'humanReview' })).toThrow();
+        expect(meta.start_task.inputSchema?.parse({ ...base, type: 'summarize' })).toMatchObject({ type: 'summarize', force: false });
+    });
+
+    it('rejects an option of another step instead of dropping it', () => {
+        const { meta } = advertised(USER, { adminAccess: CITY_ADMIN });
+        const base = { cityId: 'athens', meetingId: 'm1' };
+        expect(() => meta.start_task.inputSchema?.parse({ ...base, type: 'processAgenda', videoUrl: 'https://youtu.be/x' })).toThrow(/transcribe only/);
+        expect(() => meta.start_task.inputSchema?.parse({ ...base, type: 'transcribe', videoUrl: 'https://youtu.be/x' })).not.toThrow();
+    });
+
+    it('rejects a meeting date without a UTC offset', () => {
+        const { meta } = advertised(USER, { adminAccess: CITY_ADMIN });
+        const base = { cityId: 'athens' };
+        expect(() => meta.create_meeting.inputSchema?.parse({ ...base, dateTime: '2026-10-05T18:00:00' })).toThrow();
+        expect(() => meta.create_meeting.inputSchema?.parse({ ...base, dateTime: '2026-10-05T18:00:00+03:00' })).not.toThrow();
+    });
+
+    it('drops a name from the meeting tools, because the site derives it', () => {
+        const { meta } = advertised(USER, { adminAccess: CITY_ADMIN });
+        const names = { name: 'Ειδική Συνεδρίαση για το Λιμάνι', name_en: 'Special Meeting on the Port' };
+        const created = meta.create_meeting.inputSchema?.parse({ cityId: 'athens', dateTime: '2026-10-05T18:00:00+03:00', ...names });
+        const updated = meta.update_meeting.inputSchema?.parse({ cityId: 'athens', meetingId: 'm1', ...names });
+        for (const parsed of [created, updated]) {
+            expect(parsed).not.toHaveProperty('name');
+            expect(parsed).not.toHaveProperty('name_en');
+        }
     });
 });
 
@@ -108,7 +190,7 @@ describe('tool metadata', () => {
     // place that can notice. Filtering into an array makes Jest name the
     // offending tool.
     it('gives every tool a readOnlyHint and a known category', () => {
-        const { tools, meta } = advertised(USER);
+        const { tools, meta } = advertised(USER, { adminAccess: SUPERADMIN });
         expect(tools.filter(name =>
             typeof meta[name].annotations?.readOnlyHint !== 'boolean'
             || !CATEGORIES.includes(meta[name]._meta?.category ?? '')
@@ -179,13 +261,53 @@ describe('administrative-body filtering', () => {
         );
     });
 
+    it('accepts both body filters on search, with the same type list as list_meetings', () => {
+        const { meta } = advertised(USER);
+        const parsed = meta.search.inputSchema!.parse({
+            query: 'πάρκα',
+            administrativeBodyIds: ['body-1'],
+            administrativeBodyTypes: ['community'],
+        });
+
+        expect(parsed).toMatchObject({ administrativeBodyIds: ['body-1'], administrativeBodyTypes: ['community'] });
+        expect(() => meta.search.inputSchema!.parse({ administrativeBodyTypes: ['κοινότητα'] })).toThrow();
+    });
+
+    it('rejects an empty body filter on search rather than searching every body', () => {
+        const schema = advertised(USER).meta.search.inputSchema!;
+        expect(() => schema.parse({ administrativeBodyIds: [] })).toThrow();
+        expect(() => schema.parse({ administrativeBodyTypes: [] })).toThrow();
+    });
+
+    it('forwards both body filters of search to the data layer', async () => {
+        const { handlers } = advertised(USER);
+        await handlers.search(
+            {
+                query: 'πάρκα',
+                page: 1,
+                pageSize: 10,
+                administrativeBodyIds: ['body-1'],
+                administrativeBodyTypes: ['community'],
+            } as never,
+            ctxFor(USER)
+        );
+
+        expect(data.mcpSearch).toHaveBeenCalledWith(
+            expect.objectContaining({
+                administrativeBodyIds: ['body-1'],
+                administrativeBodyTypes: ['community'],
+            }),
+            USER
+        );
+    });
+
     it('passes the caller identity to get_city', async () => {
         // get_city only lists draft-only bodies to a caller who can see
         // drafts, so dropping the identity would silently hide them.
         const { handlers } = advertised(USER);
-        await handlers.get_city({ cityId: 'athens' } as never, ctxFor(SERVICE));
+        await handlers.get_city({ cityId: 'athens' } as never, ctxFor(USER));
 
-        expect(data.mcpGetCity).toHaveBeenCalledWith('athens', SERVICE);
+        expect(data.mcpGetCity).toHaveBeenCalledWith('athens', USER);
     });
 });
 
@@ -235,6 +357,56 @@ describe('creating a highlight and its video in one call', () => {
             expect.objectContaining({
                 video: { aspectRatio: 'social-9x16', includeCaptions: false, includeSpeakerOverlay: true },
             })
+        );
+    });
+});
+
+describe('paging arguments', () => {
+    beforeEach(() => jest.clearAllMocks());
+
+    it('starts every paged tool at page 1', () => {
+        const { meta } = advertised(USER);
+        expect(meta.list_meetings.inputSchema!.parse({ cityId: 'athens' })).toMatchObject({ page: 1, pageSize: 10 });
+        expect(meta.search.inputSchema!.parse({ query: 'πάρκα' })).toMatchObject({ page: 1, pageSize: 10 });
+        expect(meta.get_transcript.inputSchema!.parse({ cityId: 'athens', meetingId: 'm1' })).toMatchObject({ page: 1, pageSize: 40 });
+    });
+
+    it.each([
+        ['search', { query: 'πάρκα' }, 20],
+        ['list_meetings', { cityId: 'athens' }, 50],
+        ['get_transcript', { cityId: 'athens', meetingId: 'm1' }, 100],
+    ])('caps the page size of %s, and refuses a page size of 0 or a page that is not whole', (tool, args, max) => {
+        const schema = advertised(USER).meta[tool].inputSchema!;
+        expect(schema.parse({ ...args, pageSize: max })).toMatchObject({ pageSize: max });
+        expect(() => schema.parse({ ...args, pageSize: max + 1 })).toThrow();
+        expect(() => schema.parse({ ...args, pageSize: 0 })).toThrow();
+        expect(() => schema.parse({ ...args, page: 1.5 })).toThrow();
+    });
+
+    it('forwards the page and the page size of get_transcript to the data layer', async () => {
+        const { handlers } = advertised(USER);
+        await handlers.get_transcript(
+            { cityId: 'athens', meetingId: 'm1', page: 3, pageSize: 7, includeUtteranceIds: false } as never,
+            ctxFor(USER)
+        );
+
+        expect(data.mcpGetTranscript).toHaveBeenCalledWith(
+            'athens', 'm1', expect.objectContaining({ page: 3, pageSize: 7 }), USER
+        );
+    });
+
+    it('forwards the word filter of get_transcript, and refuses a one-letter word', async () => {
+        const { meta, handlers } = advertised(USER);
+        const schema = meta.get_transcript.inputSchema!;
+        expect(schema.parse({ cityId: 'athens', meetingId: 'm1', query: ' Λιμενικό ' })).toMatchObject({ query: 'Λιμενικό' });
+        expect(() => schema.parse({ cityId: 'athens', meetingId: 'm1', query: 'α' })).toThrow();
+
+        await handlers.get_transcript(
+            { cityId: 'athens', meetingId: 'm1', page: 1, pageSize: 40, includeUtteranceIds: false, query: 'Λιμενικό' } as never,
+            ctxFor(USER)
+        );
+        expect(data.mcpGetTranscript).toHaveBeenCalledWith(
+            'athens', 'm1', expect.objectContaining({ query: 'Λιμενικό' }), USER
         );
     });
 });

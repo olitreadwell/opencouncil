@@ -5,6 +5,9 @@ jest.mock('@/lib/tasks/generateHighlight', () => ({
     handleGenerateHighlightResult: jest.fn(),
 }))
 
+// Follow-up polls go through after(), which needs a request scope.
+jest.mock('next/server', () => ({ ...jest.requireActual('next/server'), after: () => {} }))
+
 jest.mock('@/lib/auth', () => ({
     withUserAuthorizedToEdit: jest.fn(),
     isUserAuthorizedToEdit: jest.fn().mockResolvedValue(true),
@@ -305,7 +308,7 @@ describe('handlePollDecisionsResult — orphan councilMeetingId healing', () => 
 
         // 2025-04-10 holds only a Λογοδοσία session: no heal.
         await createMeeting(cityId, {
-            id: 'm-logodosia', administrativeBodyId: bodyId, name: 'Ειδική Συνεδρίαση Λογοδοσίας',
+            id: 'm-logodosia', administrativeBodyId: bodyId, name: 'Ειδική Συνεδρίαση Λογοδοσίας', kind: 'accountability',
             dateTime: new Date('2025-04-10T10:00:00Z'),
         })
         // 2025-05-15 holds a real session plus a Λογοδοσία one: unambiguous.
@@ -313,7 +316,7 @@ describe('handlePollDecisionsResult — orphan councilMeetingId healing', () => 
             id: 'm-real', administrativeBodyId: bodyId, dateTime: new Date('2025-05-15T10:00:00Z'),
         })
         await createMeeting(cityId, {
-            id: 'm-logodosia-2', administrativeBodyId: bodyId, name: 'Λογοδοσία Δημάρχου',
+            id: 'm-logodosia-2', administrativeBodyId: bodyId, name: 'Λογοδοσία Δημάρχου', kind: 'accountability',
             dateTime: new Date('2025-05-15T12:00:00Z'),
         })
 

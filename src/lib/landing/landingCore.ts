@@ -1,15 +1,16 @@
-import type { Root } from 'react-dom/client';
 import type mapboxgl from 'mapbox-gl';
 import type { Realm, Topic } from '@prisma/client';
 import { cn } from '@/lib/utils';
 import { calculateGeometryBounds } from '@/lib/geo';
 import { topicStyle } from '@/lib/topicStyle';
 import type {
+    LandingHotSubject,
     LandingListCity,
     LandingMapCity,
     LandingPetitionedCity,
     LandingSubject,
     LandingGeneralCity,
+    MapViewport,
     UpcomingMeeting,
 } from './landingData';
 import type { ReactNode } from 'react';
@@ -48,6 +49,13 @@ export const DATE_RANGES = [
 export type DateRangeKey = (typeof DATE_RANGES)[number]['key'];
 export const DEFAULT_RANGE: DateRangeKey = '3m';
 
+/** The "?" drawer's much-discussed subjects: how far back they are drawn from, and how many. A
+ *  year rather than the map's default window, so a recess or a slow release never empties the door.
+ *  The query is realm-wide and runs on the home page's first paint whenever the landing cache
+ *  (15 min) is cold — the same order of work as the map's own "12 months" range. */
+export const HOT_SUBJECTS_MONTHS = 12;
+export const HOT_SUBJECTS_LIMIT = 12;
+
 /**
  * A range key as the fields the subject finders take (monthsBack / daysBack / allTime), so the
  * server initial load requests the same window the client would. Mirrors each DATE_RANGES `query`.
@@ -58,6 +66,24 @@ export function rangeToSubjectFilters(range: DateRangeKey): { monthsBack?: numbe
     if (key === 'allTime') return { allTime: true };
     if (key === 'daysBack') return { daysBack: Number(value) };
     return { monthsBack: Number(value) };
+}
+
+/**
+ * The date window of a map request, as the query parameters the map endpoints read: the explicit
+ * from/to dates when the reader set either, else the quick-range pill. Shared by the subjects
+ * fetch and the search, so a search runs under the same window as the listing it replaces.
+ */
+export function setDateWindowParams(
+    params: URLSearchParams,
+    range: DateRangeKey,
+    filters: Pick<MapFilters, 'dateFrom' | 'dateTo'>,
+): void {
+    if (filters.dateFrom || filters.dateTo) {
+        if (filters.dateFrom) params.set('dateFrom', filters.dateFrom);
+        if (filters.dateTo) params.set('dateTo', filters.dateTo);
+        return;
+    }
+    for (const [key, value] of Object.entries(rangeToSubjectFilters(range))) params.set(key, String(value));
 }
 
 /** Widen the quick date range by two steps (14d → 3m, 30d → 6m, …), clamped at the widest. */
@@ -132,12 +158,77 @@ export function nextDotMode(inView: number, dot: boolean): boolean {
     return dot ? inView >= SUBJECT_DOT_THRESHOLD * SUBJECT_DOT_EXIT_RATIO : inView >= SUBJECT_DOT_THRESHOLD;
 }
 
+/**
+ * How far past the viewport the pin layer keeps markers, as a fraction of the viewport's width
+ * and height on each side. Half a viewport each way makes the pin window four times the
+ * viewport's area, so a pan or a step of zoom mostly finds its pins already in place; the layer
+ * reconciles the set as the map moves (see useSubjectMarkers).
+ */
+export const PIN_WINDOW_PADDING = 0.5;
+
+export type ViewportBounds = Pick<MapViewport, 'w' | 's' | 'e' | 'n'>;
+
+/** The map's current bounds as the plain west/south/east/north the viewport helpers take, or
+ *  null before the map has any. */
+export function mapBounds(map: Pick<mapboxgl.Map, 'getBounds'>): ViewportBounds | null {
+    const b = map.getBounds();
+    return b ? { w: b.getWest(), s: b.getSouth(), e: b.getEast(), n: b.getNorth() } : null;
+}
+
+/** The viewport grown by `padding` of its own width and height on every side. */
+export function padViewport(v: ViewportBounds, padding: number): ViewportBounds {
+    const dx = (v.e - v.w) * padding;
+    const dy = (v.n - v.s) * padding;
+    return { w: v.w - dx, s: v.s - dy, e: v.e + dx, n: v.n + dy };
+}
+
+/**
+ * Whether a point sits inside a window whose longitudes may be unwrapped. The map renders world
+ * copies, so a view dragged around the globe reports Greece at 383°, while a subject keeps its
+ * stored longitude in -180..180. The test runs modulo 360, which also covers a window that
+ * crosses the antimeridian.
+ */
+export function pointInWindow(lng: number, lat: number, v: ViewportBounds): boolean {
+    if (lat < v.s || lat > v.n) return false;
+    const span = v.e - v.w;
+    if (span >= 360) return true;
+    const offset = (((lng - v.w) % 360) + 360) % 360;
+    return offset <= span;
+}
+
+/**
+ * The location groups the pin layer keeps as markers: the ones inside the pin window, plus the
+ * group of any subject in `keepIds` wherever it sits — the selected and previewed subjects need
+ * a pin to highlight. A group shares one point, so its first member places it.
+ */
+export function selectPinGroups(
+    groups: LandingSubject[][],
+    pinWindow: ViewportBounds,
+    keepIds: (string | null)[],
+): LandingSubject[][] {
+    const keep = new Set(keepIds.filter((id): id is string => !!id));
+    return groups.filter((g) => pointInWindow(g[0].lng, g[0].lat, pinWindow) || (keep.size > 0 && g.some((s) => keep.has(s.id))));
+}
+
+/**
+ * How a pin is highlighted: `selected` when its group holds the selected subject, `intense` (the
+ * filled category style) for the selected subject and for the mobile strip's previewed one. A
+ * "+N" pin carries a whole group, so the rule reads the group, never one subject.
+ */
+export function pinHighlight(
+    group: LandingSubject[],
+    selectedId: string | null,
+    previewId: string | null,
+): { selected: boolean; intense: boolean } {
+    const selected = !!selectedId && group.some((s) => s.id === selectedId);
+    const intense = selected || (!!previewId && group.some((s) => s.id === previewId));
+    return { selected, intense };
+}
+
 /** An HTML map marker handle: a subject icon badge (`subject` set) or a cluster count circle (null). */
 export type SubjectPin = {
     el: HTMLButtonElement;
     rootEl: HTMLDivElement;
-    /** the icon's React root — mounted lazily the first time the pin shows as a badge */
-    root: Root | null;
     marker: mapboxgl.Marker;
     subject: LandingSubject | null;
     /** drawn as a bare dot (dense viewport) — kept so the selection restyle keeps the same shape */
@@ -146,7 +237,23 @@ export type SubjectPin = {
      *  current selection/preview ids — the pin resolves its own highlight, because only it knows
      *  its members ("+N" pins carry a whole group and `subject` is null). */
     setDot: (dot: boolean, selectedId: string | null, previewId: string | null) => void;
+    /** restyle in place for a new selection or mobile preview (see pinHighlight), keeping the shape */
+    setSelection: (selectedId: string | null, previewId: string | null) => void;
 };
+
+/**
+ * The z-index of each marker that can share the map with the subject pins, lowest first. No two
+ * layers share a value: on a tie the later DOM node paints on top, and the pin layer adds its
+ * markers as the map moves (see useSubjectMarkers), so a tie would stack by how the user got there.
+ */
+export const MARKER_Z = {
+    pin: 0,
+    explainBadge: 1,
+    hotPin: 2,
+    cityHall: 3,
+    selectedPin: 4,
+    coLocatedPin: 5,
+} as const;
 
 /**
  * Styles a map pin like the TopicPill badge, minus the label. Styling goes on the inner button
@@ -155,9 +262,8 @@ export type SubjectPin = {
  * `dot` is the dense-viewport shape: the same circle, minus the icon and at a fraction of the size.
  * Only the size differs — the fill, ring and selected treatment all come from the shared colour
  * block below, so a dot reads as a small pin rather than a different kind of marker. It has to live
- * here rather than only in the factory so the selection restyle keeps a dot a dot: pins are rebuilt
- * on viewport change, not on selection, so a dot that restyled into a full badge would have no icon
- * inside it.
+ * here rather than only in the factory so the selection restyle keeps a dot a dot: a dot that
+ * restyled into a full badge would have no icon inside it.
  */
 export function stylePin(
     { el, rootEl }: { el: HTMLButtonElement; rootEl: HTMLDivElement },
@@ -184,7 +290,7 @@ export function stylePin(
     el.style.backgroundColor = background;
     el.style.borderColor = border;
     el.style.borderWidth = intense ? '2px' : '1px';
-    rootEl.style.zIndex = selected || intense ? '2' : subject.hot ? '1' : '0';
+    rootEl.style.zIndex = String(selected || intense ? MARKER_Z.selectedPin : subject.hot ? MARKER_Z.hotPin : MARKER_Z.pin);
 }
 
 /**
@@ -323,6 +429,9 @@ export type LayoutProps = {
     setQuery: (v: string) => void;
     topics: Topic[];
     cities: LandingListCity[];
+    /** the realm's most-discussed subjects lately (server-loaded, see HOT_SUBJECTS_MONTHS) — the "?"
+     *  drawer's "see a subject" door rotates through them, whatever the range pill says */
+    hotSubjects: LandingHotSubject[];
     /** unfiltered total subjects per cityId (for the Δήμοι tab stats) */
     subjectCountByCity: Record<string, number>;
     /** out-of-network δήμοι with enough petitions — the Δήμοι tab's leaderboard */

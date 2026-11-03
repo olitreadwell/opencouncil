@@ -4,9 +4,10 @@ import PartyC from "@/components/parties/Party";
 import { getCityCached } from "@/lib/cache";
 import { getParty } from "@/lib/db/parties";
 import { notFound } from "next/navigation";
-import { getAdministrativeBodiesForCity } from "@/lib/db/administrativeBodies";
+import { getPublicAdministrativeBodiesForCity } from "@/lib/db/administrativeBodies";
+import { getBodySeatTotals } from "@/lib/db/bodySeats";
 import { Metadata } from "next";
-import { buildCanonicalAlternates } from "@/lib/utils/hreflang";
+import { withCanonicalUrl } from "@/lib/utils/hreflang";
 import { getLocalizedName, getLocalizedShortName } from "@/lib/formatters/name";
 import { getOgLocale } from '@/i18n/config';
 import { buildOgImageUrl } from '@/lib/og/locale';
@@ -25,7 +26,7 @@ export async function generateMetadata(
         getCityCached(params.cityId),
     ]);
 
-    if (!party || !city) {
+    if (!party || !city || party.cityId !== city.id) {
         return {
             title: "Παράταξη δεν βρέθηκε | OpenCouncil",
             description: "Η παράταξη που αναζητάτε δεν είναι διαθέσιμη.",
@@ -37,7 +38,7 @@ export async function generateMetadata(
     const description = `Η παράταξη ${partyName} στο Δημοτικό Συμβούλιο του Δήμου ${cityName}. Δείτε τα μέλη, τις τοποθετήσεις και τη δραστηριότητά της στις συνεδριάσεις.`;
     const ogImageUrl = buildOgImageUrl(params.locale, { cityId: params.cityId, partyId: params.partyId });
 
-    return {
+    return withCanonicalUrl(`/${params.cityId}/parties/${params.partyId}`, {
         title: `${partyName} | ${cityName} | OpenCouncil`,
         description,
         keywords: [
@@ -71,15 +72,12 @@ export async function generateMetadata(
             description,
             images: [ogImageUrl],
         },
-        alternates: await buildCanonicalAlternates(
-            `/${params.cityId}/parties/${params.partyId}`,
-        ),
         other: {
             "party:name": party.name,
             "party:short": party.name_short,
             "party:city": city.name,
         },
-    };
+    });
 }
 
 export default async function PartyPage(
@@ -87,15 +85,18 @@ export default async function PartyPage(
 ) {
     const params = await props.params;
 
-    const [party, city, administrativeBodies] = await Promise.all([
+    const [party, city, administrativeBodies, seatTotals] = await Promise.all([
         getPartyCached(params.partyId),
         getCityCached(params.cityId),
-        getAdministrativeBodiesForCity(params.cityId)
+        getPublicAdministrativeBodiesForCity(params.cityId),
+        getBodySeatTotals(params.cityId)
     ]);
 
-    if (!party || !city) {
+    // getParty does not filter by city. A party of another city would show its
+    // seats against the totals of this one.
+    if (!party || !city || party.cityId !== city.id) {
         notFound();
     }
 
-    return <PartyC party={party} city={city} administrativeBodies={administrativeBodies} />
+    return <PartyC party={party} city={city} administrativeBodies={administrativeBodies} seatTotals={seatTotals} />
 }

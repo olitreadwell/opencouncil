@@ -1,22 +1,26 @@
-import { useState, useRef, useEffect, useMemo } from 'react';
+import { memo, useState, useRef, useEffect, useMemo, useId } from 'react';
+import { useTranslations } from 'next-intl';
 import { SpeakerTag } from "@prisma/client";
 import { ImageOrInitials } from "../ImageOrInitials";
-import { cn, filterActiveRoles, getPartyFromRoles, relevanceScore, UNKNOWN_SPEAKER_LABEL } from "@/lib/utils";
+import { cn, filterActiveRoles, getPartyFromRoles, relevanceScore } from "@/lib/utils";
 import {
     Popover,
     PopoverContent,
     PopoverTrigger,
 } from "@/components/ui/popover";
-import { Command, CommandInput, CommandList, CommandGroup, CommandItem } from "@/components/ui/command";
-import { Check, X, Edit2 } from "lucide-react";
+import { Command, CommandInput, CommandList, CommandGroup, CommandItem, CommandSeparator } from "@/components/ui/command";
+import { AlertTriangle, AudioLines, Check, CheckCheck, FileText, X, Edit2 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { Button } from "../ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { PersonWithRelations } from '@/lib/db/people';
 import { RoleDisplay } from './RoleDisplay';
 import { formatSurnameFirst } from '@/lib/formatters/name';
 import { useLocalizeText } from '@/hooks/useLocalizeText';
+import type { SpeakerEdit, SpeakerAssignmentScope } from '@/lib/db/speakerTags';
 
 interface PersonDisplayProps {
+    cityLanguage?: string;
     person?: PersonWithRelations;
     speakerTag?: SpeakerTag;
     segmentCount?: number;
@@ -29,11 +33,28 @@ interface PersonDisplayProps {
     nonInteractive?: boolean;
     /** Resolve the party color as of this date (e.g. the meeting date) instead of today. */
     date?: Date;
+    /** A line under the name and roles, aligned with them. */
+    caption?: React.ReactNode;
 }
 
+/** Someone the speaker identifications suggest, and why (the reason arrives localized). */
+export type PersonSuggestion = {
+    person: PersonWithRelations;
+    source: 'voiceprint' | 'transcript' | 'both';
+    reason: string;
+    /** The transcript line(s) the name rests on, quoted as the task gave them, so a reviewer can check the name. */
+    evidence?: string | null;
+};
+
+const SUGGESTION_ICONS = { voiceprint: AudioLines, transcript: FileText, both: CheckCheck };
+
+/** A selected value no picker item carries: cmdk selects the first item only while the value is empty. */
+const NO_PRESELECTION = 'no-preselection';
+
 // A simpler version of PersonBadge used in search results
-function PersonDisplay({ person, speakerTag, segmentCount, short = false, preferFullName = false, size = 'md', editable = false, onClick, nonInteractive = false, date }: PersonDisplayProps) {
+function PersonDisplay({ cityLanguage, person, speakerTag, segmentCount, short = false, preferFullName = false, size = 'md', editable = false, onClick, nonInteractive = false, date, caption }: PersonDisplayProps) {
     const localize = useLocalizeText();
+    const t = useTranslations('transcript.speakerPicker');
     const activeRoles = person ? filterActiveRoles(person.roles) : [];
     const party = person ? getPartyFromRoles(person.roles, date) : null;
     const partyColor = party?.colorHex || 'gray';
@@ -94,7 +115,7 @@ function PersonDisplay({ person, speakerTag, segmentCount, short = false, prefer
                         )}
                         {editable && segmentCount !== undefined && (
                             <span className="hidden sm:inline ml-2 text-muted-foreground font-normal">
-                                ({segmentCount} {segmentCount === 1 ? 'segment' : 'segments'})
+                                ({t('segmentCount', { count: segmentCount })})
                             </span>
                         )}
                     </div>
@@ -103,6 +124,7 @@ function PersonDisplay({ person, speakerTag, segmentCount, short = false, prefer
                     <div className="mt-0.5 sm:mt-1.5">
                         <RoleDisplay
                             roles={activeRoles}
+                            cityLanguage={cityLanguage}
                             size={size === 'sm' ? 'sm' : 'md'}
                             layout="compact"
                             showIcons={false}
@@ -110,8 +132,37 @@ function PersonDisplay({ person, speakerTag, segmentCount, short = false, prefer
                             className={cn(roleTextSize, "text-[10px] sm:text-xs")}
                         />
                     </div>
+                    {caption && <div className="mt-1 text-xs text-muted-foreground">{caption}</div>}
                 </div>
             )}
+        </div>
+    );
+}
+
+function SegmentScopeFooter({ segmentCount, onlyThisSegment, onOnlyThisSegmentChange }: {
+    segmentCount: number;
+    onlyThisSegment: boolean;
+    onOnlyThisSegmentChange: (value: boolean) => void;
+}) {
+    const t = useTranslations('transcript.speakerPicker');
+    const checkboxId = useId();
+
+    return (
+        <div className="flex flex-col gap-1 border-t bg-muted/40 px-3 py-2.5">
+            <div className="flex items-center gap-2">
+                <Checkbox
+                    id={checkboxId}
+                    aria-describedby={`${checkboxId}-hint`}
+                    checked={onlyThisSegment}
+                    onCheckedChange={(checked) => onOnlyThisSegmentChange(checked === true)}
+                />
+                <label htmlFor={checkboxId} className="cursor-pointer text-sm font-medium leading-none">
+                    {t('onlyThisSegment')}
+                </label>
+            </div>
+            <p id={`${checkboxId}-hint`} className="pl-6 text-xs text-muted-foreground">
+                {t('onlyThisSegmentHint', { others: segmentCount - 1 })}
+            </p>
         </div>
     );
 }
@@ -119,16 +170,28 @@ function PersonDisplay({ person, speakerTag, segmentCount, short = false, prefer
 interface PersonBadgeProps extends PersonDisplayProps {
     withBorder?: boolean;
     isSelected?: boolean;
-    onPersonChange?: (personId: string | null) => void;
-    onLabelChange?: (label: string) => void;
+    /** Applies the picked person or label. The picker offers the `thisSegment` scope when the tag has 2 or more segments. */
+    onAssign?: (assignment: SpeakerEdit, scope: SpeakerAssignmentScope) => void;
     availablePeople?: PersonWithRelations[];
+    /** People to offer ahead of the full list, each with the reason. Headings arrive localized. */
+    suggestions?: PersonSuggestion[];
+    suggestionsHeading?: string;
+    /** Heads the full list, so it reads apart from the suggestions above it. */
+    allPeopleHeading?: string;
+    /** When set, an editor sees this as an amber label on the badge (already localized, a few words). */
+    warning?: string;
+    /** The label that the "unknown speaker" action gives. The action shows only when it is set. */
     nextUnknownLabel?: string;
     variant?: 'default' | 'inline';
     /** When true, the badge does not navigate or behave like a button (useful on the person's own page). */
     disableNavigation?: boolean;
 }
 
-function PersonBadge({
+// Memoized: a long meeting renders one badge per speaker segment, and the
+// segment header passes stable props, so a transcript-wide re-render skips
+// every badge whose speaker did not change.
+const PersonBadge = memo(function PersonBadge({
+    cityLanguage,
     person,
     speakerTag,
     segmentCount,
@@ -137,9 +200,12 @@ function PersonBadge({
     withBorder,
     isSelected = false,
     editable = false,
-    onPersonChange,
-    onLabelChange,
+    onAssign,
     availablePeople,
+    suggestions,
+    suggestionsHeading,
+    allPeopleHeading,
+    warning,
     nextUnknownLabel,
     preferFullName = false,
     size = 'md',
@@ -150,7 +216,9 @@ function PersonBadge({
     const [isOpen, setIsOpen] = useState(false);
     const [searchQuery, setSearchQuery] = useState('');
     const [editMode, setEditMode] = useState(false);
+    const [onlyThisSegment, setOnlyThisSegment] = useState(false);
     const localize = useLocalizeText();
+    const t = useTranslations('transcript.speakerPicker');
     const router = useRouter();
     const listRef = useRef<HTMLDivElement>(null);
 
@@ -183,15 +251,34 @@ function PersonBadge({
             .map(({ person }) => person);
     }, [availablePeople, searchQuery]);
 
-    const handleSetLabel = (label: string) => {
-        onPersonChange?.(null);
-        onLabelChange?.(label);
-        setIsOpen(false);
+    // Suggestions lead the list, so a single one is what Enter picks. They step
+    // aside while the reviewer searches for someone else.
+    const shownSuggestions = searchQuery ? [] : suggestions ?? [];
+    const hasSuggestions = shownSuggestions.length > 0;
+    // Several suggestions name different people, and the reviewer is there to
+    // decide between them: the picker then opens with nothing selected, so
+    // Enter assigns nobody until the reviewer moves to an item.
+    const suggestionsDiffer = (suggestions?.length ?? 0) > 1;
+
+    // The scope choice lasts for one opening of the picker, so the common case
+    // (change every segment of the tag) never needs an extra step.
+    const handleOpenChange = (open: boolean) => {
+        setIsOpen(open);
+        if (!open) setOnlyThisSegment(false);
     };
+
+    const canScopeToSegment = (segmentCount ?? 0) > 1;
+
+    const applyAssignment = (personId: string | null, label?: string) => {
+        onAssign?.({ personId, label }, canScopeToSegment && onlyThisSegment ? 'thisSegment' : 'allSegments');
+        handleOpenChange(false);
+    };
+
+    const handleSetLabel = (label: string) => applyAssignment(null, label);
 
     const handlePersonClick = () => {
         if (editable) {
-            setIsOpen(true);
+            handleOpenChange(!isOpen);
         } else if (person && !disableNavigation) {
             router.push(`/${person.cityId}/people/${person.id}`);
         }
@@ -241,6 +328,7 @@ function PersonBadge({
             } : undefined}
         >
             <PersonDisplay
+                cityLanguage={cityLanguage}
                 person={person}
                 speakerTag={speakerTag}
                 segmentCount={segmentCount}
@@ -251,14 +339,20 @@ function PersonBadge({
                 nonInteractive={disableNavigation && !editable}
                 date={date}
             />
+            {editable && warning && (
+                <span className="shrink-0 ml-auto flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">
+                    <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                    {warning}
+                </span>
+            )}
             {editable && (
                 <Button
                     variant="ghost"
                     size="icon"
-                    className="shrink-0 h-6 w-6 sm:h-8 sm:w-8 ml-auto"
+                    className={cn("shrink-0 h-6 w-6 sm:h-8 sm:w-8", !warning && "ml-auto")}
                     onClick={(e) => {
                         e.stopPropagation();
-                        setIsOpen(true);
+                        handleOpenChange(!isOpen);
                     }}
                 >
                     <Edit2 className="h-3 w-3 sm:h-4 sm:w-4" />
@@ -269,98 +363,153 @@ function PersonBadge({
 
     if (editable && availablePeople) {
         return (
-            <Popover open={isOpen} onOpenChange={setIsOpen}>
+            <Popover open={isOpen} onOpenChange={handleOpenChange}>
                 <PopoverTrigger asChild>
                     {badge}
                 </PopoverTrigger>
-                <PopoverContent className="p-0" align="start">
-                    <Command shouldFilter={false}>
-                        <CommandInput
-                            autoFocus
-                            placeholder="Search people..."
-                            value={searchQuery}
-                            onValueChange={setSearchQuery}
-                        />
-                        <CommandList ref={listRef}>
-                            {/* cmdk's own filtering is disabled (shouldFilter=false);
-                                we rank people and gate visibility here. While the user
-                                is searching we show the ranked matches plus the "set
-                                label" fallback; the quick actions (unknown speaker,
-                                remove) show only when not searching. This keeps the top
-                                match highlighted for Enter and stops a zero filter score
-                                from hiding the fallback actions (the bug this fixes). */}
-                            {!searchQuery && (
-                                <CommandGroup>
-                                    <CommandItem
-                                        onSelect={() => handleSetLabel(nextUnknownLabel || UNKNOWN_SPEAKER_LABEL)}
-                                        className="flex items-center gap-2"
-                                    >
-                                        <div className="w-10 h-10 relative shrink-0 flex items-center justify-center bg-muted rounded-full">
-                                            <span className="text-xs font-medium">?</span>
-                                        </div>
-                                        <span className="font-medium">{nextUnknownLabel || UNKNOWN_SPEAKER_LABEL}</span>
-                                    </CommandItem>
-                                </CommandGroup>
-                            )}
-                            {rankedPeople.length > 0 && (
-                                <CommandGroup>
-                                    {rankedPeople.map((p) => (
+                {/* Mounted only while open: the list and its positioning are the
+                    expensive part, and a long meeting has hundreds of badges. */}
+                {isOpen && (
+                    <PopoverContent className="w-80 p-0" align="start">
+                        {/* Keyed: cmdk reads defaultValue once, and the suggestions can arrive
+                            while the picker is open. It then starts afresh, with nothing selected. */}
+                        <Command
+                            key={suggestionsDiffer ? 'suggestions-differ' : 'default'}
+                            shouldFilter={false}
+                            defaultValue={suggestionsDiffer ? NO_PRESELECTION : undefined}
+                        >
+                            <CommandInput
+                                autoFocus
+                                placeholder={t('searchPlaceholder')}
+                                value={searchQuery}
+                                onValueChange={setSearchQuery}
+                            />
+                            <CommandList ref={listRef}>
+                                {/* cmdk's own filtering is disabled (shouldFilter=false);
+                                    we rank people and gate visibility here. While the user
+                                    is searching we show the ranked matches plus the "set
+                                    label" fallback; the quick actions (unknown speaker,
+                                    remove) show only when not searching. This keeps the top
+                                    match highlighted for Enter and stops a zero filter score
+                                    from hiding the fallback actions (the bug this fixes). */}
+                                {hasSuggestions && (
+                                    <>
+                                        <CommandGroup heading={suggestionsHeading}>
+                                            {shownSuggestions.map(({ person: suggested, source, reason, evidence }) => {
+                                                const SourceIcon = SUGGESTION_ICONS[source];
+                                                return (
+                                                    <CommandItem
+                                                        key={suggested.id}
+                                                        value={`suggestion-${suggested.id}`}
+                                                        onSelect={() => applyAssignment(suggested.id)}
+                                                        className="flex items-center gap-2"
+                                                    >
+                                                        <Check
+                                                            className={cn(
+                                                                "shrink-0 h-4 w-4",
+                                                                person?.id === suggested.id ? "opacity-100" : "opacity-0"
+                                                            )}
+                                                        />
+                                                        <PersonDisplay
+                                                            cityLanguage={cityLanguage}
+                                                            person={suggested}
+                                                            size="sm"
+                                                            date={date}
+                                                            caption={
+                                                                <>
+                                                                    <span className="flex items-center gap-1.5">
+                                                                        <SourceIcon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                                                                        {reason}
+                                                                    </span>
+                                                                    {/* The line the transcript name rests on: what a reviewer checks it against. */}
+                                                                    {evidence && (
+                                                                        <q className="mt-1 block whitespace-normal break-words italic">{evidence}</q>
+                                                                    )}
+                                                                </>
+                                                            }
+                                                        />
+                                                    </CommandItem>
+                                                );
+                                            })}
+                                        </CommandGroup>
+                                        <CommandSeparator />
+                                    </>
+                                )}
+                                {!searchQuery && nextUnknownLabel && (
+                                    <CommandGroup>
                                         <CommandItem
-                                            key={p.id}
-                                            value={p.id}
-                                            onSelect={() => {
-                                                onPersonChange?.(p.id);
-                                                setIsOpen(false);
-                                            }}
+                                            onSelect={() => handleSetLabel(nextUnknownLabel)}
                                             className="flex items-center gap-2"
                                         >
-                                            <Check
-                                                className={cn(
-                                                    "shrink-0 h-4 w-4",
-                                                    person?.id === p.id ? "opacity-100" : "opacity-0"
-                                                )}
-                                            />
-                                            <PersonDisplay
-                                                person={p}
-                                                size="sm"
-                                                date={date}
-                                            />
+                                            <div className="w-10 h-10 relative shrink-0 flex items-center justify-center bg-muted rounded-full">
+                                                <span className="text-xs font-medium">?</span>
+                                            </div>
+                                            <span className="font-medium">{nextUnknownLabel}</span>
                                         </CommandItem>
-                                    ))}
-                                </CommandGroup>
-                            )}
-                            {searchQuery && (
-                                <CommandGroup>
-                                    <CommandItem
-                                        onSelect={() => handleSetLabel(searchQuery)}
-                                    >
-                                        <Edit2 className="mr-2 h-4 w-4" />
-                                        Set label to &quot;{searchQuery}&quot;
-                                    </CommandItem>
-                                </CommandGroup>
-                            )}
-                            {person && !searchQuery && (
-                                <CommandGroup>
-                                    <CommandItem
-                                        onSelect={() => {
-                                            onPersonChange?.(null);
-                                            setIsOpen(false);
-                                        }}
-                                        className="text-destructive"
-                                    >
-                                        <X className="mr-2 h-4 w-4" />
-                                        Remove person
-                                    </CommandItem>
-                                </CommandGroup>
-                            )}
-                        </CommandList>
-                    </Command>
-                </PopoverContent>
+                                    </CommandGroup>
+                                )}
+                                {rankedPeople.length > 0 && (
+                                    <CommandGroup heading={hasSuggestions ? allPeopleHeading : undefined}>
+                                        {rankedPeople.map((p) => (
+                                            <CommandItem
+                                                key={p.id}
+                                                value={p.id}
+                                                onSelect={() => applyAssignment(p.id)}
+                                                className="flex items-center gap-2"
+                                            >
+                                                <Check
+                                                    className={cn(
+                                                        "shrink-0 h-4 w-4",
+                                                        person?.id === p.id ? "opacity-100" : "opacity-0"
+                                                    )}
+                                                />
+                                                <PersonDisplay
+                                                    cityLanguage={cityLanguage}
+                                                    person={p}
+                                                    size="sm"
+                                                    date={date}
+                                                />
+                                            </CommandItem>
+                                        ))}
+                                    </CommandGroup>
+                                )}
+                                {searchQuery && (
+                                    <CommandGroup>
+                                        <CommandItem
+                                            onSelect={() => handleSetLabel(searchQuery)}
+                                        >
+                                            <Edit2 className="mr-2 h-4 w-4" />
+                                            {t('setLabel', { label: searchQuery })}
+                                        </CommandItem>
+                                    </CommandGroup>
+                                )}
+                                {person && !searchQuery && (
+                                    <CommandGroup>
+                                        <CommandItem
+                                            onSelect={() => applyAssignment(null)}
+                                            className="text-destructive"
+                                        >
+                                            <X className="mr-2 h-4 w-4" />
+                                            {t('removePerson')}
+                                        </CommandItem>
+                                    </CommandGroup>
+                                )}
+                            </CommandList>
+                        </Command>
+                        {canScopeToSegment && (
+                            <SegmentScopeFooter
+                                segmentCount={segmentCount ?? 0}
+                                onlyThisSegment={onlyThisSegment}
+                                onOnlyThisSegmentChange={setOnlyThisSegment}
+                            />
+                        )}
+                    </PopoverContent>
+                )}
             </Popover>
         );
     }
 
     return badge;
-}
+});
 
 export { PersonBadge };

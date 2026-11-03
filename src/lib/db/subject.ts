@@ -1,11 +1,8 @@
 import prisma from './prisma';
-import type { CityStatus } from '@prisma/client';
 import { TOPICLESS_COLOR } from '@/lib/topicStyle';
 import {
     Subject,
     SpeakerContribution,
-    Decision,
-    Highlight,
     Location,
     Topic,
     VoteType,
@@ -15,12 +12,22 @@ import {
 } from '@prisma/client';
 import { PersonWithRelations } from '@/lib/db/people';
 import { extractUtteranceIds } from '@/lib/utils/references';
+import { isAdministrativeBodyType } from '@/lib/utils/administrativeBodies';
+import { isCalendarDay } from '@/lib/zod-schemas/dates';
+import { queryFlag } from '@/lib/zod-schemas/primitives';
+import { dayBounds } from '@/lib/dates/dayBounds';
+import { DEFAULT_TIMEZONE } from '@/lib/formatters/time';
+import { previewDescription } from '@/lib/formatters/markdown';
 import { getContributionCount } from '@/lib/utils';
 import { roleWithRelationsInclude } from './types/roles';
+import { subjectDecisionSelect, type SubjectDecision } from './types/decision';
+import { subjectHighlightsInclude, type SubjectHighlight } from './types/highlight';
+import { meetingBodyTypeWhere } from './meetingBodyFilter';
 // Import from the leaf (not the `../cache` barrel, which re-exports cache/queries → auth → env
 // and would drag that heavy server-only chain into this widely-imported module).
 import { createCache } from '../cache/index';
-import { PUBLIC_CITY_WHERE } from '../cityStatus';
+import { isPublic, publicMeetingWhere } from '../cityStatus';
+import { meetingLabelInCity } from '@/lib/meetingName';
 
 // The landing subject finders are realm + filter keyed in the data cache. Releasing/unreleasing
 // a meeting busts the tag (see toggleMeetingRelease); the TTL is a safety net for other changes
@@ -28,6 +35,9 @@ import { PUBLIC_CITY_WHERE } from '../cityStatus';
 const LANDING_SUBJECTS_TTL = 900; // 15 min
 /** Cache tag for the landing subject lists/counts of a realm — revalidate it on meeting release. */
 export const landingSubjectsTag = (realm: Realm) => `realm:${realm}:landing-subjects`;
+/** The shape of a cached subject row. Bump it when the row's fields change, so a deployment whose
+ *  cache namespace is not build-keyed never serves rows of the previous shape for a TTL. */
+const LANDING_ROW_VERSION = 'v3';
 
 /** Deterministic cache-key fragment for a filter set (arrays sorted so order can't split keys). */
 function subjectFilterKey(f: MapSubjectFilters): string {
@@ -103,12 +113,12 @@ export type SubjectWithRelations = Subject & {
     contributions: (SpeakerContribution & {
         speaker: PersonWithRelations | null;
     })[];
-    highlights: Highlight[];
+    highlights: SubjectHighlight[];
     location: LocationWithCoordinates | null;
     topic: Topic | null;
     introducedBy: PersonWithRelations | null;
     discussedIn: (Subject & { topic: Topic | null }) | null;
-    decision: Decision | null;
+    decision: SubjectDecision | null;
     votes: { voteType: VoteType; person: { id: string; name: string; roles: { electedOrder: number | null; administrativeBodyId: string | null }[] } }[];
     attendance: { status: 'PRESENT' | 'ABSENT'; person: { id: string; name: string; roles: { electedOrder: number | null; administrativeBodyId: string | null }[] } }[];
 };
@@ -183,9 +193,8 @@ export async function getSubjectCountsByCityCached(realm: Realm): Promise<Record
                 where: {
                     contributions: { some: {} },
                     councilMeeting: {
-                        released: true,
+                        ...publicMeetingWhere(realm),
                         dateTime: { lte: new Date() },
-                        city: realm ? { ...PUBLIC_CITY_WHERE, realm } : PUBLIC_CITY_WHERE,
                     },
                 },
                 _count: { _all: true },
@@ -245,23 +254,27 @@ export type MapSubjectFilters = {
     subjectIds?: string[];
 };
 
+/** A date bound of the map's URL: a calendar day, as the map writes it, or nothing. */
+function calendarDayParam(value: string | null): string | null {
+    return isCalendarDay(value) ? value : null;
+}
+
 /**
- * Parse the landing map's query params into MapSubjectFilters. Validates the enum/numbers so junk
- * (`?bodyType=foo`, `?daysBack=abc`) is dropped rather than reaching Prisma and 500-ing.
+ * Parse the landing map's query params into MapSubjectFilters. Validates the enum/numbers/dates so
+ * junk (`?bodyType=foo`, `?daysBack=abc`, `?dateFrom=abc`) is dropped rather than reaching Prisma
+ * and 500-ing.
  */
 export function parseMapSubjectFilters(searchParams: URLSearchParams): MapSubjectFilters {
     const num = (v: string | null) => (v && Number.isFinite(Number(v)) ? Number(v) : undefined);
-    const isBodyType = (b: string): b is AdministrativeBodyType =>
-        (Object.values(AdministrativeBodyType) as string[]).includes(b);
     return {
         monthsBack: num(searchParams.get('monthsBack')),
         daysBack: num(searchParams.get('daysBack')) ?? null,
-        allTime: searchParams.get('allTime') === 'true',
+        allTime: queryFlag.catch(false).parse(searchParams.get('allTime') ?? ''),
         topicIds: (searchParams.get('topicIds') || '').split(',').filter(Boolean),
         cityIds: (searchParams.get('cityIds') || '').split(',').filter(Boolean),
-        bodyTypes: (searchParams.get('bodyType') || '').split(',').filter(isBodyType),
-        dateFrom: searchParams.get('dateFrom'),
-        dateTo: searchParams.get('dateTo'),
+        bodyTypes: (searchParams.get('bodyType') || '').split(',').filter(isAdministrativeBodyType),
+        dateFrom: calendarDayParam(searchParams.get('dateFrom')),
+        dateTo: calendarDayParam(searchParams.get('dateTo')),
     };
 }
 
@@ -269,7 +282,10 @@ export function parseMapSubjectFilters(searchParams: URLSearchParams): MapSubjec
 export type MapSubjectRow = {
     id: string;
     name: string;
-    description: string;
+    /** the description as plain text, cut to DESCRIPTION_PREVIEW_CHARS (see previewDescription) */
+    descriptionPreview: string;
+    /** the description runs past the preview — GET /api/subject/{id}/description has the rest */
+    descriptionTruncated: boolean;
     cityId: string;
     cityName: string;
     nameMunicipality: string;
@@ -295,6 +311,13 @@ export type MapSubjectRow = {
 /** Non-located subject row — the same wire shape without the map-pin-only fields. */
 export type GeneralSubjectRow = Omit<MapSubjectRow, 'geometry' | 'locationText' | 'locationType'>;
 
+/** The fields every subject row shares; a caller adds what it shows of the description. */
+type SubjectRowBase = Omit<GeneralSubjectRow, 'descriptionPreview' | 'descriptionTruncated'>;
+
+/** A much-discussed subject for the MCP's hot-subjects tool: the shared fields plus the
+ *  description in full, which the tool quotes. No preview: nothing there shows one. */
+export type HotSubjectRow = SubjectRowBase & { description: string };
+
 /** A municipality's non-located subjects + its centroid, for the "general subjects" marker.
  *  Carries the city's display fields (name/genitive/logo) so the client renders straight from the
  *  row instead of re-joining against the loaded city list. */
@@ -314,7 +337,11 @@ const mapSubjectInclude = {
         select: {
             dateTime: true,
             name: true,
-            administrativeBody: { select: { name: true, type: true } },
+            name_en: true,
+            kind: true,
+            sessionNumber: true,
+            urgent: true,
+            administrativeBody: { select: { name: true, name_en: true, type: true } },
             // City display fields travel on every row so the client needn't reconcile against
             // the loaded city list (Subject reaches City only through councilMeeting).
             city: { select: { name: true, name_municipality: true, logoImage: true, timezone: true } },
@@ -329,6 +356,23 @@ const mapSubjectInclude = {
 
 type MapSubjectPayload = Prisma.SubjectGetPayload<{ include: typeof mapSubjectInclude }>;
 
+/** The window the map lists when a caller names no positive quick range and no explicit dates. */
+const DEFAULT_MONTHS_BACK = 6;
+
+/**
+ * The start of the quick-range window (daysBack / monthsBack), counted back from `now`.
+ * Undefined for allTime, and when neither count is set: the caller decides what that means.
+ * Shared with the map's search so a search and a listing read the pill the same way.
+ */
+export function quickRangeStart(f: Pick<MapSubjectFilters, 'allTime' | 'daysBack' | 'monthsBack'>, now: Date): Date | undefined {
+    if (f.allTime) return undefined;
+    const start = new Date(now);
+    if (f.daysBack && f.daysBack > 0) start.setDate(start.getDate() - f.daysBack);
+    else if (f.monthsBack && f.monthsBack > 0) start.setMonth(start.getMonth() - f.monthsBack);
+    else return undefined;
+    return start;
+}
+
 /**
  * Shared where-clause for the map subject queries (realm required). `located` picks map-pins
  * (locationId set) vs the general/city list (locationId null). Future-dated meetings are always
@@ -339,16 +383,16 @@ export function buildMapSubjectWhere(realm: Realm | null, f: MapSubjectFilters):
     const now = new Date();
     const dateTime: { gte?: Date; lte: Date } = { lte: now };
     if (f.dateFrom || f.dateTo) {
-        if (f.dateFrom) dateTime.gte = new Date(f.dateFrom);
+        // The map spans many cities, and a where clause reads a day in one
+        // zone. DEFAULT_TIMEZONE is the zone of the Greek cities; for a city
+        // in another zone, a meeting near midnight can fall on the next day.
+        if (f.dateFrom) dateTime.gte = dayBounds(f.dateFrom, DEFAULT_TIMEZONE).start;
         if (f.dateTo) {
-            const to = new Date(`${f.dateTo}T23:59:59.999`);
+            const to = dayBounds(f.dateTo, DEFAULT_TIMEZONE).end;
             if (to < now) dateTime.lte = to;
         }
     } else if (!f.allTime) {
-        const threshold = new Date();
-        if (f.daysBack && f.daysBack > 0) threshold.setDate(threshold.getDate() - f.daysBack);
-        else threshold.setMonth(threshold.getMonth() - (f.monthsBack ?? 6));
-        dateTime.gte = threshold;
+        dateTime.gte = quickRangeStart(f, now) ?? quickRangeStart({ monthsBack: DEFAULT_MONTHS_BACK }, now);
     }
     return {
         // undefined → no constraint (both located and non-located subjects)
@@ -362,20 +406,18 @@ export function buildMapSubjectWhere(realm: Realm | null, f: MapSubjectFilters):
         ...(f.topicIds?.length ? { topicId: { in: f.topicIds } } : {}),
         ...(f.cityIds?.length ? { cityId: { in: f.cityIds } } : {}),
         councilMeeting: {
-            released: true,
+            ...publicMeetingWhere(realm),
             dateTime,
-            city: realm ? { ...PUBLIC_CITY_WHERE, realm } : PUBLIC_CITY_WHERE,
-            ...(f.bodyTypes?.length ? { administrativeBody: { type: { in: f.bodyTypes } } } : {}),
+            ...(f.bodyTypes?.length ? meetingBodyTypeWhere(f.bodyTypes) : {}),
         },
     };
 }
 
-/** The wire fields shared by located + non-located rows (everything except geometry/location). */
-function toGeneralSubjectRow(s: MapSubjectPayload, discussionSeconds: Map<string, number>): GeneralSubjectRow {
+/** The wire fields shared by every row (everything except geometry/location and the description). */
+function toSubjectRowBase(s: MapSubjectPayload, discussionSeconds: Map<string, number>): SubjectRowBase {
     return {
         id: s.id,
         name: s.name,
-        description: s.description,
         cityId: s.cityId,
         cityName: s.councilMeeting.city.name,
         nameMunicipality: s.councilMeeting.city.name_municipality,
@@ -383,7 +425,7 @@ function toGeneralSubjectRow(s: MapSubjectPayload, discussionSeconds: Map<string
         cityTimezone: s.councilMeeting.city.timezone,
         councilMeetingId: s.councilMeetingId,
         meetingDate: s.councilMeeting?.dateTime?.toISOString(),
-        meetingName: s.councilMeeting?.name,
+        meetingName: meetingLabelInCity(s.councilMeeting, 'el'),
         bodyName: s.councilMeeting?.administrativeBody?.name ?? null,
         adminBodyType: s.councilMeeting?.administrativeBody?.type ?? null,
         topicId: s.topicId,
@@ -419,7 +461,8 @@ export async function getMapSubjects(realm: Realm, filters: MapSubjectFilters): 
     const located = subjects.filter((s) => s.locationId && geometryMap.has(s.locationId));
     const discussionSeconds = await getDiscussionSecondsForSubjects(located.map((s) => s.id));
     return located.map((s) => ({
-        ...toGeneralSubjectRow(s, discussionSeconds),
+        ...toSubjectRowBase(s, discussionSeconds),
+        ...previewDescription(s.description),
         locationText: s.location?.text,
         locationType: s.location?.type,
         geometry: geometryMap.get(s.locationId!)!,
@@ -431,7 +474,7 @@ export async function getMapSubjects(realm: Realm, filters: MapSubjectFilters): 
 export async function getMapSubjectsCached(realm: Realm, filters: MapSubjectFilters): Promise<MapSubjectRow[]> {
     return createCache(
         () => getMapSubjects(realm, filters),
-        ['map-subjects', realm, subjectFilterKey(filters)],
+        ['map-subjects', LANDING_ROW_VERSION, realm, subjectFilterKey(filters)],
         { revalidate: LANDING_SUBJECTS_TTL, tags: [landingSubjectsTag(realm)] },
     )();
 }
@@ -446,7 +489,7 @@ export async function getHotSubjectsCached(
     realm: Realm,
     filters: MapSubjectFilters,
     limit: number,
-): Promise<GeneralSubjectRow[]> {
+): Promise<HotSubjectRow[]> {
     return createCache(
         async () => {
             const subjects = await prisma.subject.findMany({
@@ -457,11 +500,11 @@ export async function getHotSubjectsCached(
 
             const discussionSeconds = await getDiscussionSecondsForSubjects(subjects.map((s) => s.id));
             return subjects
-                .map((s) => toGeneralSubjectRow(s, discussionSeconds))
+                .map((s): HotSubjectRow => ({ ...toSubjectRowBase(s, discussionSeconds), description: s.description }))
                 .sort((a, b) => (b.discussionTimeSeconds ?? 0) - (a.discussionTimeSeconds ?? 0))
                 .slice(0, limit);
         },
-        ['hot-subjects', realm, subjectFilterKey(filters), String(limit)],
+        ['hot-subjects', LANDING_ROW_VERSION, realm, subjectFilterKey(filters), String(limit)],
         { revalidate: LANDING_SUBJECTS_TTL, tags: [landingSubjectsTag(realm)] },
     )();
 }
@@ -499,7 +542,9 @@ export async function getGeneralSubjects(realm: Realm, filters: MapSubjectFilter
         .map(([cityId, subs]): GeneralCityRow | null => {
             const c = centroidMap.get(cityId);
             if (!c) return null; // city without geometry → can't place a marker
-            const rows = subs.map((s) => toGeneralSubjectRow(s, discussionSeconds));
+            const rows = subs.map(
+                (s): GeneralSubjectRow => ({ ...toSubjectRowBase(s, discussionSeconds), ...previewDescription(s.description) }),
+            );
             return {
                 cityId,
                 cityName: rows[0].cityName,
@@ -518,7 +563,7 @@ export async function getGeneralSubjects(realm: Realm, filters: MapSubjectFilter
 export async function getGeneralSubjectsCached(realm: Realm, filters: MapSubjectFilters): Promise<GeneralCityRow[]> {
     return createCache(
         () => getGeneralSubjects(realm, filters),
-        ['general-subjects', realm, subjectFilterKey(filters)],
+        ['general-subjects', LANDING_ROW_VERSION, realm, subjectFilterKey(filters)],
         { revalidate: LANDING_SUBJECTS_TTL, tags: [landingSubjectsTag(realm)] },
     )();
 }
@@ -528,11 +573,11 @@ export async function getAllSubjects(): Promise<SubjectWithRelations[]> {
         const subjects = await prisma.subject.findMany({
             include: {
                 contributions: contributionsInclude,
-                highlights: true,
+                highlights: subjectHighlightsInclude,
                 location: true,
                 topic: true,
                 introducedBy: introducedByInclude,
-                decision: true,
+                decision: { select: subjectDecisionSelect },
                 discussedIn: {
                     include: {
                         topic: true,
@@ -560,10 +605,10 @@ export async function getSubjectsForMeeting(cityId: string, councilMeetingId: st
             include: {
                 contributions: contributionsInclude,
                 introducedBy: introducedByInclude,
-                highlights: true,
+                highlights: subjectHighlightsInclude,
                 location: true,
                 topic: true,
-                decision: true,
+                decision: { select: subjectDecisionSelect },
                 discussedIn: {
                     include: {
                         topic: true,
@@ -575,7 +620,7 @@ export async function getSubjectsForMeeting(cityId: string, councilMeetingId: st
         });
 
         // Then get the coordinates for locations that exist
-        const locationIds = subjects.filter(s => s.location).map(s => s.location!.id);
+        const locationIds = subjects.flatMap(s => s.location ? [s.location.id] : []);
 
         if (locationIds.length > 0) {
             const locationCoordinates = await prisma.$queryRaw<Array<{ id: string; x: number; y: number }>>`
@@ -584,6 +629,7 @@ export async function getSubjectsForMeeting(cityId: string, councilMeetingId: st
                 WHERE id = ANY(${locationIds}::text[])
                 AND type = 'point'
             `;
+            const coordinatesByLocationId = new Map(locationCoordinates.map(l => [l.id, l]));
 
             // Merge coordinates into the subjects
             return subjects.map(subject => ({
@@ -591,7 +637,7 @@ export async function getSubjectsForMeeting(cityId: string, councilMeetingId: st
                 location: subject.location
                     ? {
                         ...subject.location,
-                        coordinates: locationCoordinates.find(l => l.id === subject.location!.id),
+                        coordinates: coordinatesByLocationId.get(subject.location.id),
                     }
                     : null,
             }));
@@ -616,10 +662,10 @@ export async function getSubject(subjectId: string): Promise<SubjectWithRelation
             include: {
                 contributions: contributionsInclude,
                 introducedBy: introducedByInclude,
-                highlights: true,
+                highlights: subjectHighlightsInclude,
                 location: true,
                 topic: true,
-                decision: true,
+                decision: { select: subjectDecisionSelect },
                 discussedIn: {
                     include: {
                         topic: true,
@@ -746,18 +792,48 @@ export async function getLatestSubjectsForSpeaker(personId: string, take: number
     return [...subjects.values()].slice(0, take);
 }
 
-/**
- * Whether a subject is public: its meeting released and its city public, the
- * same test every public reader applies. `null` when the subject does not exist.
- */
-export async function subjectIsPublic(subjectId: string): Promise<{ cityId: string; public: boolean } | null> {
-    const row = await prisma.subject.findUnique({
-        where: { id: subjectId },
-        select: { cityId: true, councilMeeting: { select: { released: true, city: { select: { status: true } } } } },
-    });
+/** What the public-visibility rule reads off a subject's meeting. */
+const subjectVisibilitySelect = {
+    released: true,
+    city: { select: { status: true } },
+} satisfies Prisma.CouncilMeetingSelect;
+type SubjectVisibility = Prisma.CouncilMeetingGetPayload<{ select: typeof subjectVisibilitySelect }>;
+
+/** Whether the public may see a subject: its meeting released and its city public. The image
+ *  route reads it; the queries apply the same rule as a where clause, scoped to the realm (see
+ *  publicMeetingWhere). */
+function isPublicSubject(meeting: SubjectVisibility): boolean {
+    return meeting.released && isPublic(meeting.city.status);
+}
+
+const subjectIsPublicSelect = {
+    cityId: true,
+    councilMeetingId: true,
+    councilMeeting: { select: subjectVisibilitySelect },
+} satisfies Prisma.SubjectSelect;
+
+/** Whether a subject is public (see isPublicSubject). `null` when the subject does not exist. */
+export async function subjectIsPublic(subjectId: string): Promise<{ cityId: string; councilMeetingId: string; public: boolean } | null> {
+    const row = await prisma.subject.findUnique({ where: { id: subjectId }, select: subjectIsPublicSelect });
     if (!row) return null;
-    const publicStatuses: readonly CityStatus[] = PUBLIC_CITY_WHERE.status.in;
-    return { cityId: row.cityId, public: row.councilMeeting.released && publicStatuses.includes(row.councilMeeting.city.status) };
+    return { cityId: row.cityId, councilMeetingId: row.councilMeetingId, public: isPublicSubject(row.councilMeeting) };
+}
+
+const publicSubjectDescriptionSelect = { description: true } satisfies Prisma.SubjectSelect;
+
+/**
+ * A public subject's description, in markdown, for the route that serves the landing card the
+ * full description. The rule is the one the map's own queries apply (see publicMeetingWhere): a
+ * released meeting of a public city on `realm`. `null` for anything else — a missing id, an unreleased
+ * meeting, a city that is not public, or a city of another realm, which an id must not read
+ * across (city pages are tenant-isolated).
+ */
+export async function getPublicSubjectDescription(subjectId: string, realm: Realm): Promise<string | null> {
+    const row = await prisma.subject.findFirst({
+        where: { id: subjectId, councilMeeting: publicMeetingWhere(realm) },
+        select: publicSubjectDescriptionSelect,
+    });
+    return row?.description ?? null;
 }
 
 export async function subjectExists(subjectId: string): Promise<boolean> {
@@ -771,6 +847,16 @@ export async function getSubjectIdsForMeeting(cityId: string, councilMeetingId: 
         select: { id: true },
     });
     return rows.map((row) => row.id);
+}
+
+/** The distinct meetings the given subjects belong to. Used to re-derive every meeting an edit of a reading touched. */
+export async function getMeetingsOfSubjects(subjectIds: string[]): Promise<{ cityId: string; councilMeetingId: string }[]> {
+    const rows = await prisma.subject.findMany({
+        where: { id: { in: subjectIds } },
+        select: { cityId: true, councilMeetingId: true },
+    });
+    const meetings = new Map(rows.map(row => [`${row.cityId}/${row.councilMeetingId}`, row]));
+    return [...meetings.values()];
 }
 
 /** What the image backfill ranks a subject on — the same signals the landing feeds the ranker. */

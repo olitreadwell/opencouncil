@@ -1,11 +1,12 @@
 import { AdministrativeBodyType, Realm } from "@prisma/client";
-import { isUserAuthorizedToEdit } from "@/lib/auth";
+import { isUserAuthorizedToEdit, getUnreleasedScope } from "@/lib/auth";
+import { unreleasedCacheKey } from "@/lib/unreleased";
 import { getCity, getAllCitiesMinimal, getAllCityIds, getSupportedCitiesWithLogos, getAboutPageStats, getCityIdContainingPoint } from "@/lib/db/cities";
 import { decodeGeohashToCenter } from "@/lib/geo";
 import { getGitHubStats } from "@/lib/github";
 import { getCityMessage } from "@/lib/db/cityMessages";
 import { getMeetingSummary } from "@/lib/db/meetingSummary";
-import { getCouncilMeetingsForCity, getCouncilMeetingsWithSubjectPreview, DEFAULT_MEETING_PAGE_SIZE, type MeetingListOptions } from "@/lib/db/meetingsList";
+import { countCouncilMeetings, getCouncilMeetingsForCity, getCouncilMeetingsWithSubjectPreview, DEFAULT_MEETING_PAGE_SIZE, type MeetingListOptions } from "@/lib/db/meetingsList";
 import { getAdjacentMeetings } from "@/lib/db/adjacentMeetings";
 import { countCityPetitions } from "@/lib/db/petitions";
 import { petitionBucket, type PetitionBucket } from "@/lib/landing/petitions";
@@ -13,11 +14,12 @@ import { MEETING_PREVIEW_CACHE_VERSION } from "@/lib/db/types";
 import { getPartiesForCity } from "@/lib/db/parties";
 import { getPeopleForCity } from "@/lib/db/people";
 import { getSubjectCountForCity, getSubjectsForMeeting, SubjectWithRelations } from "@/lib/db/subject";
-import { getAdministrativeBodiesForCity, getAdministrativeBodiesWithPublicMeetings } from "@/lib/db/administrativeBodies";
+import { getPublicAdministrativeBodiesForCity, getAdministrativeBodiesWithPublicMeetings } from "@/lib/db/administrativeBodies";
 import { getMeetingStatus } from "@/lib/meetingStatus";
 import { getBatchStatisticsForSubjects, Statistics } from "@/lib/statistics";
 import { createCache } from "./index";
 import { getCityCoverage } from "@/lib/db/coverage";
+import { hideLinks } from '@/lib/meetingPublic';
 
 /**
  * How long a time-filtered meeting query may go stale.
@@ -36,8 +38,11 @@ const TIME_FILTERED_TTL = 900;
  * it — from the reader's authorization, or to false — and overrides whatever it
  * was handed. Leaving it in the signature let a caller ask for unreleased
  * meetings, type-check, and quietly get released ones.
+ *
+ * `meetingIds` is left out because no key below records it: two id lists
+ * would share one entry.
  */
-type CachedMeetingListOptions = Omit<MeetingListOptions, 'includeUnreleased'>;
+type CachedMeetingListOptions = Omit<MeetingListOptions, 'includeUnreleased' | 'unreleased' | 'meetingIds'>;
 
 /**
  * Cached list of all city ids (single shared cache key, tag `cities:all`).
@@ -95,8 +100,8 @@ export async function getCityWithGeometryCached(cityId: string) {
  */
 export async function getCouncilMeetingsForCityPublicCached(cityId: string, options: CachedMeetingListOptions = {}) {
   return createCache(
-    () => getCouncilMeetingsForCity(cityId, { ...options, includeUnreleased: false }),
-    ['city', cityId, 'meetings', 'onlyReleased', ...meetingListKey(options)],
+    async () => (await getCouncilMeetingsForCity(cityId, { ...options, includeUnreleased: false })).map(hideLinks),
+    ['city', cityId, 'meetings', MEETING_PREVIEW_CACHE_VERSION, 'onlyReleased', ...meetingListKey(options)],
     {
       tags: ['city', `city:${cityId}`, `city:${cityId}:meetings`],
       ...(options.timeFilter ? { revalidate: TIME_FILTERED_TTL } : {}),
@@ -123,11 +128,16 @@ export function bodyFilterKey({ administrativeBodyTypes, administrativeBodyIds }
 
 /** Cache-key fragments for the filters a meeting list query accepts. */
 function meetingListKey(options: MeetingListOptions): string[] {
-  const { limit, page, pageSize = DEFAULT_MEETING_PAGE_SIZE, from, to, timeFilter } = options;
+  // The type of every cached wrapper leaves meetingIds out, but a variable of
+  // the wider MeetingListOptions type still passes it. No key records the ids,
+  // so two id lists would share one entry: fail instead.
+  if (options.meetingIds) throw new Error('A cached meeting list cannot select meetings by id');
+  const { limit, page, pageSize = DEFAULT_MEETING_PAGE_SIZE, from, to, timeFilter, takesPlace } = options;
   return [
     page ? `page:${page}:${pageSize}` : (limit ? `limit:${limit}` : 'all'),
     ...bodyFilterKey(options),
     timeFilter ?? 'all',
+    takesPlace ? 'takesPlace' : 'anyStatus',
     // from/to go into the where, so they have to go into the key — without them
     // two different date ranges are one cache entry.
     `range:${from?.toISOString() ?? ''}:${to?.toISOString() ?? ''}`,
@@ -141,10 +151,15 @@ function meetingListKey(options: MeetingListOptions): string[] {
  * read inside one.
  */
 export async function getCouncilMeetingsPreviewCached(cityId: string, options: CachedMeetingListOptions = {}) {
-  const includeUnreleased = await isUserAuthorizedToEdit({ cityId });
+  const unreleased = await getUnreleasedScope(cityId);
   return createCache(
-    () => getCouncilMeetingsWithSubjectPreview(cityId, { ...options, includeUnreleased }),
-    ['city', cityId, 'meetingPreviews', MEETING_PREVIEW_CACHE_VERSION, includeUnreleased ? 'withUnreleased' : 'onlyReleased', ...meetingListKey(options)],
+    // A reader who sees only some drafts, or none, gets no link to another
+    // meeting: the linked meeting can be a draft outside their scope.
+    async () => {
+      const meetings = await getCouncilMeetingsWithSubjectPreview(cityId, { ...options, unreleased });
+      return unreleased.all ? meetings : meetings.map(hideLinks);
+    },
+    ['city', cityId, 'meetingPreviews', MEETING_PREVIEW_CACHE_VERSION, unreleasedCacheKey(unreleased), ...meetingListKey(options)],
     {
       tags: ['city', `city:${cityId}`, `city:${cityId}:meetings`],
       ...(options.timeFilter ? { revalidate: TIME_FILTERED_TTL } : {}),
@@ -152,10 +167,39 @@ export async function getCouncilMeetingsPreviewCached(cityId: string, options: C
   )();
 }
 
+/**
+ * How many meetings the options select over every page. Keyed and tagged like
+ * the list it counts, so a new or released meeting clears both together.
+ */
+export async function countCouncilMeetingsCached(cityId: string, options: Omit<CachedMeetingListOptions, 'page' | 'pageSize' | 'limit'> = {}) {
+  const unreleased = await getUnreleasedScope(cityId);
+  return createCache(
+    () => countCouncilMeetings(cityId, { ...options, unreleased }),
+    ['city', cityId, 'meetingCount', unreleasedCacheKey(unreleased), ...meetingListKey(options)],
+    {
+      tags: ['city', `city:${cityId}`, `city:${cityId}:meetings`],
+      ...(options.timeFilter ? { revalidate: TIME_FILTERED_TTL } : {}),
+    }
+  )();
+}
+
+/**
+ * The card rows of these meetings, as the reader may see them, in the list's
+ * order. Not cached: the search on the meetings tab finds a different id list
+ * for every query, and no key records the ids. It resolves the reader and
+ * hides the links exactly as getCouncilMeetingsPreviewCached does, so the
+ * uncached path cannot show a reader more than the cached one.
+ */
+export async function getCouncilMeetingPreviewsByIds(cityId: string, meetingIds: string[]) {
+  const unreleased = await getUnreleasedScope(cityId);
+  const meetings = await getCouncilMeetingsWithSubjectPreview(cityId, { meetingIds, unreleased });
+  return unreleased.all ? meetings : meetings.map(hideLinks);
+}
+
 /** Public (no-auth) counterpart, safe for static pages. */
 export async function getCouncilMeetingsPreviewPublicCached(cityId: string, options: CachedMeetingListOptions = {}) {
   return createCache(
-    () => getCouncilMeetingsWithSubjectPreview(cityId, { ...options, includeUnreleased: false }),
+    async () => (await getCouncilMeetingsWithSubjectPreview(cityId, { ...options, includeUnreleased: false })).map(hideLinks),
     ['city', cityId, 'meetingPreviews', MEETING_PREVIEW_CACHE_VERSION, 'onlyReleased', ...meetingListKey(options)],
     {
       tags: ['city', `city:${cityId}`, `city:${cityId}:meetings`],
@@ -239,12 +283,13 @@ export async function getPeopleForCityCached(cityId: string) {
 }
 
 /**
- * Cached version of getAdministrativeBodiesForCity that fetches and caches all administrative bodies for a city
+ * Cached version of getPublicAdministrativeBodiesForCity: every administrative
+ * body of a city, with the fields anyone may read.
  */
-export async function getAdministrativeBodiesForCityCached(cityId: string) {
+export async function getPublicAdministrativeBodiesForCityCached(cityId: string) {
   return createCache(
-    () => getAdministrativeBodiesForCity(cityId),
-    ['city', cityId, 'administrativeBodies'],
+    () => getPublicAdministrativeBodiesForCity(cityId),
+    ['city', cityId, 'administrativeBodies', 'public'],
     { tags: ['city', `city:${cityId}`, `city:${cityId}:administrativeBodies`] }
   )();
 }
@@ -311,7 +356,9 @@ export async function getSubjectCountForCityCached(cityId: string) {
 export async function getSubjectsForMeetingCached(cityId: string, meetingId: string) {
   return createCache(
     () => getSubjectsForMeeting(cityId, meetingId),
-    ['city', cityId, 'meeting', meetingId, 'subjects'],
+    // The version names the row shape: the entries have no TTL, so a shape
+    // change must not read the entries of the previous shape.
+    ['city', cityId, 'meeting', meetingId, 'subjects', 'v2'],
     { tags: [`city:${cityId}`, `city:${cityId}:meetings`, `city:${cityId}:meeting:${meetingId}`] }
   )();
 }
@@ -322,7 +369,9 @@ export async function getSubjectStatisticsCached(
   subjects: SubjectWithRelations[],
   meetingDateTime: Date | string,
 ): Promise<Record<string, Statistics>> {
-  const includeUnreleased = await isUserAuthorizedToEdit({ cityId });
+  // The subjects are this meeting's, so its editors (a body admin among them)
+  // see the statistics of a draft.
+  const includeUnreleased = await isUserAuthorizedToEdit({ cityId, councilMeetingId: meetingId });
 
   return createCache(
     async () => {

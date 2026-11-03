@@ -1,12 +1,9 @@
-// Import directly from @vercel/og rather than next/og: Next 14.2 ships an older
-// vendored @vercel/og@0.6.3 (satori@0.10.9) which has known runaway-CPU + memory
-// leaks (vercel/next.js#65451, satori#393/#532). The standalone package at 0.11.1
-// ships satori@0.25 with those fixes.
-import { ImageResponse } from '@vercel/og';
+import { ImageResponse } from 'next/og';
 import type { Realm } from '@prisma/client';
 import type { ReactElement, ReactNode } from 'react';
-import { icons } from 'lucide-react';
+import { icons, type IconNode } from 'lucide';
 import { getTranslations } from 'next-intl/server';
+import { getRoleTitles } from '@/i18n/roleTitles';
 import { getMeetingDataForOG } from '@/lib/db/meetings';
 import { getCity, getPetitionedMapCitiesCached } from '@/lib/db/cities';
 import { getConsultationDataForOG } from '@/lib/db/consultations';
@@ -35,16 +32,17 @@ import { LOGO_BLACK_DATA_URI, OG_FONTS } from '@/lib/og/serverAssets';
 import { getImageData, getPublicImageData, SEAL_BOX, type ImageBox } from '@/lib/og/remoteImage';
 import { boundaryPath } from '@/lib/og/boundary';
 import { getAboutPageStatsCached, getAllCitiesMinimalCached, getCityPetitionBucketCached } from '@/lib/cache/queries';
-import { HERO_AUDIENCES, shotsForRealm } from '@/components/about/config';
+import { HERO_AUDIENCES, shotsForRealm, type HeroAudienceId } from '@/components/about/config';
 import { getPortraitData } from '@/lib/og/portrait';
 import { allIllustrated, getStaticIllustrations, getSubjectIllustrations, ILLUSTRATION_BOX } from '@/lib/og/illustration';
 import { ogCacheControl } from '@/lib/og/render';
 import { subjectOgElement } from '@/lib/og/subjectImage';
-import { topicGlyph } from '@/lib/og/topicIcon';
+import { OgIcon, topicGlyph } from '@/lib/og/topicIcon';
 import {
     OG, OgAvatar, OgBody, OgChip, OgChips, OgContextChip, OgEyebrow, OgFacts, OgFrame, OgHeader, OgHeadline,
     OgRow, OgStack, OgTile, OgTileGrid, OgTitle, ogUppercase,
 } from '@/components/og/frame';
+import { meetingNameInCity } from '@/lib/meetingName';
 
 /**
  * A `getTranslations` result. The `og` catalog holds every string these images
@@ -143,7 +141,7 @@ const MeetingOGImage = async (cityId: string, meetingId: string, reqId: string, 
                             <OgEyebrow text={stamp.monthYear} locale={locale} size={18} color={OG.MUTED} />
                         </OgRow>
                         <div style={{ display: 'flex', marginTop: 22 }}>
-                            <OgTitle size={40} maxWidth={440}>{getLocalizedName(data, locale)}</OgTitle>
+                            <OgTitle size={40} maxWidth={440}>{meetingNameInCity(data, locale)}</OgTitle>
                         </div>
                         <div style={{ display: 'flex', marginTop: 14 }}>
                             <OgFacts items={[when, t('meeting.subjects', { count: data.subjects.length })]} />
@@ -196,7 +194,7 @@ const CityOGImage = async (cityId: string, locale: string, t: Translator) => {
                                 // eslint-disable-next-line @next/next/no-img-element
                                 <img src={seal} width={96} height={96} alt="" style={{ objectFit: 'contain' }} />
                             ) : (
-                                <icons.Landmark size={48} color={OG.MUTED} />
+                                <OgIcon node={icons.Landmark} size={48} color={OG.MUTED} />
                             )}
                         </div>
                         <div style={{ display: 'flex', marginTop: 24 }}><OgTitle size={60} maxWidth={560}>{getLocalizedName(city, locale)}</OgTitle></div>
@@ -266,7 +264,7 @@ const ConsultationOGImage = async (cityId: string, consultationId: string, local
                         <OgEyebrow text={t('consultation.keyTopics')} locale={locale} size={14} color={OG.MUTED} />
                         {chapters.slice(0, 4).map((chapter, i) => (
                             <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 12, borderRadius: 16, border: `1px solid ${OG.BORDER}`, background: '#ffffff', padding: '16px 20px', fontSize: 20, color: OG.INK }}>
-                                <icons.ScrollText size={22} color={OG.MUTED} />
+                                <OgIcon node={icons.ScrollText} size={22} color={OG.MUTED} />
                                 <span style={{ whiteSpace: 'nowrap' }}>{storyPreview(localizeText(chapter.title ?? '', locale) || t('consultation.untitledChapter'), 34)}</span>
                             </div>
                         ))}
@@ -284,8 +282,7 @@ const PersonOGImage = async (cityId: string, personId: string, locale: string, t
 
     const party = getPartyFromRoles(person.roles);
     // The label the site's badges give the role, so the mayor reads as the mayor here too.
-    const tPerson = await getTranslations({ locale, namespace: 'Person' });
-    const roleName = getRoleLabelAt(person.roles, tPerson, new Date()) ?? t('person.council');
+    const roleName = getRoleLabelAt(person.roles, await getRoleTitles(locale, city.language), new Date()) ?? t('person.council');
     // Released meetings only: this image is public and cached, whoever asked for it.
     const [portrait, seal, subjects] = await Promise.all([
         getPortraitData(person.image),
@@ -482,6 +479,9 @@ function browserTile(src: string, width: number, height: number): ReactNode {
 
 // About: the sales page's own words beside the product they describe, with the
 // counts the page shows. The screenshot is the realm's own, as on the page.
+// The page draws HERO_AUDIENCES' lucide-react icons, which satori cannot call (see OgIcon).
+const HERO_AUDIENCE_ICONS: Record<HeroAudienceId, IconNode> = { residents: icons.Users, services: icons.Landmark };
+
 const AboutOGImage = async (locale: string, t: Translator, realm: Realm) => {
     const tHero = await getTranslations({ locale, namespace: 'about.hero' });
     const [stats, shot] = await Promise.all([
@@ -502,9 +502,9 @@ const AboutOGImage = async (locale: string, t: Translator, realm: Realm) => {
                     <OgStack gap={22}>
                         <OgHeadline top={tHero('title')} bottom={tHero('titleHighlight')} size={44} />
                         <OgStack gap={12}>
-                            {HERO_AUDIENCES.map(({ id, icon: Icon }) => (
+                            {HERO_AUDIENCES.map(({ id }) => (
                                 <OgRow key={id} gap={10} style={{ alignItems: 'flex-start' }}>
-                                    <Icon size={22} color={OG.ORANGE_INK} style={{ marginTop: 2 }} />
+                                    <OgIcon node={HERO_AUDIENCE_ICONS[id]} size={22} color={OG.ORANGE_INK} style={{ marginTop: 2 }} />
                                     <OgStack gap={2}>
                                         <span style={{ fontSize: 20, lineHeight: 1.3, color: OG.INK }}>{tHero(`audiences.${id}.lead`)}</span>
                                         <span style={{ maxWidth: 500, fontSize: 19, lineHeight: 1.35, color: OG.MUTED }}>{tHero(`audiences.${id}.text`)}</span>
@@ -544,10 +544,9 @@ const ExplainOGImage = () => (
                 <OgStack gap={10} style={{ width: 420 }}>
                     <OgEyebrow text="Κεφάλαια" locale="el" size={14} color={OG.MUTED} />
                     {EXPLAIN_CHAPTERS.map(([icon, label]) => {
-                        const Glyph = icons[icon];
                         return (
                             <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 12, borderRadius: 16, border: `1px solid ${OG.BORDER}`, background: '#ffffff', padding: '16px 20px', fontSize: 20, color: OG.INK }}>
-                                <Glyph size={22} color={OG.ORANGE} />
+                                <OgIcon node={icons[icon]} size={22} color={OG.ORANGE} />
                                 <span style={{ whiteSpace: 'nowrap' }}>{label}</span>
                             </div>
                         );
@@ -564,7 +563,7 @@ const SearchOGImage = (t: Translator) => (
         <div style={{ display: 'flex', flex: 1, flexDirection: 'column', justifyContent: 'center', gap: 28, padding: `0 ${OG.PAD}px ${OG.PAD}px` }}>
             <OgHeadline top={t('search.title')} bottom={t('search.subtitle')} />
             <div style={{ display: 'flex', alignItems: 'center', gap: 16, width: 760, borderRadius: 9999, border: `1px solid ${OG.BORDER}`, background: '#ffffff', padding: '20px 28px' }}>
-                <icons.Search size={26} color={OG.MUTED} />
+                <OgIcon node={icons.Search} size={26} color={OG.MUTED} />
                 <span style={{ fontSize: 24, color: OG.MUTED }}>{t('search.placeholder')}</span>
             </div>
             <OgChips>

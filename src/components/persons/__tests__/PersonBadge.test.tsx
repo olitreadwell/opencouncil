@@ -1,16 +1,12 @@
-import { render, screen, fireEvent } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { SpeakerTag } from '@prisma/client';
 import { PersonBadge } from '../PersonBadge';
 import { PersonWithRelations } from '@/lib/db/people';
+import { NextIntlClientProvider } from 'next-intl';
+import transcript from '../../../../messages/en/transcript.json';
 
 jest.mock('next/navigation', () => ({
     useRouter: () => ({ push: jest.fn() }),
-}));
-
-// next-intl ships ESM that Jest doesn't transform; PersonBadge only reaches it
-// via useLocalizeText → useLocale. Greek keeps localization a no-op.
-jest.mock('next-intl', () => ({
-    useLocale: () => 'el',
 }));
 
 // The avatar and role rendering aren't under test here; keep them out of the
@@ -56,6 +52,7 @@ const speakerTag: SpeakerTag = {
     id: 'tag-1',
     label: 'Speaker 1',
     personId: null,
+    personSetBy: null,
     createdAt: new Date(),
     updatedAt: new Date(),
 };
@@ -65,16 +62,19 @@ const people: PersonWithRelations[] = [
     makePerson({ id: 'p2', name: 'Σαλαμανή' }),
 ];
 
-const renderBadge = (props: Partial<React.ComponentProps<typeof PersonBadge>> = {}) =>
+const renderBadge = (props: Partial<React.ComponentProps<typeof PersonBadge>> = {}, sibling?: React.ReactNode) =>
     render(
-        <PersonBadge
-            editable
-            speakerTag={speakerTag}
-            availablePeople={people}
-            onPersonChange={jest.fn()}
-            onLabelChange={jest.fn()}
-            {...props}
-        />,
+        <NextIntlClientProvider locale="en" messages={{ transcript }}>
+            {sibling}
+            <PersonBadge
+                editable
+                speakerTag={speakerTag}
+                availablePeople={people}
+                onAssign={jest.fn()}
+                nextUnknownLabel="Άγνωστος Ομιλητής 3"
+                {...props}
+            />
+        </NextIntlClientProvider>,
     );
 
 // Click the speaker badge to open the re-assignment popover, then type a query.
@@ -108,16 +108,15 @@ describe('PersonBadge editable speaker picker', () => {
         expect(screen.getByText('Set label to "Παπ"')).toBeInTheDocument();
     });
 
-    it('applies the typed label via onLabelChange and clears the person', () => {
-        const onPersonChange = jest.fn();
-        const onLabelChange = jest.fn();
-        renderBadge({ onPersonChange, onLabelChange });
+    it('applies the typed label and clears the person in one assignment', () => {
+        const onAssign = jest.fn();
+        renderBadge({ onAssign });
 
         search('Ζζζ');
         fireEvent.click(screen.getByText('Set label to "Ζζζ"'));
 
-        expect(onPersonChange).toHaveBeenCalledWith(null);
-        expect(onLabelChange).toHaveBeenCalledWith('Ζζζ');
+        expect(onAssign).toHaveBeenCalledTimes(1);
+        expect(onAssign).toHaveBeenCalledWith({ personId: null, label: 'Ζζζ' }, 'allSegments');
     });
 
     it('highlights the top match while searching, so Enter picks the person', () => {
@@ -135,12 +134,252 @@ describe('PersonBadge editable speaker picker', () => {
         renderBadge();
         // Open with no query: the "unknown speaker" quick action is offered.
         fireEvent.click(screen.getByText('Speaker 1'));
-        expect(screen.getByText('Άγνωστος Ομιλητής')).toBeInTheDocument();
+        expect(screen.getByText('Άγνωστος Ομιλητής 3')).toBeInTheDocument();
 
         // Once searching, it gives way to the matches + the "set label" fallback.
         fireEvent.change(screen.getByPlaceholderText('Search people...'), {
             target: { value: 'Παπ' },
         });
-        expect(screen.queryByText('Άγνωστος Ομιλητής')).not.toBeInTheDocument();
+        expect(screen.queryByText('Άγνωστος Ομιλητής 3')).not.toBeInTheDocument();
+    });
+    it('gives the unknown speaker label that it is passed, and offers none without one', () => {
+        const onAssign = jest.fn();
+        const { unmount } = renderBadge({ onAssign, nextUnknownLabel: 'Unknown Speaker 2' });
+        fireEvent.click(screen.getByText('Speaker 1'));
+        fireEvent.click(screen.getByText('Unknown Speaker 2'));
+        expect(onAssign).toHaveBeenCalledWith({ personId: null, label: 'Unknown Speaker 2' }, 'allSegments');
+        unmount();
+
+        renderBadge({ nextUnknownLabel: undefined });
+        fireEvent.click(screen.getByText('Speaker 1'));
+        expect(screen.queryByText(/Άγνωστος Ομιλητής|Unknown Speaker/)).not.toBeInTheDocument();
+    });
+});
+
+describe('PersonBadge segment scope', () => {
+    const open = () => fireEvent.click(screen.getByText('Speaker 1'));
+
+    it('changes every segment of the tag when the person is picked directly', () => {
+        const onAssign = jest.fn();
+        renderBadge({ segmentCount: 7, onAssign });
+
+        open();
+        expect(screen.getByRole('checkbox')).not.toBeChecked();
+        fireEvent.click(screen.getByText('Σαλαμανή'));
+
+        expect(onAssign).toHaveBeenCalledWith({ personId: 'p2', label: undefined }, 'allSegments');
+    });
+
+    it('changes only this segment when the checkbox is ticked', () => {
+        const onAssign = jest.fn();
+        renderBadge({ segmentCount: 7, onAssign });
+
+        open();
+        fireEvent.click(screen.getByRole('checkbox'));
+        fireEvent.click(screen.getByText('Σαλαμανή'));
+
+        expect(onAssign).toHaveBeenCalledWith({ personId: 'p2', label: undefined }, 'thisSegment');
+    });
+
+    it('applies a label to this segment only', () => {
+        const onAssign = jest.fn();
+        renderBadge({ segmentCount: 3, onAssign });
+
+        open();
+        fireEvent.click(screen.getByRole('checkbox'));
+        fireEvent.change(screen.getByPlaceholderText('Search people...'), { target: { value: 'Ζζζ' } });
+        fireEvent.click(screen.getByText('Set label to "Ζζζ"'));
+
+        expect(onAssign).toHaveBeenCalledWith({ personId: null, label: 'Ζζζ' }, 'thisSegment');
+    });
+
+    it('describes the ticked state, whether or not the checkbox is ticked', () => {
+        // The hint reads as a subtitle of the option, so it must always say what
+        // ticking does, never what happens while it is unticked.
+        renderBadge({ segmentCount: 7, onAssign: jest.fn() });
+
+        open();
+        const checkbox = screen.getByRole('checkbox', { name: 'Change this segment only' });
+        const hint = 'The other 6 segments of this speaker stay as they are.';
+        expect(checkbox).toHaveAccessibleDescription(hint);
+        fireEvent.click(checkbox);
+        expect(checkbox).toHaveAccessibleDescription(hint);
+    });
+
+    it('resets to all segments the next time the picker opens', () => {
+        renderBadge({ segmentCount: 7, onAssign: jest.fn() });
+
+        open();
+        fireEvent.click(screen.getByRole('checkbox'));
+        fireEvent.click(screen.getByText('Σαλαμανή'));
+        open();
+
+        expect(screen.getByRole('checkbox')).not.toBeChecked();
+    });
+
+    it('hides the checkbox when the tag has one segment', () => {
+        renderBadge({ segmentCount: 1, onAssign: jest.fn() });
+
+        open();
+
+        expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+    });
+});
+
+describe('PersonBadge speaker suggestions', () => {
+    const suggestions = [{ person: people[1], source: 'transcript' as const, reason: 'Discussion text', evidence: '[00:01:14] τον λόγο έχει η κ. Σαλαμανή' }];
+
+    it('leads with the suggested people and why, then heads the full list', () => {
+        renderBadge({ suggestions, suggestionsHeading: 'Suggested', allPeopleHeading: 'All people' });
+        fireEvent.click(screen.getByText('Speaker 1'));
+
+        const suggestedHeading = screen.getByText('Suggested');
+        const unknownSpeaker = screen.getByText('Άγνωστος Ομιλητής 3');
+        const allPeopleHeading = screen.getByText('All people');
+        // Document order: suggestions, then the unknown-speaker action, then everyone.
+        expect(suggestedHeading.compareDocumentPosition(unknownSpeaker) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+        expect(unknownSpeaker.compareDocumentPosition(allPeopleHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+        expect(screen.getByText('Discussion text')).toBeInTheDocument();
+        // The line the name rests on, for the reviewer to check it against.
+        expect(screen.getByText('[00:01:14] τον λόγο έχει η κ. Σαλαμανή')).toBeInTheDocument();
+        // Once as a suggestion, once in the full list.
+        expect(screen.getAllByText('Σαλαμανή')).toHaveLength(2);
+    });
+
+    it('shows no "all people" heading when there is nothing suggested', () => {
+        renderBadge({ allPeopleHeading: 'All people' });
+        fireEvent.click(screen.getByText('Speaker 1'));
+        expect(screen.queryByText('All people')).not.toBeInTheDocument();
+    });
+
+    it('assigns a suggestion when it is picked', () => {
+        const onAssign = jest.fn();
+        renderBadge({ suggestions, suggestionsHeading: 'Suggested', onAssign });
+        fireEvent.click(screen.getByText('Speaker 1'));
+        fireEvent.click(screen.getByText('Discussion text'));
+
+        expect(onAssign).toHaveBeenCalledWith({ personId: 'p2', label: undefined }, 'allSegments');
+    });
+
+    it('assigns a suggestion to this segment only when the checkbox is ticked', () => {
+        const onAssign = jest.fn();
+        renderBadge({ suggestions, suggestionsHeading: 'Suggested', segmentCount: 4, onAssign });
+        fireEvent.click(screen.getByText('Speaker 1'));
+        fireEvent.click(screen.getByRole('checkbox'));
+        fireEvent.click(screen.getByText('Discussion text'));
+
+        expect(onAssign).toHaveBeenCalledWith({ personId: 'p2', label: undefined }, 'thisSegment');
+    });
+
+    it('picks a single suggestion on Enter', () => {
+        const onAssign = jest.fn();
+        renderBadge({ suggestions, suggestionsHeading: 'Suggested', onAssign });
+        fireEvent.click(screen.getByText('Speaker 1'));
+        fireEvent.keyDown(screen.getByPlaceholderText('Search people...'), { key: 'Enter' });
+
+        expect(onAssign).toHaveBeenCalledWith({ personId: 'p2', label: undefined }, 'allSegments');
+    });
+
+    it('selects nothing when the suggestions differ, so Enter assigns nobody unread', () => {
+        const onAssign = jest.fn();
+        const differing = [
+            { person: people[0], source: 'voiceprint' as const, reason: 'Voiceprint' },
+            { person: people[1], source: 'transcript' as const, reason: 'Discussion text', evidence: '[00:01:14] τον λόγο έχει η κ. Σαλαμανή' },
+        ];
+        renderBadge({ suggestions: differing, suggestionsHeading: 'Suggested', onAssign });
+        fireEvent.click(screen.getByText('Speaker 1'));
+        const input = screen.getByPlaceholderText('Search people...');
+
+        expect(document.querySelector('[cmdk-item=""][aria-selected="true"]')).toBeNull();
+        fireEvent.keyDown(input, { key: 'Enter' });
+        expect(onAssign).not.toHaveBeenCalled();
+
+        // The reviewer moves to a suggestion, and Enter then picks that one.
+        fireEvent.keyDown(input, { key: 'ArrowDown' });
+        fireEvent.keyDown(input, { key: 'ArrowDown' });
+        fireEvent.keyDown(input, { key: 'Enter' });
+        expect(onAssign).toHaveBeenCalledWith({ personId: 'p2', label: undefined }, 'allSegments');
+    });
+
+    it('selects nothing when differing suggestions arrive while the picker is open', () => {
+        // The identifications load after editing mode turns on, so a picker can be open before they are there.
+        const onAssign = jest.fn();
+        const badge = (extra: Partial<React.ComponentProps<typeof PersonBadge>>) => (
+            <NextIntlClientProvider locale="en" messages={{ transcript }}>
+                <PersonBadge editable speakerTag={speakerTag} availablePeople={people} onAssign={onAssign} suggestionsHeading="Suggested" {...extra} />
+            </NextIntlClientProvider>
+        );
+        const { rerender } = render(badge({}));
+        fireEvent.click(screen.getByText('Speaker 1'));
+        // With nothing suggested, the first item is selected, as it always was.
+        expect(document.querySelector('[cmdk-item=""][aria-selected="true"]')).not.toBeNull();
+
+        rerender(badge({
+            suggestions: [
+                { person: people[0], source: 'voiceprint' as const, reason: 'Voiceprint' },
+                { person: people[1], source: 'transcript' as const, reason: 'Discussion text' },
+            ],
+        }));
+
+        expect(screen.getByText('Suggested')).toBeInTheDocument();
+        expect(document.querySelector('[cmdk-item=""][aria-selected="true"]')).toBeNull();
+        fireEvent.keyDown(screen.getByPlaceholderText('Search people...'), { key: 'Enter' });
+        expect(onAssign).not.toHaveBeenCalled();
+    });
+
+    it('steps the suggestions aside while the reviewer searches', () => {
+        renderBadge({ suggestions, suggestionsHeading: 'Suggested', allPeopleHeading: 'All people' });
+        search('Παπ');
+        expect(screen.queryByText('Suggested')).not.toBeInTheDocument();
+        expect(screen.queryByText('All people')).not.toBeInTheDocument();
+    });
+
+    it('labels the badge when the methods disagree, only for an editor', () => {
+        const { unmount } = renderBadge({ warning: 'Methods disagree' });
+        expect(screen.getByText('Methods disagree')).toBeInTheDocument();
+        unmount();
+
+        renderBadge({ warning: 'Methods disagree', editable: false });
+        expect(screen.queryByText('Methods disagree')).not.toBeInTheDocument();
+    });
+});
+
+describe('PersonBadge picker focus', () => {
+    const outsideControl = <button type="button">outside</button>;
+    // Radix restores focus from a zero-delay timer after the picker unmounts.
+    const flushUnmountFocus = () => act(() => new Promise<void>(resolve => { setTimeout(resolve, 0); }));
+    const badge = () => screen.getByText('Speaker 1').closest('[role="button"]');
+
+    it('closes on a second press of the badge', () => {
+        renderBadge();
+        fireEvent.click(screen.getByText('Speaker 1'));
+        expect(screen.getByPlaceholderText('Search people...')).toBeInTheDocument();
+
+        fireEvent.click(screen.getByText('Speaker 1'));
+
+        expect(screen.queryByPlaceholderText('Search people...')).not.toBeInTheDocument();
+    });
+
+    it('returns focus to the badge after Escape', async () => {
+        renderBadge({}, outsideControl);
+        fireEvent.click(screen.getByText('Speaker 1'));
+        fireEvent.keyDown(screen.getByPlaceholderText('Search people...'), { key: 'Escape' });
+        await waitFor(() => expect(screen.queryByPlaceholderText('Search people...')).not.toBeInTheDocument());
+        await flushUnmountFocus();
+
+        expect(document.activeElement).toBe(badge());
+    });
+
+    it('leaves focus on a control the reader moved to', async () => {
+        renderBadge({}, outsideControl);
+        fireEvent.click(screen.getByText('Speaker 1'));
+        const outside = screen.getByRole('button', { name: 'outside' });
+        act(() => { outside.focus(); });
+        fireEvent.focusIn(outside);
+        await waitFor(() => expect(screen.queryByPlaceholderText('Search people...')).not.toBeInTheDocument());
+        await flushUnmountFocus();
+
+        expect(document.activeElement).toBe(outside);
     });
 });

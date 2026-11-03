@@ -49,7 +49,6 @@ const ALLOWED_FILES = new Set([
     'src/app/qr/[code]/route.ts',
     'src/app/[locale]/(admin)/admin/reports/page.tsx',
     'src/app/api/admin/elasticsearch/status/route.ts',
-    'src/app/api/admin/entities/route.ts',
     'src/app/api/admin/notifications/release/route.ts',
     'src/app/api/admin/qr/[id]/route.ts',
     'src/app/api/admin/qr/route.ts',
@@ -61,15 +60,12 @@ const ALLOWED_FILES = new Set([
     'src/app/api/cities/[cityId]/meetings/[meetingId]/notifications/route.ts',
     'src/app/api/cities/[cityId]/meetings/[meetingId]/operator/route.ts',
     'src/app/api/cities/[cityId]/meetings/[meetingId]/subjects/[subjectId]/route.ts',
-    'src/app/api/cities/[cityId]/meetings/route.ts',
-    'src/app/api/cities/[cityId]/populate/route.ts',
     'src/app/api/cities/[cityId]/reset/route.ts',
     'src/app/api/dev/quick-login/route.ts',
     'src/app/api/dev/seed-test-users/route.ts',
     'src/app/api/dev/seed-users/route.ts',
     'src/app/api/og/route.tsx',
     'src/app/api/subject/[subjectId]/first-utterance/[speakerId]/route.ts',
-    'src/app/api/subject/voting-utterances/route.ts',
     'src/app/api/utterance/[utteranceId]/route.ts',
 ]);
 

@@ -1,31 +1,12 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest, NextResponse, after } from 'next/server';
 import { revalidatePath, revalidateTag } from 'next/cache';
-import { editAdministrativeBody, deleteAdministrativeBody } from '@/lib/db/administrativeBodies';
-import { z } from 'zod';
-import { withUserAuthorizedToEdit } from '@/lib/auth';
+import { editAdministrativeBody, editAdministrativeBodyContacts, deleteAdministrativeBody } from '@/lib/db/administrativeBodies';
+import { confirmDecisionConventions } from '@/lib/db/administrativeBodiesInternal';
+import { rederiveMeetingsOfBody } from '@/lib/derivation/rederive';
+import { isUserAuthorizedToEdit, withUserAuthorizedToEdit } from '@/lib/auth';
+import { administrativeBodyContactsSchema, updateAdministrativeBodyRequestSchema } from '@/lib/zod-schemas/administrativeBody';
+import { handleApiError } from '@/lib/api/errors';
 
-const bodySchema = z.object({
-    name: z.string().min(2, {
-        message: "Name must be at least 2 characters.",
-    }),
-    name_en: z.string().min(2, {
-        message: "Name (English) must be at least 2 characters.",
-    }),
-    type: z.enum(['council', 'committee', 'community']),
-    youtubeChannelUrl: z.union([
-        z.string().url({
-            message: "Must be a valid URL.",
-        }),
-        z.literal('')
-    ]).optional().transform(val => val === '' ? undefined : val),
-    contactEmails: z.array(z.string().email()).optional().default([]),
-    notificationBehavior: z.enum(['NOTIFICATIONS_DISABLED', 'NOTIFICATIONS_AUTO', 'NOTIFICATIONS_APPROVAL']).optional(),
-    showUnreviewedTranscript: z.boolean().optional(),
-    diavgeiaUnitIds: z.string().optional().transform(val => {
-        if (!val || val.trim() === '') return [];
-        return val.split(',').map(s => s.trim()).filter(Boolean);
-    }),
-});
 
 export async function PUT(
     request: NextRequest,
@@ -33,20 +14,45 @@ export async function PUT(
 ) {
     const params = await props.params;
     try {
-        await withUserAuthorizedToEdit({ cityId: params.cityId });
         const body = await request.json();
-        const parsed = bodySchema.parse(body);
-        const { name, name_en, type, youtubeChannelUrl, contactEmails, notificationBehavior, showUnreviewedTranscript, diavgeiaUnitIds } = parsed;
 
+        // An admin of the body, not of the city, changes the YouTube channel
+        // and the contact emails and nothing else (#828).
+        if (!(await isUserAuthorizedToEdit({ cityId: params.cityId }))) {
+            await withUserAuthorizedToEdit({ cityId: params.cityId, administrativeBodyId: params.bodyId });
+            const { youtubeChannelUrl, contactEmails } = administrativeBodyContactsSchema.parse(body);
+            const updatedBody = await editAdministrativeBodyContacts(params.bodyId, { youtubeChannelUrl, contactEmails });
+            revalidateTag(`city:${params.cityId}:administrativeBodies`, 'max');
+            return NextResponse.json(updatedBody);
+        }
+
+        // A malformed body throws a ZodError, which the handler below answers 400.
+        const parsed = updateAdministrativeBodyRequestSchema.parse(body);
+
+        // Confirming the conventions is its own write: it carries only the
+        // conventions, and the writer stamps who confirmed them.
+        if (parsed.confirmConventions === true) {
+            const confirmed = await confirmDecisionConventions(params.bodyId, parsed.decisionConventions);
+            revalidateTag(`city:${params.cityId}:administrativeBodies`, 'max');
+            // Through after(): a body can hold hundreds of meetings, and the
+            // person waits for none of them.
+            after(() => rederiveMeetingsOfBody(params.bodyId));
+            return NextResponse.json(confirmed);
+        }
+
+        const { name, name_en, type, youtubeChannelUrl, contactEmails, notificationBehavior, showUnreviewedTranscript, diavgeiaUnitIds, place } = parsed;
+
+        // A field that the request leaves out keeps its value.
         const updatedBody = await editAdministrativeBody(params.bodyId, {
             name,
             name_en,
             type,
-            youtubeChannelUrl: youtubeChannelUrl && youtubeChannelUrl.trim() !== '' ? youtubeChannelUrl : null,
-            contactEmails: contactEmails || [],
-            notificationBehavior: notificationBehavior,
-            ...(showUnreviewedTranscript !== undefined && { showUnreviewedTranscript }),
-            diavgeiaUnitIds: diavgeiaUnitIds || [],
+            youtubeChannelUrl,
+            contactEmails,
+            notificationBehavior,
+            showUnreviewedTranscript,
+            diavgeiaUnitIds,
+            place,
         });
 
         revalidateTag(`city:${params.cityId}:administrativeBodies`, 'max');
@@ -54,14 +60,7 @@ export async function PUT(
 
         return NextResponse.json(updatedBody);
     } catch (error) {
-        if (error instanceof z.ZodError) {
-            return NextResponse.json({ error: error.errors }, { status: 400 });
-        }
-        console.error('Failed to update administrative body:', error);
-        return NextResponse.json(
-            { error: 'Failed to update administrative body' },
-            { status: 500 }
-        );
+        return handleApiError(error, 'Failed to update administrative body');
     }
 }
 
@@ -71,16 +70,12 @@ export async function DELETE(
 ) {
     const params = await props.params;
     try {
-        await withUserAuthorizedToEdit({ cityId: params.cityId });
+        await withUserAuthorizedToEdit({});
         await deleteAdministrativeBody(params.bodyId);
         revalidateTag(`city:${params.cityId}:administrativeBodies`, 'max');
         revalidatePath(`/${params.cityId}/people`);
         return new NextResponse(null, { status: 204 });
     } catch (error) {
-        console.error('Failed to delete administrative body:', error);
-        return NextResponse.json(
-            { error: 'Failed to delete administrative body' },
-            { status: 500 }
-        );
+        return handleApiError(error, 'Failed to delete administrative body');
     }
 } 

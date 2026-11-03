@@ -1,8 +1,10 @@
 import type { estypes } from '@elastic/elasticsearch';
+import type { QueryContainer } from '../types';
 
 jest.mock('@/env.mjs', () => ({ env: { ELASTICSEARCH_INDEX: 'test-index' } }));
 
 import { buildRelatedSubjectsQuery, RELATED_MIN_SIMILARITY, RELATED_SUBJECTS_SIZE } from '../related';
+import { subjectVisibilityFilters } from '../query';
 
 const SEED = { id: 'subject-1', name: 'Κυκλοφοριακές ρυθμίσεις', cityId: 'athens', councilMeetingId: 'meeting-1' };
 const REALM_CITIES = ['athens', 'chania', 'argos'];
@@ -12,7 +14,7 @@ function boolOf(query: estypes.SearchRequest): estypes.QueryDslBoolQuery {
 }
 
 function cityTerms(query: estypes.SearchRequest): string[] {
-    const filters = boolOf(query).filter as estypes.QueryDslQueryContainer[];
+    const filters = boolOf(query).filter as QueryContainer[];
     const terms = filters.find(f => f.terms)?.terms as Record<string, string[]>;
     return terms.city_id;
 }
@@ -21,18 +23,29 @@ describe('buildRelatedSubjectsQuery', () => {
     // The floor is the product decision the feature turns on, measured on
     // the production index; the cases below read it back, so this one pins it.
     it('keeps the measured similarity floor and the page size', () => {
-        expect(RELATED_MIN_SIMILARITY).toBe(0.93);
+        expect(RELATED_MIN_SIMILARITY).toBe(0.75);
         expect(RELATED_SUBJECTS_SIZE).toBe(5);
+    });
+
+    // The runtime resolves the index behind the alias and its model's floor
+    // together; the query must name that index, so the floor never meets
+    // another index's scores.
+    it('searches the resolved index with its floor when given a profile', () => {
+        const query = buildRelatedSubjectsQuery(SEED, 'city', REALM_CITIES, {
+            index: 'subjects-2026-08', semanticMinScore: 0.934, semanticMappedScale: 320, relatedMinSimilarity: 0.93,
+        });
+        expect(query.index).toBe('subjects-2026-08');
+        expect(query.min_score).toBe(0.93);
     });
 
     it('asks the semantic fields with the subject name and nothing else', () => {
         const query = buildRelatedSubjectsQuery(SEED, 'city', REALM_CITIES);
-        const must = boolOf(query).must as estypes.QueryDslQueryContainer[];
+        const must = boolOf(query).must as QueryContainer[];
         const disMax = must[0].dis_max as estypes.QueryDslDisMaxQuery;
 
         expect(must).toHaveLength(1);
         expect(disMax.tie_breaker).toBe(0);
-        expect(disMax.queries.map(q => q.semantic)).toEqual([
+        expect(disMax.queries.map(q => q?.semantic)).toEqual([
             { field: 'name.semantic', query: SEED.name },
             { field: 'description.semantic', query: SEED.name },
         ]);
@@ -54,6 +67,16 @@ describe('buildRelatedSubjectsQuery', () => {
     it('only returns released subjects', () => {
         const query = buildRelatedSubjectsQuery(SEED, 'city', REALM_CITIES);
         expect(boolOf(query).filter).toContainEqual({ term: { meeting_released: true } });
+    });
+
+    // Related subjects show beside every subject page. A visibility rule the
+    // search applies and this query does not would show here what the search
+    // hides.
+    it('applies every visibility filter the search applies', () => {
+        const filter = boolOf(buildRelatedSubjectsQuery(SEED, 'other', REALM_CITIES)).filter;
+        for (const visibility of subjectVisibilityFilters()) {
+            expect(filter).toContainEqual(visibility);
+        }
     });
 
     it('the city scope stays inside the subject municipality', () => {

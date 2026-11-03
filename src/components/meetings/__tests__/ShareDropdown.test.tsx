@@ -11,6 +11,7 @@ jest.mock('next/navigation', () => ({ usePathname: () => mockPathname, useParams
 jest.mock('../VideoProvider', () => ({ useVideo: () => ({ currentTime: mockCurrentTime }) }));
 jest.mock('../CouncilMeetingDataContext', () => ({ useCouncilMeetingData: () => ({
     meeting: { id: 'meeting', cityId: 'city', released: true, name: 'Council meeting', name_en: 'Council meeting' },
+    city: { timezone: 'Europe/Athens' },
     subjects: [{ id: 'subject', name: 'A safer square' }],
 }) }));
 jest.mock('@/lib/analytics/capture', () => ({ captureEvent: jest.fn() }));
@@ -144,6 +145,17 @@ describe('meeting and subject sharing menu', () => {
         fireEvent.click(screen.getByRole('menuitem', { name: 'copyLink' }));
         await screen.findByRole('menuitem', { name: 'copied' });
         expect(writeText).toHaveBeenCalledWith('http://localhost/en/city/meeting/transcript?textLocale=el');
+    });
+
+    it('does not pass on the shared excerpt that the reader arrived with', async () => {
+        mockPathname = '/en/city/meeting/transcript';
+        mockSubjectId = undefined;
+        const selector = 'cityId=city&meetingId=meeting&firstUtteranceId=u1&lastUtteranceId=u2&textLocale=en&digest=' + 'a'.repeat(64) + '&maxDrift=500';
+        window.history.replaceState({}, '', `${mockPathname}?${selector}&utm_source=news`);
+        mount();
+        fireEvent.click(await openMenu());
+        await screen.findByRole('menuitem', { name: 'copied' });
+        expect(writeText).toHaveBeenCalledWith('http://localhost/en/city/meeting/transcript?utm_source=news');
     });
 
     it('preserves zero for automatic timestamp copies and removes the timestamp when unchecked', async () => {

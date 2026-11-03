@@ -2,7 +2,7 @@
 import { withUserAuthorizedToEdit } from "../auth";
 import prisma from "./prisma";
 import { TaskStatus } from '@prisma/client';
-import { CORE_PROCESSING_TASKS, MeetingTaskType, TASK_CONFIG } from "../tasks/types";
+import { CORE_PROCESSING_TASKS, MeetingTaskType, TASK_CONFIG, taskScope } from "@/lib/tasks/types";
 import { getHighlightPermissions } from "./highlights";
 
 // Derived type for meeting task completion status
@@ -56,10 +56,9 @@ export async function getTasksForMeeting(cityId: string, meetingId: string): Pro
     }
 }
 
-// Reading a single task status lives in tasksInternal.ts (server-only): its
-// sole caller is the task-server callback route, which authorizes by
-// possession of the unguessable id, so the read cannot carry a user gate and
-// must stay off the Server Action surface instead.
+// The taskStatuses route reads and deletes a single task through
+// tasksInternal.ts (server-only), because it settles access itself and those
+// functions must stay off the Server Action surface.
 
 export async function deleteTaskStatus(taskStatusId: string): Promise<void> {
     // Called directly from client components (admin tasks + voiceprint actions),
@@ -67,9 +66,9 @@ export async function deleteTaskStatus(taskStatusId: string): Promise<void> {
     // requires superadmin so a bare delete cannot be fired against any id.
     const task = await prisma.taskStatus.findUnique({
         where: { id: taskStatusId },
-        select: { cityId: true },
+        select: { type: true, cityId: true, councilMeetingId: true },
     });
-    await withUserAuthorizedToEdit(task ? { cityId: task.cityId } : {});
+    await withUserAuthorizedToEdit(task ? taskScope(task) : {});
     try {
         await prisma.taskStatus.delete({
             where: { id: taskStatusId },
@@ -85,12 +84,12 @@ export async function deleteTaskStatus(taskStatusId: string): Promise<void> {
  */
 export async function getGenerateHighlightTasksForHighlight(cityId: string, meetingId: string, highlightId: string): Promise<TaskStatus[]> {
     // Check authorization: city editors can view any highlight's tasks, regular users only their own
-    const permissions = await getHighlightPermissions(cityId);
+    const permissions = await getHighlightPermissions(cityId, meetingId);
     if (!permissions) {
         throw new Error('Authentication required');
     }
 
-    if (!permissions.canEditCity) {
+    if (!permissions.canEdit) {
         // Regular users can only view tasks for their own highlights
         const highlight = await prisma.highlight.findUnique({
             where: { id: highlightId },

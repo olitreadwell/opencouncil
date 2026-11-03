@@ -71,9 +71,12 @@ These variables are used by the flake runner (`nix run .#dev`) to configure **lo
 | Variable | Description | Required | Default |
 |----------|-------------|----------|---------|
 | `RESEND_API_KEY` | API key for Resend email service. | Yes | - |
+| `EMAIL_FROM_OVERRIDE` | Sender ("from") address for every email. When it is not set, each email uses its own `opencouncil.gr` mailbox, as `src/lib/email/senders.ts` defines. For local development, use a Resend test sender (see below). | No | - |
 | `BASIC_AUTH_USERNAME` | Username for basic auth protection. | No | - |
 | `BASIC_AUTH_PASSWORD` | Password for basic auth protection. | No | - |
 | `NEXTAUTH_SECRET` | Secret used by NextAuth.js to hash tokens, sign/encrypt cookies, and generate cryptographic keys. | Yes | - |
+| `AUTH_GOOGLE_ID` | OAuth client id for "Sign in with Google". Unset hides the Google button. The magic link keeps working. | No | - |
+| `AUTH_GOOGLE_SECRET` | OAuth client secret for "Sign in with Google". Set it together with `AUTH_GOOGLE_ID`. | No | - |
 | `SESSION_COOKIE_DOMAIN` | Domain for the session-mirror cookie that authenticates the Notis admin. Derived from `DEPLOYMENT_ENV` + `NEXTAUTH_URL` (`.opencouncil.gr` on production, `.staging.opencouncil.gr` on staging; none in development or previews). Set only to override. | No | derived |
 | `SESSION_COOKIE_SUFFIX` | Per-environment suffix for the mirror cookie name, so the production mirror never authenticates a staging service. Derived from `DEPLOYMENT_ENV` (`-staging` on staging, empty on production). Set only to override — and if you do, set Notis's `MAIN_SESSION_COOKIE_NAME` to match. | No | derived |
 
@@ -82,8 +85,35 @@ These variables are used by the flake runner (`nix run .#dev`) to configure **lo
 |----------|-------------|----------|---------|
 | `NOTIS_API_URL` | Base URL of the Notis service (`https://notis.opencouncil.gr`; staging `https://notis.staging.opencouncil.gr`; `http://localhost:3001` in development). The profile's Νότης switch reads and flips the reader's subscription through it, server-side. Without it the switch shows as unavailable. | No | - |
 | `NOTIS_SERVICE_TOKEN` | Bearer token presented on `NOTIS_API_URL/api/subscriptions/*`. The same value as the Notis component's `NOTIS_SERVICE_TOKEN`, at least 32 characters (`openssl rand -hex 32`), different per environment. | No | - |
+| `BIRD_API_KEY`, `BIRD_WORKSPACE_ID`, `BIRD_SMS_CHANNEL_ID` | Bird access for the SMS that carries a phone verification code. The same values as the Notis component's. The main app uses Bird for nothing else. Without them, development and previews print the code to the server log, and production cannot send codes. | No | - |
 
 Every WhatsApp and SMS message to a reader belongs to the Notis service, which holds the Bird credentials and its own webhook subscription. Its variables are in [services/notis/README.md](../services/notis/README.md), and the Bird workspace setup in [bird-setup.md](./bird-setup.md).
+
+#### Resend setup for local development
+
+Every email goes through [Resend](https://resend.com). The default senders use the `opencouncil.gr` domain, and Resend sends only from a domain that you verified on your own account. On a fork, every send therefore fails with **HTTP 403** until you follow these steps.
+
+To run a fork with your own Resend account and no verified domain:
+
+1. Create a Resend account and an API key. Set `RESEND_API_KEY`.
+2. Set `EMAIL_FROM_OVERRIDE="OpenCouncil <onboarding@resend.dev>"`. Every email then uses the Resend test sender.
+3. Set `DEV_EMAIL_OVERRIDE` to the email that owns your Resend account. In test mode, Resend delivers only to that email. The override sends every email there while you develop, as [Email Testing in Development](#email-testing-in-development) describes.
+4. Sign in with that same email. Resend refuses a sign-in email to any other address.
+
+With a domain that you verified on Resend, set `EMAIL_FROM_OVERRIDE` to an address on that domain instead. Resend then delivers to any recipient.
+
+In development, the QuickLogin tool signs you in as a seeded [test user](#test-users) without an email.
+
+When a send fails, the dev server console shows `[auth][error] Error: Resend error (<status>): <Resend's response>`. Resend's message names the cause.
+
+#### Sign in with Google
+Create an OAuth 2.0 client of type "Web application" in the Google Cloud Console.
+Use the canonical domains defined in [`REALMS`](../src/lib/realm.ts) as the source of truth. For each domain, add an authorized redirect URI: `https://<realm domain>/api/auth/callback/google`.
+Add each top private domain to the OAuth consent screen's authorized domains once (country subdomains of `opencouncil.eu` share that authorized domain).
+Route each domain to this deployment and configure its redirect URI before enabling Google sign-in there.
+For development, add `http://localhost:3000/api/auth/callback/google`.
+
+The button appears on the host that `NEXTAUTH_URL` names and on every realm apex. One deployment serves every realm, and next-auth rewrites each request to the origin of `NEXTAUTH_URL`. The auth route therefore sends the Google sign-in and its callback on another realm apex through Auth.js core with the request's own host (`realmOAuthUrl`), so the sign-in finishes on the domain it started on. A preview names its own host in `NEXTAUTH_URL`, so it works once `https://pr-<N>.opencouncil.dev/api/auth/callback/google` is in the client's redirect URIs.
 
 #### NEXTAUTH_SECRET
 You can quickly create a good value on the command line via this openssl command:
@@ -151,14 +181,16 @@ The Google Calendar integration uses OAuth 2.0 authentication with a Google acco
 |----------|-------------|----------|---------|
 | `NEXT_PUBLIC_CONTACT_EMAIL` | Public contact email. | No | - |
 | `NEXT_PUBLIC_CONTACT_ADDRESS` | Public contact address. | No | - |
+| `NEXT_PUBLIC_BUILD_COMMIT_SHA` | The commit the build carries. `/api/health` publishes it, and a Discord alert names it. Previews set it from the head commit of the pull request. An App Platform app sets it in its spec from `${opencouncil.COMMIT_HASH}`, with a scope that includes build time, so that the value matches the code that was built. A deployment that does not set it reports a null commit. | No | - |
 
 ### Development Configuration
 | Variable | Description | Required | Default |
 |----------|-------------|----------|---------|
-| `DEV_TEST_CITY_ID` | The city ID used for creating development test users. | No | `chania` |
-| `DEV_EMAIL_OVERRIDE` | Email address to receive ALL emails in development mode. When set, redirects all outgoing emails to this address instead of the actual recipients. The subject line will be prefixed with `[DEV → original@email.com]` to show the intended recipient. | No | - |
-| `SEED_DATA_URL` | URL to fetch seed data from if local file doesn't exist. | No | [link](https://raw.githubusercontent.com/schemalabz/opencouncil-seed-data/refs/heads/main/seed_data.json) |
-| `SEED_DATA_PATH` | Path to local seed data file. | No | `./prisma/seed_data.json` |
+| `DEV_EMAIL_OVERRIDE` | Email address that receives outgoing email instead of the real recipients. See [Email Testing in Development](#email-testing-in-development) for which emails it redirects. | No | - |
+| `SEED_ARTIFACT_URL` | Base URL of the published seed artifact, or a local artifact directory, for `npm run seed`. | No | `https://github.com/schemalabz/opencouncil-seed-data/releases/latest/download` |
+| `SEED_PG_BIN` | Directory of the PostgreSQL tools that the seed commands use. `npm run seed` takes the 16 client tools (`pg_restore`, `psql`) from it. `npm run seed-pipeline` takes a server with PostGIS from it for `produce` and `verify`. When it is not set, `npm run seed` uses `PATH`. | No | |
+| `SEED_DATA_URL` | Legacy JSON seeder only: URL to fetch `prisma/seed.ts` data from if the local file doesn't exist. | No | [link](https://raw.githubusercontent.com/schemalabz/opencouncil-seed-data/refs/heads/main/seed_data.json) |
+| `SEED_DATA_PATH` | Legacy JSON seeder only: path to the local data file of `prisma/seed.ts`. | No | `./prisma/seed_data.json` |
 
 ### Docker Port Configuration
 | Variable | Description | Required | Default |
@@ -188,7 +220,7 @@ The mock data system provides:
 - Realistic streaming behavior
 
 ### Test Users
-When `NODE_ENV=development`, the application includes a QuickLogin development tool that allows switching between different user accounts for testing authorization scenarios. The test users are automatically created during database seeding and are focused on the city specified by `DEV_TEST_CITY_ID`.
+When `NODE_ENV=development`, the application includes a QuickLogin development tool that allows switching between different user accounts for testing authorization scenarios. The seeding process creates the test users, and `npm run seed -- fixtures` creates them on a restored database. The city admin administers every supported city.
 
 ### Development Mode
 When `NODE_ENV=development`:
@@ -198,20 +230,18 @@ When `NODE_ENV=development`:
 - Mock data can be toggled in the chat interface
 - QuickLogin tool is available for testing different user permission levels
 - Mobile Preview QR code available next to the DEV panel for phone testing (see [Nix Usage Guide](nix-usage.md#mobile-preview-qr-code-for-phone-testing))
-- Email override is available via `DEV_EMAIL_OVERRIDE` to intercept all outgoing emails
+- Email override is available via `DEV_EMAIL_OVERRIDE` (see [Email Testing in Development](#email-testing-in-development))
 
 ### Email Testing in Development
-To test email functionality without sending emails to real users, set the `DEV_EMAIL_OVERRIDE` environment variable:
+To keep test emails away from real users, set `DEV_EMAIL_OVERRIDE`. With the Resend test sender, use the email that owns your Resend API key:
 
 ```bash
-DEV_EMAIL_OVERRIDE=your-test-email@example.com
+DEV_EMAIL_OVERRIDE=you@your-domain.org
 ```
 
-When set, all emails will be redirected to this address in development mode. The subject line will be prefixed with `[DEV → original@email.com]` to indicate the intended recipient. This applies to all emails:
-- Highlight completion notifications
-- Authentication emails
-- User invitations
-- Notification system emails
+The variable redirects two groups of email differently:
+- **Every email except sign-in**, in development and on a preview: the email goes to `DEV_EMAIL_OVERRIDE`. The subject starts with `[DEV → original@email.com]`, and a banner shows the intended recipients. This group includes notifications, user invitations and highlight emails.
+- **Sign-in emails**: only the sign-in email of a seeded [test user](#test-users) goes to `DEV_EMAIL_OVERRIDE`. This applies in every environment where the variable is set. A sign-in email for any other address goes to that address.
 
 ## Production Setup
 

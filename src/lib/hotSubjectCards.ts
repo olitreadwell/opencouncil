@@ -1,4 +1,5 @@
-import type { AdministrativeBody, AdministrativeBodyType, NonAgendaReason, Topic } from '@prisma/client';
+import type { AdministrativeBodyType, MeetingKind, NonAgendaReason, Topic } from '@prisma/client';
+import type { PublicAdministrativeBody } from '@/lib/db/types';
 import { bodyFilterKey, createCache } from '@/lib/cache';
 import { getBatchStatisticsForSubjects } from '@/lib/statistics';
 import { getSubjectCardExtras } from '@/lib/db/subject';
@@ -22,12 +23,15 @@ export interface HotCardSubject {
 export interface HotCardMeeting {
     cityId: string;
     id: string;
-    name: string;
+    name: string | null;
     name_en: string | null;
+    kind: MeetingKind | null;
+    urgent: boolean;
+    sessionNumber: number | null;
     /** Always a Date. A cache hit hands back an ISO string, which getHotSubjectCardsCached
      *  restores before it returns — so a reader can call Date methods on this. */
     dateTime: Date;
-    administrativeBody: AdministrativeBody | null;
+    administrativeBody: PublicAdministrativeBody | null;
 }
 
 /**
@@ -56,7 +60,7 @@ export interface HotSubjectCard {
 }
 
 /** Bump when the ranking or the card shape changes, so entries don't go stale. */
-const HOT_CARDS_CACHE_VERSION = 'v3';
+const HOT_CARDS_CACHE_VERSION = 'v4';
 
 interface Args {
     limit: number;
@@ -103,6 +107,9 @@ async function buildCards(top: HotSubject[], withSpeakers: boolean): Promise<Hot
                 id: meeting.id,
                 name: meeting.name,
                 name_en: meeting.name_en,
+                kind: meeting.kind,
+                urgent: meeting.urgent,
+                sessionNumber: meeting.sessionNumber,
                 dateTime: meeting.dateTime,
                 administrativeBody: meeting.administrativeBody,
             },

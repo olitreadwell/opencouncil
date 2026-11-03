@@ -1,10 +1,11 @@
 import { Metadata } from "next";
 import { getCityCached } from "@/lib/cache";
-import { getConsultationById, getConsultationComments, fetchRegulationData } from "@/lib/db/consultations";
+import { getConsultationById, getConsultationComments, fetchRegulationData, type ConsultationCommentWithUpvotes } from "@/lib/db/consultations";
 import { notFound } from "next/navigation";
-import { RegulationData } from "@/components/consultations/types";
+import { GeoSetData, RegulationData } from "@/components/consultations/types";
+import { describeEntity, entityLabel, extractGeoSets } from "@/components/consultations/entityDisplay";
 import { auth } from "@/auth";
-import { formatDate } from "@/lib/utils";
+import { cn, formatDate } from "@/lib/utils";
 import { ExternalLink } from "lucide-react";
 import PrintButton from "@/components/consultations/PrintButton";
 import { env } from "@/env.mjs";
@@ -12,7 +13,10 @@ import { getRealm } from "@/lib/realm.server";
 import { getRealmContactPhone, getRealmDomain } from "@/lib/realm";
 import { getLocalizedName } from "@/lib/formatters/name";
 import { localizeText } from "@/lib/serbian";
-import { getSafeHtmlContent } from "@/lib/utils/sanitize";
+import { getSafeCommentHtml } from "@/lib/utils/sanitize";
+import Header, { PathElement } from "@/components/layout/Header";
+import Footer from "@/components/layout/Footer";
+import { hasExplainPage } from "@/lib/explain/availability";
 
 interface PageProps {
     params: Promise<{ cityId: string; id: string; locale: string }>;
@@ -48,11 +52,11 @@ export async function generateMetadata(props: PageProps): Promise<Metadata> {
 
 // Helper function to order comments by document appearance
 function orderCommentsByDocumentStructure(
-    comments: any[],
+    comments: ConsultationCommentWithUpvotes[],
     regulationData: RegulationData
-): { documentComments: any[], locationComments: any[] } {
-    const documentComments: any[] = [];
-    const locationComments: any[] = [];
+): { documentComments: ConsultationCommentWithUpvotes[], locationComments: ConsultationCommentWithUpvotes[] } {
+    const documentComments: ConsultationCommentWithUpvotes[] = [];
+    const locationComments: ConsultationCommentWithUpvotes[] = [];
 
     // Create ordering maps
     const chapterOrder = new Map<string, number>();
@@ -178,79 +182,45 @@ function orderCommentsByDocumentStructure(
     return { documentComments, locationComments };
 }
 
-// Helper function to get entity details for display
-function getEntityDetails(entityType: string, entityId: string, regulationData: RegulationData) {
-    switch (entityType) {
-        case 'CHAPTER': {
-            const chapter = regulationData.regulation
-                .filter(item => item.type === 'chapter')
-                .find(chapter => chapter.id === entityId);
+/** The place or section a comment is about, named as the consultation's screens and emails name it. */
+function commentPlace(entityId: string, regulationData: RegulationData, geoSets: GeoSetData[]): string {
+    const display = describeEntity(regulationData, geoSets, entityId);
+    return display ? entityLabel(display) : 'Στοιχείο που δεν υπάρχει πια στη διαβούλευση';
+}
 
-            return {
-                type: 'κεφάλαιο',
-                title: chapter?.title || 'Άγνωστο κεφάλαιο',
-                number: chapter?.num,
-                parentContext: null
-            };
-        }
-        case 'ARTICLE': {
-            for (const chapter of regulationData.regulation.filter(item => item.type === 'chapter')) {
-                const article = chapter.articles?.find(article => article.id === entityId);
-                if (article) {
-                    return {
-                        type: 'άρθρο',
-                        title: article.title,
-                        number: article.num,
-                        parentContext: `κεφάλαιο ${chapter.num}`
-                    };
-                }
-            }
-            return {
-                type: 'άρθρο',
-                title: 'Άγνωστο άρθρο',
-                number: null,
-                parentContext: null
-            };
-        }
-        case 'GEOSET': {
-            const geoset = regulationData.regulation
-                .filter(item => item.type === 'geoset')
-                .find(geoset => geoset.id === entityId);
-
-            return {
-                type: 'γεωγραφικό σύνολο',
-                title: geoset?.name || 'Άγνωστο σύνολο περιοχών',
-                number: null,
-                parentContext: null
-            };
-        }
-        case 'GEOMETRY': {
-            for (const geoset of regulationData.regulation.filter(item => item.type === 'geoset')) {
-                const geometry = geoset.geometries?.find(geometry => geometry.id === entityId);
-                if (geometry) {
-                    return {
-                        type: 'τοποθεσία',
-                        title: geometry.name,
-                        number: null,
-                        parentContext: `γεωγραφικό σύνολο &quot;${geoset.name}&quot;`
-                    };
-                }
-            }
-            return {
-                type: 'τοποθεσία',
-                title: 'Άγνωστη περιοχή',
-                number: null,
-                parentContext: null
-            };
-        }
-        default:
-            return {
-                type: 'στοιχείο',
-                title: 'Άγνωστο στοιχείο',
-                number: null,
-                parentContext: null
-            };
-    }
+/** One comment of the printout, with the municipality's response under it when it has one. */
+function PrintedComment({ comment, place, municipalityName, accent, last }: {
+    comment: ConsultationCommentWithUpvotes;
+    place: string;
+    municipalityName: string;
+    accent: 'blue' | 'green';
+    last: boolean;
+}) {
+    return (
+        <div className={cn("border-l-4 pl-4", accent === 'blue' ? "border-blue-200" : "border-green-200")}>
+            <div className="text-sm font-medium text-gray-900 mb-2">
+                «{place}»,
+                ο χρήστης <span className="font-semibold">{comment.user.name || 'Ανώνυμος'}</span> στις{' '}
+                {formatDate(new Date(comment.createdAt))}:
+            </div>
+            <div
+                className="text-gray-700 prose prose-sm max-w-none"
+                dangerouslySetInnerHTML={{ __html: getSafeCommentHtml(comment.body) }}
+            />
+            {comment.response && (
+                <div className="mt-3 border-l-4 border-orange-200 pl-4">
+                    <div className="text-sm font-medium text-gray-900 mb-2">
+                        Ο {municipalityName} απάντησε στις {formatDate(new Date(comment.response.createdAt))}:
+                    </div>
+                    <div
+                        className="text-gray-700 prose prose-sm max-w-none"
+                        dangerouslySetInnerHTML={{ __html: getSafeCommentHtml(comment.response.body) }}
+                    />
+                </div>
+            )}
+            {!last && <div className="mt-4 border-b border-gray-100"></div>}
+        </div>
+    );
 }
 
 export default async function CommentsPage(props: PageProps) {
@@ -288,11 +258,21 @@ export default async function CommentsPage(props: PageProps) {
 
     // Order comments by document structure
     const { documentComments, locationComments } = orderCommentsByDocumentStructure(comments, regulationData);
+    const geoSets = extractGeoSets(regulationData);
 
     const currentDate = new Date();
     const consultationUrl = `/${params.cityId}/consultation/${params.id}`;
+    const pathElements: PathElement[] = [
+        { name: getLocalizedName(city, params.locale), link: `/${params.cityId}`, city },
+        { name: "Διαβουλεύσεις", link: `/${params.cityId}/consultations` },
+        { name: localizeText(consultation.name, params.locale), link: consultationUrl },
+    ];
 
     return (
+        <>
+        <div className="print:hidden">
+            <Header path={pathElements} currentEntity={{ cityId: city.id }} showExplain={hasExplainPage(realm)} />
+        </div>
         <div className="min-h-screen bg-white">
             {/* Header - visible on screen only */}
             <div className="print:hidden bg-gray-50 border-b p-4">
@@ -339,27 +319,16 @@ export default async function CommentsPage(props: PageProps) {
                         </h2>
 
                         <div className="space-y-6">
-                            {documentComments.map((comment, index) => {
-                                const entityDetails = getEntityDetails(comment.entityType, comment.entityId, regulationData);
-
-                                return (
-                                    <div key={comment.id} className="border-l-4 border-blue-200 pl-4">
-                                        <div className="text-sm font-medium text-gray-900 mb-2">
-                                            Στο {entityDetails.type} {entityDetails.number && `${entityDetails.number} `}
-                                            {entityDetails.parentContext && `(${entityDetails.parentContext})`},
-                                            ο χρήστης <span className="font-semibold">{comment.user.name || 'Ανώνυμος'}</span> στις{' '}
-                                            {formatDate(new Date(comment.createdAt))}:
-                                        </div>
-                                        <div
-                                            className="text-gray-700 prose prose-sm max-w-none"
-                                            dangerouslySetInnerHTML={{ __html: getSafeHtmlContent(comment.body) }}
-                                        />
-                                        {index < documentComments.length - 1 && (
-                                            <div className="mt-4 border-b border-gray-100"></div>
-                                        )}
-                                    </div>
-                                );
-                            })}
+                            {documentComments.map((comment, index) => (
+                                <PrintedComment
+                                    key={comment.id}
+                                    comment={comment}
+                                    place={commentPlace(comment.entityId, regulationData, geoSets)}
+                                    municipalityName={city.name_municipality}
+                                    accent="blue"
+                                    last={index === documentComments.length - 1}
+                                />
+                            ))}
                         </div>
                     </div>
                 )}
@@ -372,27 +341,16 @@ export default async function CommentsPage(props: PageProps) {
                         </h2>
 
                         <div className="space-y-6">
-                            {locationComments.map((comment, index) => {
-                                const entityDetails = getEntityDetails(comment.entityType, comment.entityId, regulationData);
-
-                                return (
-                                    <div key={comment.id} className="border-l-4 border-green-200 pl-4">
-                                        <div className="text-sm font-medium text-gray-900 mb-2">
-                                            Στη {entityDetails.type} &quot;{entityDetails.title}&quot;
-                                            {entityDetails.parentContext && ` του ${entityDetails.parentContext}`},
-                                            ο χρήστης <span className="font-semibold">{comment.user.name || 'Ανώνυμος'}</span> στις{' '}
-                                            {formatDate(new Date(comment.createdAt))}:
-                                        </div>
-                                        <div
-                                            className="text-gray-700 prose prose-sm max-w-none"
-                                            dangerouslySetInnerHTML={{ __html: getSafeHtmlContent(comment.body) }}
-                                        />
-                                        {index < locationComments.length - 1 && (
-                                            <div className="mt-4 border-b border-gray-100"></div>
-                                        )}
-                                    </div>
-                                );
-                            })}
+                            {locationComments.map((comment, index) => (
+                                <PrintedComment
+                                    key={comment.id}
+                                    comment={comment}
+                                    place={commentPlace(comment.entityId, regulationData, geoSets)}
+                                    municipalityName={city.name_municipality}
+                                    accent="green"
+                                    last={index === locationComments.length - 1}
+                                />
+                            ))}
                         </div>
                     </div>
                 )}
@@ -413,5 +371,9 @@ export default async function CommentsPage(props: PageProps) {
                 </div>
             </div>
         </div>
+        <div className="print:hidden">
+            <Footer realm={realm} />
+        </div>
+        </>
     );
 } 

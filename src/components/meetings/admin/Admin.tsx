@@ -2,7 +2,7 @@
 import React from 'react';
 import { Slider } from '@/components/ui/slider';
 import { useTranscriptOptions } from '@/components/meetings/options/OptionsContext';
-import { TaskStatus } from '@prisma/client';
+import type { NotificationBehavior, TaskStatus } from '@prisma/client';
 import { useToast } from '@/hooks/use-toast';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -19,20 +19,31 @@ import { useCouncilMeetingData } from '../CouncilMeetingDataContext';
 import { requestProcessAgenda } from '@/lib/tasks/processAgenda';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import AddMeetingForm from '@/components/meetings/AddMeetingForm';
-import { Pencil, Bell, BellOff } from 'lucide-react';
+import { Pencil, Bell } from 'lucide-react';
 import { Link } from '@/i18n/routing';
 import { LinkOrDrop } from '@/components/ui/link-or-drop';
 import { MeetingExportButtons } from '../MeetingExportButtons';
 import { CreateNotificationModal } from './CreateNotificationModal';
+import { ReleaseMeetingDialog } from './ReleaseMeetingDialog';
 import { useTranslations } from 'next-intl';
 import MeetingOperator from './MeetingOperator';
+import { transcriptionRefusal } from '@/lib/meetingLifecycleRules';
+import { notificationOutcome } from '@/lib/notifications/freshness';
+import { NotificationOutcomeIcon, NotificationOutcomeNote } from '@/components/notifications/NotificationOutcomeNote';
 
 export default function AdminActions({
+    notificationBehavior,
+    editableBodyIds,
 }: {
-    }) {
+    /** The notification setting of the meeting's body, null without a body. The page reads it for an editor; the public meeting does not carry it. */
+    notificationBehavior: NotificationBehavior | null;
+    /** The bodies a body admin may move the meeting to; absent for a city admin. */
+    editableBodyIds?: string[],
+}) {
     const { toast } = useToast();
     const t = useTranslations('admin.adminActions');
     const { meeting, transcript, people, city, subjects } = useCouncilMeetingData();
+    const transcriptionRefused = transcriptionRefusal(meeting) !== null;
     const [isTranscribing, setIsTranscribing] = React.useState(false);
     const [isSummarizing, setIsSummarizing] = React.useState(false);
     const [isProcessingAgenda, setIsProcessingAgenda] = React.useState(false);
@@ -50,14 +61,17 @@ export default function AdminActions({
     const [forceAgenda, setForceAgenda] = React.useState(false);
     const [forceSummarize, setForceSummarize] = React.useState(false);
     const [isNotificationModalOpen, setIsNotificationModalOpen] = React.useState(false);
+    const [isReleaseDialogOpen, setIsReleaseDialogOpen] = React.useState(false);
     const [notificationType, setNotificationType] = React.useState<'beforeMeeting' | 'afterMeeting'>('beforeMeeting');
     React.useEffect(() => {
         setMediaUrl(meeting.youtubeUrl || '');
     }, [meeting.youtubeUrl]);
 
-    const notificationBehavior = meeting.administrativeBody?.notificationBehavior;
-
-    const notificationsEnabled = notificationBehavior && notificationBehavior !== 'NOTIFICATIONS_DISABLED';
+    // What each task would do with email if it succeeded now: the rule the task callback acts on.
+    const notificationFacts = { released: isReleased, dateTime: meeting.dateTime, scheduleStatus: meeting.scheduleStatus, notificationBehavior };
+    const now = new Date();
+    const agendaNotifications = notificationOutcome(notificationFacts, 'processAgenda', now, now);
+    const summaryNotifications = notificationOutcome(notificationFacts, 'summarize', now, now);
     const fetchTaskStatuses = React.useCallback(async () => {
         try {
             const tasks = await getTasksForMeeting(meeting.cityId, meeting.id);
@@ -83,7 +97,15 @@ export default function AdminActions({
     const handleTranscribe = async () => {
         setIsTranscribing(true);
         try {
-            await requestTranscribe(mediaUrl, meeting.id, meeting.cityId, { force: forceTranscribe });
+            const result = await requestTranscribe(mediaUrl, meeting.id, meeting.cityId, { force: forceTranscribe });
+            if (!result.ok) {
+                toast({
+                    title: t('toasts.errorRequestingTranscription.title'),
+                    description: result.message,
+                    variant: 'destructive'
+                });
+                return;
+            }
             toast({
                 title: t('toasts.transcriptionRequested.title'),
                 description: t('toasts.transcriptionRequested.description'),
@@ -112,7 +134,15 @@ export default function AdminActions({
     const handleSummarize = async (force: boolean = false) => {
         setIsSummarizing(true);
         try {
-            await requestSummarize(meeting.cityId, meeting.id, topics.filter(t => t.trim() !== ''), additionalInstructions, { force });
+            const result = await requestSummarize(meeting.cityId, meeting.id, topics.filter(t => t.trim() !== ''), additionalInstructions, { force });
+            if (!result.ok) {
+                toast({
+                    title: t('toasts.errorRequestingSummarization.title'),
+                    description: result.message,
+                    variant: 'destructive'
+                });
+                return;
+            }
             toast({
                 title: t('toasts.summarizationRequested.title'),
                 description: t('toasts.summarizationRequested.description'),
@@ -186,10 +216,29 @@ export default function AdminActions({
         setTopics([...topics, '']);
     };
 
-    const handleReleaseToggle = async () => {
+    const handleReleaseToggle = () => {
+        // A release tells the subscribers; the dialog says what before it happens. Hiding needs no confirmation.
+        if (isReleased) {
+            void setRelease(false);
+        } else {
+            setIsReleaseDialogOpen(true);
+        }
+    };
+
+    const setRelease = async (released: boolean) => {
         try {
-            const updatedMeeting = await toggleMeetingRelease(meeting.cityId, meeting.id, !isReleased);
+            const result = await toggleMeetingRelease(meeting.cityId, meeting.id, released);
+            if (!result.ok) {
+                toast({
+                    title: t('toasts.errorTogglingRelease.title'),
+                    description: result.message,
+                    variant: 'destructive'
+                });
+                return;
+            }
+            const updatedMeeting = result.meeting;
             setIsReleased(updatedMeeting.released);
+            setIsReleaseDialogOpen(false);
             toast({
                 title: updatedMeeting.released ? t('toasts.meetingReleased.title') : t('toasts.meetingUnreleased.title'),
                 description: updatedMeeting.released ? t('toasts.meetingReleased.description') : t('toasts.meetingUnreleased.description'),
@@ -207,7 +256,15 @@ export default function AdminActions({
     const handleProcessAgenda = async (force: boolean = false) => {
         setIsProcessingAgenda(true);
         try {
-            await requestProcessAgenda(agendaUrl, meeting.id, meeting.cityId, { force });
+            const result = await requestProcessAgenda(agendaUrl, meeting.id, meeting.cityId, { force });
+            if (!result.ok) {
+                toast({
+                    title: t('toasts.errorProcessingAgenda.title'),
+                    description: result.message,
+                    variant: 'destructive'
+                });
+                return;
+            }
             toast({
                 title: t('toasts.agendaProcessingRequested.title'),
                 description: t('toasts.agendaProcessingRequested.description'),
@@ -286,7 +343,9 @@ export default function AdminActions({
                         <div className="mt-4 pb-8">
                             <AddMeetingForm
                                 cityId={meeting.cityId}
+                                realm={city.realm}
                                 meeting={meeting}
+                                allowedBodyIds={editableBodyIds}
                                 onSuccess={() => {
                                     // Refresh the page to show updated data
                                     window.location.reload();
@@ -309,7 +368,10 @@ export default function AdminActions({
             <div className="space-x-4">
                 <Popover open={isPopoverOpen} onOpenChange={setIsPopoverOpen}>
                     <PopoverTrigger asChild>
-                        <Button>{t('buttons.transcribe')}</Button>
+                        {/* The server refuses the task too (requestTranscribeInternal). */}
+                        <Button disabled={transcriptionRefused} title={transcriptionRefused ? t('transcribeRefused') : undefined}>
+                            {t('buttons.transcribe')}
+                        </Button>
                     </PopoverTrigger>
                     <PopoverContent className="w-80">
                         <div className="space-y-4">
@@ -319,6 +381,7 @@ export default function AdminActions({
                                 value={mediaUrl}
                                 onChange={(e) => setMediaUrl(e.target.value)}
                                 onUrlChange={(url) => setMediaUrl(url)}
+                                config={{ cityId: meeting.cityId, identifier: meeting.id, kind: 'recording', councilMeetingId: meeting.id }}
                             />
                             <div className="flex items-center justify-between space-x-2 w-full">
                                 <div className="flex items-center space-x-2">
@@ -351,6 +414,7 @@ export default function AdminActions({
                                 value={agendaUrl}
                                 onChange={(e) => setAgendaUrl(e.target.value)}
                                 onUrlChange={(url) => setAgendaUrl(url)}
+                                config={{ cityId: meeting.cityId, identifier: meeting.id, kind: 'agenda', councilMeetingId: meeting.id }}
                             />
                             <div className="flex items-center justify-between space-x-2 w-full">
                                 <div className="flex items-center space-x-2">
@@ -363,9 +427,10 @@ export default function AdminActions({
                                 </div>
                                 <Button onClick={() => handleProcessAgenda(forceAgenda)} disabled={isProcessingAgenda}>
                                     {isProcessingAgenda ? t('buttons.starting') : t('buttons.process')}
-                                    {notificationsEnabled ? <Bell className="ml-1.5 h-3 w-3" /> : <BellOff className="ml-1.5 h-3 w-3 text-amber-500" />}
+                                    <NotificationOutcomeIcon outcome={agendaNotifications} className="ml-1.5 h-3 w-3" />
                                 </Button>
                             </div>
+                            <NotificationOutcomeNote outcome={agendaNotifications} phase="processAgenda" className="text-xs" />
                             {forceAgenda && (
                                 <p className="text-xs text-muted-foreground">{t('forms.forceDescription.processAgenda')}</p>
                             )}
@@ -408,9 +473,10 @@ export default function AdminActions({
                                 </div>
                                 <Button onClick={() => handleSummarize(forceSummarize)} disabled={isSummarizing}>
                                     {isSummarizing ? t('buttons.starting') : t('buttons.summarize')}
-                                    {notificationsEnabled ? <Bell className="ml-1.5 h-3 w-3" /> : <BellOff className="ml-1.5 h-3 w-3 text-amber-500" />}
+                                    <NotificationOutcomeIcon outcome={summaryNotifications} className="ml-1.5 h-3 w-3" />
                                 </Button>
                             </div>
+                            <NotificationOutcomeNote outcome={summaryNotifications} phase="summarize" className="text-xs" />
                             {forceSummarize && (
                                 <p className="text-xs text-muted-foreground">{t('forms.forceDescription.summarize')}</p>
                             )}
@@ -428,11 +494,20 @@ export default function AdminActions({
             <div className="flex items-center space-x-2">
                 <Switch
                     id="release-toggle"
+                    // Releasing opens the confirmation dialog; hiding does not.
+                    aria-haspopup={isReleased ? undefined : 'dialog'}
                     checked={isReleased}
                     onCheckedChange={handleReleaseToggle}
                 />
                 <Label htmlFor="release-toggle">{t('forms.released')}</Label>
             </div>
+            <ReleaseMeetingDialog
+                open={isReleaseDialogOpen}
+                onOpenChange={setIsReleaseDialogOpen}
+                cityId={meeting.cityId}
+                meetingId={meeting.id}
+                onConfirm={() => setRelease(true)}
+            />
         </div>
 
         <div className="mt-6">

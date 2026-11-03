@@ -2,9 +2,12 @@
 import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import Image from 'next/image'
-import { zodResolver } from "@hookform/resolvers/zod"
+import { useValidationMessage, useZodResolver } from "@/hooks/useLocalizedValidation"
 import { useForm } from "react-hook-form"
-import { z } from "zod"
+import type * as z from "zod"
+import { personFormDataSchema, personUpdateFormDataSchema, personFormSchema, type PersonFormOutput } from "@/lib/zod-schemas/person"
+import { toFormData } from "@/lib/utils/formData"
+import { apiErrorMessage } from "@/lib/utils/validationIssues"
 import { Button } from "../../components/ui/button"
 import {
     Form,
@@ -17,7 +20,8 @@ import {
 } from "../../components/ui/form"
 import { Input } from "../../components/ui/input"
 import { SheetClose } from "../../components/ui/sheet"
-import { Party, Person, Role, AdministrativeBody } from '@prisma/client'
+import { Party, Person, Role } from '@prisma/client'
+import type { PublicAdministrativeBody } from '@/lib/db/types'
 import { RoleWithRelations } from '@/lib/db/types'
 import { Loader2, Check, Trash2 } from "lucide-react"
 import { useTranslations } from 'next-intl'
@@ -27,36 +31,27 @@ import InputWithDerivatives from "../../components/InputWithDerivatives"
 import { toPhoneticLatin as toGreeklish } from 'greek-utils'
 import { useToast } from "@/hooks/use-toast"
 import { ImageCropDialog } from "@/components/ui/ImageCropDialog"
-import RolesList from './RolesList'
+import RolesList, { type RoleType } from './RolesList'
 
-const formSchema = z.object({
-    name: z.string().min(2, {
-        message: "Person name must be at least 2 characters.",
-    }),
-    name_en: z.string().min(2, {
-        message: "Person name (English) must be at least 2 characters.",
-    }),
-    name_short: z.string().min(2, {
-        message: "Short name must be at least 2 characters.",
-    }),
-    name_short_en: z.string().min(2, {
-        message: "Short name (English) must be at least 2 characters.",
-    }),
-    image: z.instanceof(File).optional(),
-    profileUrl: z.string().url().optional().or(z.literal('')),
-})
 
 interface PersonFormProps {
     person?: Person & { roles?: RoleWithRelations[] }
     onSuccess?: () => void
     cityId: string,
     parties: Party[]
-    administrativeBodies: AdministrativeBody[]
+    administrativeBodies: PublicAdministrativeBody[]
+    /**
+     * Whether the viewer may change the roles. A person who claimed their own
+     * page edits name and photo only; their form then sends no roles, and the
+     * server keeps the roles as they are.
+     */
+    canEditRoles?: boolean
+    /** The kinds of role the editor offers; see RolesList. */
+    roleTypes?: RoleType[]
 }
 
-export default function PersonForm({ person, parties, administrativeBodies, onSuccess, cityId }: PersonFormProps) {
+export default function PersonForm({ person, parties, administrativeBodies, onSuccess, cityId, canEditRoles = true, roleTypes }: PersonFormProps) {
     const router = useRouter()
-    const [image, setImage] = useState<File | null>(null)
     const [removeImage, setRemoveImage] = useState(false)
     const [cropFile, setCropFile] = useState<File | null>(null)
     const [isSubmitting, setIsSubmitting] = useState(false)
@@ -64,11 +59,12 @@ export default function PersonForm({ person, parties, administrativeBodies, onSu
     const [imagePreview, setImagePreview] = useState<string | null>(person?.image || null)
     const [roles, setRoles] = useState<RoleWithRelations[]>(person?.roles || [])
     const t = useTranslations('PersonForm')
+    const validationMessage = useValidationMessage()
     const { toast } = useToast()
     const nameInputRef = useRef<HTMLInputElement>(null)
 
-    const form = useForm<z.infer<typeof formSchema>>({
-        resolver: zodResolver(formSchema),
+    const form = useForm({
+        resolver: useZodResolver(personFormSchema),
         defaultValues: {
             name: person?.name || "",
             name_en: person?.name_en || "",
@@ -78,32 +74,10 @@ export default function PersonForm({ person, parties, administrativeBodies, onSu
         },
     })
 
-    async function onSubmit(values: z.infer<typeof formSchema>) {
+    async function onSubmit(values: PersonFormOutput) {
         setIsSubmitting(true)
         const url = person ? `/api/cities/${cityId}/people/${person.id}` : `/api/cities/${cityId}/people`
         const method = person ? 'PUT' : 'POST'
-
-        // Validate image size
-        if (image && image.size > 5 * 1024 * 1024) { // 5MB limit
-            toast({
-                title: t('error'),
-                description: 'Image size must be less than 5MB',
-                variant: "destructive",
-            })
-            setIsSubmitting(false)
-            return
-        }
-
-        const formData = new FormData()
-        console.log('Creating FormData object...')
-
-        // Append all form values
-        formData.append('name', values.name)
-        formData.append('name_en', values.name_en)
-        formData.append('name_short', values.name_short)
-        formData.append('name_short_en', values.name_short_en)
-        formData.append('cityId', cityId)
-        formData.append('profileUrl', values.profileUrl || "")
 
         // Clean up roles data before sending
         const cleanRoles = roles.map(role => ({
@@ -120,18 +94,25 @@ export default function PersonForm({ person, parties, administrativeBodies, onSu
             electedOrder: role.electedOrder
         }))
 
-        console.log('Roles to be sent:', cleanRoles)
-        formData.append('roles', JSON.stringify(cleanRoles))
+        if (canEditRoles) {
+            console.log('Roles to be sent:', cleanRoles)
+        }
 
-        // Only append image if it exists and is valid
-        if (image) {
-            console.log('Appending image:', image.name, image.size)
-            formData.append('image', image)
+        const fields = {
+            name: values.name,
+            name_en: values.name_en,
+            name_short: values.name_short,
+            name_short_en: values.name_short_en,
+            profileUrl: values.profileUrl || "",
+            image: values.image,
+            // Signal removal of an existing image
+            removeImage: removeImage && !values.image ? 'true' : undefined,
         }
-        // Signal removal of an existing image
-        if (removeImage && !image) {
-            formData.append('removeImage', 'true')
-        }
+        // A new person needs roles. An edit by a person who may not change
+        // the roles leaves them out, and the server keeps them.
+        const formData = person
+            ? toFormData({ ...fields, roles: canEditRoles ? JSON.stringify(cleanRoles) : undefined } satisfies z.input<typeof personUpdateFormDataSchema>)
+            : toFormData({ ...fields, roles: JSON.stringify(cleanRoles) } satisfies z.input<typeof personFormDataSchema>)
 
         console.log('FormData created, sending request to:', url)
 
@@ -166,7 +147,6 @@ export default function PersonForm({ person, parties, administrativeBodies, onSu
                         image: undefined,
                         profileUrl: "",
                     })
-                    setImage(null)
                     setImagePreview(null)
                     setRemoveImage(false)
                     // Do not reset roles ever, for easier data entry
@@ -179,8 +159,10 @@ export default function PersonForm({ person, parties, administrativeBodies, onSu
                     description: person ? t('personUpdated') : t('personCreated'),
                 })
             } else {
+                // The routes answer { error }: a string for a refused role,
+                // the zod issues for a malformed form.
                 const errorData = await response.json()
-                throw new Error(errorData.message || t('failedToSavePerson'))
+                throw new Error(apiErrorMessage(errorData, response.status, t('failedToSavePerson'), validationMessage))
             }
         } catch (error) {
             console.error('Error in form submission:', error)
@@ -214,7 +196,7 @@ export default function PersonForm({ person, parties, administrativeBodies, onSu
                         <strong className="font-bold">{t('formErrors')}</strong>
                         <ul className="mt-2 list-disc list-inside">
                             {Object.entries(form.formState.errors).map(([key, error]) => (
-                                <li key={key}>{error.message}</li>
+                                <li key={key}>{error.message && validationMessage(error.message)}</li>
                             ))}
                         </ul>
                     </div>
@@ -268,7 +250,7 @@ export default function PersonForm({ person, parties, administrativeBodies, onSu
                                         size="icon"
                                         aria-label="Remove image"
                                         onClick={() => {
-                                            setImage(null)
+                                            form.setValue('image', undefined)
                                             setImagePreview(null)
                                             setRemoveImage(true)
                                         }}
@@ -293,7 +275,8 @@ export default function PersonForm({ person, parties, administrativeBodies, onSu
                     title={t('image')}
                     onCancel={() => setCropFile(null)}
                     onConfirm={(processed) => {
-                        setImage(processed)
+                        // The schema checks the size, and FormMessage shows its message.
+                        form.setValue('image', processed, { shouldValidate: true })
                         setImagePreview(URL.createObjectURL(processed))
                         setRemoveImage(false)
                         setCropFile(null)
@@ -317,17 +300,20 @@ export default function PersonForm({ person, parties, administrativeBodies, onSu
                     )}
                 />
 
-                <div className="space-y-2">
-                    <h3 className="text-lg font-medium">{t('roles')}</h3>
-                    <RolesList
-                        personId={person?.id}
-                        cityId={cityId}
-                        roles={roles}
-                        parties={parties}
-                        administrativeBodies={administrativeBodies}
-                        onUpdate={setRoles}
-                    />
-                </div>
+                {canEditRoles && (
+                    <div className="space-y-2">
+                        <h3 className="text-lg font-medium">{t('roles')}</h3>
+                        <RolesList
+                            personId={person?.id}
+                            cityId={cityId}
+                            roles={roles}
+                            parties={parties}
+                            administrativeBodies={administrativeBodies}
+                            onUpdate={setRoles}
+                            roleTypes={roleTypes}
+                        />
+                    </div>
+                )}
 
                 <div className="flex justify-between">
                     <Button type="submit" disabled={isSubmitting}>

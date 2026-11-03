@@ -1,5 +1,5 @@
 import { createEnv } from "@t3-oss/env-nextjs";
-import { z } from "zod";
+import * as z from "zod";
 
 /**
  * Session-mirror defaults. Both values are a function of where the app runs,
@@ -36,8 +36,8 @@ export const env = createEnv({
    * isn't built with invalid env vars.
    */
   server: {
-    DATABASE_URL: z.string().url(),
-    DIRECT_URL: z.string().url(),
+    DATABASE_URL: z.url(),
+    DIRECT_URL: z.url(),
 
     // Database Initialization (for local Docker setup)
     DATABASE_USER: z.string().optional(),
@@ -46,10 +46,17 @@ export const env = createEnv({
 
     // Auth
     RESEND_API_KEY: z.string().min(1),
+    // Replaces every sender address; see src/lib/email/senders.ts.
+    EMAIL_FROM_OVERRIDE: z.string().min(1).optional(),
     NEXTAUTH_SECRET: z.string().min(1),
-    NEXTAUTH_URL: z.string().url(),
+    NEXTAUTH_URL: z.url(),
     BASIC_AUTH_USERNAME: z.string().optional(),
     BASIC_AUTH_PASSWORD: z.string().optional(),
+    // Sign in with Google. Both unset disables the provider and hides the
+    // button; the magic link keeps working. See docs/environment-variables.md
+    // for the redirect URIs the Google client must list.
+    AUTH_GOOGLE_ID: z.string().optional(),
+    AUTH_GOOGLE_SECRET: z.string().optional(),
     // Session-mirror cookie for the Notis admin (see applySessionMirror in
     // src/proxy.ts). Both default from DEPLOYMENT_ENV + NEXTAUTH_URL — see
     // derivedCookieDomain/derivedCookieSuffix above; set either only to
@@ -75,14 +82,14 @@ export const env = createEnv({
     DO_SPACES_KEY: z.string().min(1),
     DO_SPACES_SECRET: z.string().min(1),
     DO_SPACES_BUCKET: z.string().min(1),
-    CDN_URL: z.string().url(),
+    CDN_URL: z.url(),
 
     // Task Server
-    TASK_API_URL: z.string().url(),
+    TASK_API_URL: z.url(),
     TASK_API_KEY: z.string().min(1),
 
     // Elasticsearch
-    ELASTICSEARCH_URL: z.string().url(),
+    ELASTICSEARCH_URL: z.url(),
     ELASTICSEARCH_API_KEY: z.string().min(1),
     ELASTICSEARCH_INDEX: z.string().default('subjects'), // Override for testing (e.g., 'subjects_test')
 
@@ -97,11 +104,19 @@ export const env = createEnv({
     // subscription through /api/subscriptions/{userId}. Both optional — a
     // deployment without them shows the switch as unavailable and still
     // writes notifyByPhone, which is what the poller enrolls on.
-    NOTIS_API_URL: z.string().url().optional(),
+    NOTIS_API_URL: z.url().optional(),
     NOTIS_SERVICE_TOKEN: z.string().optional(),
 
+    // Bird, for one thing only: the SMS that carries a phone verification
+    // code (src/lib/phone-verification/sms.ts). Every other message to a
+    // reader is Notis's. All optional: without them a development or preview
+    // deployment prints the code to the server log, and production refuses.
+    BIRD_API_KEY: z.string().optional(),
+    BIRD_WORKSPACE_ID: z.string().optional(),
+    BIRD_SMS_CHANNEL_ID: z.string().optional(),
+
     // Discord Admin Alerts
-    DISCORD_WEBHOOK_URL: z.string().url().optional(),
+    DISCORD_WEBHOOK_URL: z.url().optional(),
 
     // Google Calendar Integration (OAuth 2.0)
     GOOGLE_CALENDAR_CLIENT_ID: z.string().optional(),
@@ -117,10 +132,9 @@ export const env = createEnv({
     CACHE_URL: z.string().optional(),
 
     // Development
-    DEV_TEST_CITY_ID: z.string().default('chania'),
-    DEV_EMAIL_OVERRIDE: z.string().email().optional(),
+    DEV_EMAIL_OVERRIDE: z.email().optional(),
     SIMULATE_WHATSAPP_UNAVAILABLE: z.string().optional(),
-    SEED_DATA_URL: z.string().url().default('https://raw.githubusercontent.com/schemalabz/opencouncil-seed-data/refs/heads/main/seed_data.json'),
+    SEED_DATA_URL: z.url().default('https://raw.githubusercontent.com/schemalabz/opencouncil-seed-data/refs/heads/main/seed_data.json'),
     SEED_DATA_PATH: z.string().default('./prisma/seed_data.json'),
   },
 
@@ -131,7 +145,7 @@ export const env = createEnv({
    */
   client: {
     NEXT_PUBLIC_MAPBOX_ACCESS_TOKEN: z.string().min(1),
-    NEXT_PUBLIC_CONTACT_EMAIL: z.string().email().optional(),
+    NEXT_PUBLIC_CONTACT_EMAIL: z.email().optional(),
     NEXT_PUBLIC_CONTACT_ADDRESS: z.string().optional(),
     NEXT_PUBLIC_BUILD_COMMIT_SHA: z.string().optional(),
     // PostHog analytics; unset (or empty) disables analytics entirely.
@@ -149,10 +163,13 @@ export const env = createEnv({
     DATABASE_PASSWORD: process.env.DATABASE_PASSWORD,
     DATABASE_NAME: process.env.DATABASE_NAME,
     RESEND_API_KEY: process.env.RESEND_API_KEY,
+    EMAIL_FROM_OVERRIDE: process.env.EMAIL_FROM_OVERRIDE,
     NEXTAUTH_SECRET: process.env.NEXTAUTH_SECRET,
     NEXTAUTH_URL: process.env.NEXTAUTH_URL,
     BASIC_AUTH_USERNAME: process.env.BASIC_AUTH_USERNAME,
     BASIC_AUTH_PASSWORD: process.env.BASIC_AUTH_PASSWORD,
+    AUTH_GOOGLE_ID: process.env.AUTH_GOOGLE_ID,
+    AUTH_GOOGLE_SECRET: process.env.AUTH_GOOGLE_SECRET,
     SESSION_COOKIE_DOMAIN: process.env.SESSION_COOKIE_DOMAIN ?? derivedCookieDomain(),
     SESSION_COOKIE_SUFFIX: process.env.SESSION_COOKIE_SUFFIX ?? derivedCookieSuffix(),
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
@@ -173,6 +190,9 @@ export const env = createEnv({
     DEPLOYMENT_ENV: process.env.DEPLOYMENT_ENV,
     NOTIS_API_URL: process.env.NOTIS_API_URL,
     NOTIS_SERVICE_TOKEN: process.env.NOTIS_SERVICE_TOKEN,
+    BIRD_API_KEY: process.env.BIRD_API_KEY,
+    BIRD_WORKSPACE_ID: process.env.BIRD_WORKSPACE_ID,
+    BIRD_SMS_CHANNEL_ID: process.env.BIRD_SMS_CHANNEL_ID,
     DISCORD_WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL,
     GOOGLE_CALENDAR_CLIENT_ID: process.env.GOOGLE_CALENDAR_CLIENT_ID,
     GOOGLE_CALENDAR_CLIENT_SECRET: process.env.GOOGLE_CALENDAR_CLIENT_SECRET,
@@ -181,7 +201,6 @@ export const env = createEnv({
     GOOGLE_CALENDAR_ENABLED: process.env.GOOGLE_CALENDAR_ENABLED,
     CRON_SECRET: process.env.CRON_SECRET,
     CACHE_URL: process.env.CACHE_URL,
-    DEV_TEST_CITY_ID: process.env.DEV_TEST_CITY_ID,
     DEV_EMAIL_OVERRIDE: process.env.DEV_EMAIL_OVERRIDE,
     SIMULATE_WHATSAPP_UNAVAILABLE: process.env.SIMULATE_WHATSAPP_UNAVAILABLE,
     SEED_DATA_URL: process.env.SEED_DATA_URL,

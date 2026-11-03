@@ -1,7 +1,9 @@
-import { NextRequest } from 'next/server';
 import { Prisma } from '@prisma/client';
 import prisma from './prisma';
-import { isUserAuthorizedToEdit, validateBearerAuth } from '../auth';
+import { isUserAuthorizedToEdit } from '../auth';
+import { meetingLabelInCity } from '@/lib/meetingName';
+import { meetingNameSelect } from '@/lib/db/types';
+import { transcriptGateSelect, transcriptIsPublic } from '@/lib/db/sharing/publicContent';
 
 const neighborSelect = {
     id: true,
@@ -36,7 +38,6 @@ const toNeighbor = (u: NeighborRow): UtteranceContextNeighbor => ({
 });
 
 export async function getUtteranceContext(
-    request: NextRequest,
     utteranceId: string,
     before: number,
     after: number
@@ -51,7 +52,13 @@ export async function getUtteranceContext(
                     meetingId: true,
                     cityId: true,
                     meeting: {
-                        select: { name: true, dateTime: true, released: true },
+                        select: {
+                            ...meetingNameSelect,
+                            ...transcriptGateSelect,
+                            administrativeBody: { select: { ...meetingNameSelect.administrativeBody.select, ...transcriptGateSelect.administrativeBody.select } },
+                            released: true,
+                            city: { select: { timezone: true } },
+                        },
                     },
                 },
             },
@@ -62,9 +69,10 @@ export async function getUtteranceContext(
 
     const { meetingId, cityId, meeting } = target.speakerSegment;
 
-    if (!meeting.released) {
-        const bearer = await validateBearerAuth(request);
-        if (!bearer && !(await isUserAuthorizedToEdit({ cityId }))) {
+    // A reader gets the context of a public transcript only. An editor of the
+    // city also gets a draft or a closed one.
+    if (!meeting.released || !transcriptIsPublic(meeting)) {
+        if (!(await isUserAuthorizedToEdit({ cityId, councilMeetingId: meetingId }))) {
             return null;
         }
     }
@@ -114,7 +122,7 @@ export async function getUtteranceContext(
         meeting: {
             id: meetingId,
             cityId,
-            name: meeting.name,
+            name: meetingLabelInCity(meeting, 'el'),
             dateTime: meeting.dateTime.toISOString(),
         },
         before: beforeRows.slice().reverse().map(toNeighbor),

@@ -9,7 +9,7 @@ import { useCouncilMeetingData } from '@/components/meetings/CouncilMeetingDataC
 import { getLocalizedName } from '@/lib/formatters/name';
 import { formatDate } from '@/lib/formatters/time';
 import { localizeText } from '@/lib/serbian';
-import { digestExcerpt, excerptPath, excerptSourceIsVisible, type ExcerptSelector, type ExcerptSource } from '@/lib/sharing/excerptSelector';
+import { digestExcerpt, excerptSourceIsVisible, transcriptExcerptPath, type ExcerptSelector, type ExcerptSource } from '@/lib/sharing/excerptSelector';
 import { useTranscriptOptions } from '@/components/meetings/options/OptionsContext';
 import { useMediaQuery } from '@/hooks/use-media-query';
 import { toolbarPlacement } from '@/lib/sharing/toolbarPlacement';
@@ -19,14 +19,16 @@ import { ContentShareDialog } from './ContentShareDialog';
 import { ExcerptQuote, excerptQuoteText } from './ExcerptQuote';
 import { TranscriptReviewNotice } from './TranscriptReviewNotice';
 import { storyImagePath } from '@/lib/sharing/story';
-import { majoritySubject, nearestSubject } from '@/lib/sharing/passageSubject';
+import { subjectOfPassage } from '@/lib/sharing/passageSubject';
 import { captureSharingEvent } from '@/lib/analytics/sharing';
+import { meetingLabel } from '@/lib/meetingName';
 
 export const EXCERPT_SHARE_EVENT = 'oc:share-excerpt';
 export type ExcerptShareEventDetail = { range: Range | null; utteranceId: string } | { utteranceIds: string[] };
-export function useExcerptSources() {
+export function useExcerptSources(textLocale?: AppLocale) {
     const { transcript, getPerson, getSpeakerTag, speakerTags } = useCouncilMeetingData();
-    const locale = useLocale();
+    const uiLocale = useLocale();
+    const locale = textLocale ?? uiLocale;
     return useMemo<ExcerptSource[]>(() => transcript.flatMap(segment => {
         const tag = getSpeakerTag(segment.speakerTagId) ?? segment.speakerTag;
         const person = tag.personId ? getPerson(tag.personId) : null;
@@ -70,24 +72,8 @@ export function ExcerptSelectionToolbar({ rootRef, disabled, editable }: { rootR
     const [error, setError] = useState('');
     const openRef = useRef(false);
     openRef.current = open;
-    // The subject the share page and its images will name, by the rules the server applies (passageSubject.ts).
-    const selectedSubject = useMemo(() => {
-        if (!active) return null;
-        const byId = (id: string | null) => (id && subjects.find(subject => subject.id === id)) || null;
-        const utterances = transcript.flatMap(segment => segment.utterances);
-        const selectedIds = new Set(active.runs.map(run => run.id));
-        const selected = utterances.filter(utterance => selectedIds.has(utterance.id));
-        const majority = majoritySubject(selected.map(utterance => byId(utterance.discussionSubjectId)));
-        if (majority) return majority;
-        const passage = { start: Math.min(...selected.map(u => u.startTimestamp)), end: Math.max(...selected.map(u => u.startTimestamp)) };
-        const neighbour = (utterance: { startTimestamp: number; discussionSubjectId: string | null } | undefined) => {
-            const subject = utterance ? byId(utterance.discussionSubjectId) : null;
-            return utterance && subject ? { at: utterance.startTimestamp, subject } : null;
-        };
-        const assigned = utterances.filter(utterance => utterance.discussionSubjectId);
-        const nearest = nearestSubject(passage, neighbour(assigned.filter(u => u.startTimestamp < passage.start).at(-1)), neighbour(assigned.find(u => u.startTimestamp > passage.end)));
-        return nearest ?? (subjects.length === 1 ? subjects[0] : null);
-    }, [active, transcript, subjects]);
+    // The subject the link preview and its images will name, by the rules the server applies (passageSubject.ts).
+    const selectedSubject = useMemo(() => active && subjectOfPassage(transcript.flatMap(segment => segment.utterances), new Set(active.runs.map(run => run.id)), subjects, maxUtteranceDrift), [active, transcript, subjects, maxUtteranceDrift]);
     const context = `${getLocalizedName(city, locale)} · ${formatDate(meeting.dateTime, city.timezone, locale)}`;
 
     const openSelection = useCallback(async (captured: SelectionResult, surface: 'transcript_selection' | 'transcript_context_menu' | 'transcript_segment' = 'transcript_selection') => {
@@ -104,7 +90,7 @@ export function ExcerptSelectionToolbar({ rootRef, disabled, editable }: { rootR
                 cityId: city.id, meetingId: meeting.id, firstUtteranceId: value.firstUtteranceId, lastUtteranceId: value.lastUtteranceId,
                 textLocale: locale, digest: await digestExcerpt(value.runs), maxDrift: maxUtteranceDrift,
             };
-            setActive(value); setWholeSegment(isSegment); setShareSurface(surface); setUrl(new URL(excerptPath(selector), window.location.origin).href); setOpen(true);
+            setActive(value); setWholeSegment(isSegment); setShareSurface(surface); setUrl(new URL(transcriptExcerptPath(selector), window.location.origin).href); setOpen(true);
             setStoryImageUrl(storyImagePath({ type: 'excerpt', selector }));
         } catch { setError(t('selectionInvalid')); }
         finally { setPending(false); }
@@ -161,11 +147,11 @@ export function ExcerptSelectionToolbar({ rootRef, disabled, editable }: { rootR
         {(error || selection.status === 'too-long') && !open && <div role="status" className="fixed bottom-5 left-1/2 z-40 w-[calc(100%-2rem)] max-w-md -translate-x-1/2 border bg-background p-4 text-sm shadow-lg">{error || t('selectionTooLong')}</div>}
         <ContentShareDialog open={open} onOpenChange={setOpen} title={t(wholeSegment ? 'shareSegment' : 'shareExcerpt')} description={t('excerptDescription')} url={url} storyImageUrl={storyImageUrl}
             analytics={{ content_type: wholeSegment ? 'segment' : 'excerpt', surface: shareSurface, city_id: city.id, meeting_id: meeting.id, subject_id: selectedSubject?.id, locale, editable, reviewed: taskStatus.humanReview, utterance_count: active?.runs.length, character_count: active?.runs.reduce((total, run) => total + run.text.length, 0) }}
-            sourceText={active ? [reviewNotice, `${excerptQuoteText(active.runs, t('unknownSpeaker'))}\n${context}\n${getLocalizedName(meeting, locale)}`].filter(Boolean).join('\n\n') : ''} copyTextLabel={t('copyQuote')}>
+            sourceText={active ? [reviewNotice, `${excerptQuoteText(active.runs, t('unknownSpeaker'))}\n${context}\n${meetingLabel(meeting, locale, city.timezone, { date: false })}`].filter(Boolean).join('\n\n') : ''} copyTextLabel={t('copyQuote')}>
             {active && <div className="space-y-5">
-                <p className="text-xs font-medium leading-5 text-muted-foreground">{selectedSubject?.name ?? getLocalizedName(meeting, locale)}<br />{context}</p>
+                <p className="text-xs font-medium leading-5 text-muted-foreground">{selectedSubject?.name ?? meetingLabel(meeting, locale, city.timezone, { date: false })}<br />{context}</p>
                 {reviewNotice && <TranscriptReviewNotice text={reviewNotice} />}
-                <div className="max-h-[35dvh] overflow-y-auto pr-1"><ExcerptQuote runs={active.runs} unknownSpeaker={t('unknownSpeaker')} compact /></div>
+                <div className="max-h-[35dvh] overflow-y-auto pr-1"><ExcerptQuote runs={active.runs} unknownSpeaker={t('unknownSpeaker')} /></div>
                 <p className="text-xs leading-5 text-muted-foreground">{t('wholePassages')}{editable && <span className="mt-1 block">{t('savedTextOnly')}</span>}</p>
             </div>}
         </ContentShareDialog>

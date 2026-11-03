@@ -18,7 +18,17 @@
     "pilot": {
       "france": "We are looking for our first pilot municipality in France",
       "serbia": "We are looking for our first pilot municipality in Serbia",
-      "cyprus": "We are looking for our first pilot municipality in Cyprus"
+      "cyprus": "We are looking for our first pilot municipality in Cyprus",
+      "austria": "We are looking for our first pilot municipality in Austria",
+      "belgium": "We are looking for our first pilot municipality in Belgium",
+      "finland": "We are looking for our first pilot municipality in Finland",
+      "germany": "We are looking for our first pilot municipality in Germany",
+      "italy": "We are looking for our first pilot municipality in Italy",
+      "netherlands": "We are looking for our first pilot municipality in the Netherlands",
+      "poland": "We are looking for our first pilot municipality in Poland",
+      "portugal": "We are looking for our first pilot municipality in Portugal",
+      "spain": "We are looking for our first pilot municipality in Spain",
+      "default": "We are looking for our first pilot municipality"
     },
     "title": "Municipal councils and committees,",
     "titleHighlight": "open to everyone",
@@ -125,28 +135,28 @@
     "awardsTitle": "Awards and mentions",
     "items": {
       "ministryAward": {
-        "title": "Ministry of Digital Governance Award",
-        "subtitle": "Best Applied Idea, Local Government"
+        "title": "Digital Governance Award",
+        "subtitle": "Best Applied Idea in Local Government, from the Greek Ministry of Digital Governance."
       },
       "epsa": {
-        "title": "EPSA 2025-26",
-        "subtitle": "Best Practice Certificate"
+        "title": "Good Practice Certificate",
+        "subtitle": "European Public Sector Award 2025–26, EIPA"
       },
       "innovationInPolitics": {
-        "title": "Innovation in Politics Awards 2026",
-        "subtitle": "Finalist"
+        "title": "Finalist",
+        "subtitle": "Innovation in Politics Awards 2026"
+      },
+      "guangzhou": {
+        "title": "Finalist",
+        "subtitle": "7th Guangzhou International Award for Urban Innovation"
       },
       "oecd": {
-        "title": "OECD",
-        "subtitle": "Cited in a report on AI in government"
-      },
-      "kede": {
-        "title": "KEDE",
-        "subtitle": "Article on OpenCouncil in Chania"
+        "title": "OpenCouncil in the OECD.AI Policy Navigator",
+        "subtitle": "the OECD catalogue of AI in the public sector"
       },
       "wired": {
-        "title": "WIRED Greece",
-        "subtitle": "Article"
+        "title": "“AI and municipal councils, at the edge of Greece”",
+        "subtitle": "a WIRED Greece report from Orestiada"
       }
     }
   },
@@ -226,7 +236,17 @@
     "title": {
       "france": "Become the first pilot municipality in France.",
       "serbia": "Become the first pilot municipality in Serbia.",
-      "cyprus": "Become the first pilot municipality in Cyprus."
+      "cyprus": "Become the first pilot municipality in Cyprus.",
+      "austria": "Become the first pilot municipality in Austria.",
+      "belgium": "Become the first pilot municipality in Belgium.",
+      "finland": "Become the first pilot municipality in Finland.",
+      "germany": "Become the first pilot municipality in Germany.",
+      "italy": "Become the first pilot municipality in Italy.",
+      "netherlands": "Become the first pilot municipality in the Netherlands.",
+      "poland": "Become the first pilot municipality in Poland.",
+      "portugal": "Become the first pilot municipality in Portugal.",
+      "spain": "Become the first pilot municipality in Spain.",
+      "default": "Become our first pilot municipality."
     },
     "subtitle": "We are looking for one municipality to launch OpenCouncil in your country. The pilot is free, for as long as it takes.",
     "points": {
@@ -588,6 +608,10 @@
     "positionPlaceholder": "e.g. Director of Council Support",
     "municipality": "Municipality",
     "municipalityPlaceholder": "Municipality name",
+    "phone": "Phone",
+    "phonePlaceholder": "Your phone number",
+    "phoneInvalid": "That number does not look right.",
+    "optional": "optional",
     "submit": "Request a presentation",
     "thankYou": "Thank you!",
     "thankYouMessage": "We'll get back to you at <strong>{email}</strong> shortly.",

@@ -1,6 +1,7 @@
 'use client';
 import type { ComponentType, ReactNode } from 'react';
-import { Bell, FileText, ScrollText, Youtube } from 'lucide-react';
+import { Bell, FileText, ScrollText } from 'lucide-react';
+import { SiYoutube } from 'react-icons/si';
 import { useLocale, useTranslations } from 'next-intl';
 import { Link } from '@/i18n/routing';
 import { captureEvent } from '@/lib/analytics/capture';
@@ -8,11 +9,12 @@ import { useTranscriptOptions } from '@/components/meetings/options/OptionsConte
 import { useCouncilMeetingData } from '@/components/meetings/CouncilMeetingDataContext';
 import { useNotificationPreference } from '@/contexts/NotificationPreferenceContext';
 import { formatClockTime, formatDate, formatWeekdayDateTime } from '@/lib/formatters/time';
-import { meetingStageExplainHref, type PublicMeetingStage } from '@/lib/meetingStage';
+import { presentationExplainHref, type PresentationKey, type PublicMeetingPresentation } from '@/lib/meetingPresentation';
+import { hasPublicRecording } from '@/lib/meetingLifecycleRules';
 import { cn } from '@/lib/utils';
 import { StageRing } from './StageRing';
 
-type StripStage = Exclude<PublicMeetingStage, 'complete'>;
+type StripStage = Exclude<PresentationKey, 'complete'>;
 
 /** The strip's wash. Review shares the transcript banner's yellow: it is the same promise. */
 const TINT: Record<StripStage, string> = {
@@ -22,6 +24,9 @@ const TINT: Record<StripStage, string> = {
     transcribing: 'border-border bg-muted/70 text-muted-foreground',
     review: 'border-yellow-500/50 bg-yellow-50 text-yellow-800',
     archive: 'border-border bg-card text-muted-foreground',
+    postponed: 'border-[hsl(var(--orange))]/25 bg-[hsl(var(--orange))]/[0.06] text-[hsl(var(--orange-deep))]',
+    cancelled: 'border-destructive/25 bg-destructive/5 text-destructive',
+    noRecording: 'border-border bg-card text-muted-foreground',
 };
 
 type PillVariant = 'outline' | 'primary' | 'live';
@@ -37,7 +42,7 @@ const PILL: Record<PillVariant, string> = {
  * — no rail, no icon disc, no title — the family of the transcript's yellow
  * banner, tinted by stage. Nothing renders once the meeting is complete.
  */
-export function MeetingStageStrip({ stage, deadline }: { stage: PublicMeetingStage; deadline: Date | null }) {
+export function MeetingStageStrip({ presentation, stage, deadline }: { presentation: PublicMeetingPresentation; stage: PresentationKey; deadline: Date | null }) {
     const t = useTranslations('meetingStage');
     const tMeeting = useTranslations('CouncilMeeting');
     const locale = useLocale();
@@ -51,9 +56,10 @@ export function MeetingStageStrip({ stage, deadline }: { stage: PublicMeetingSta
 
     const date = new Date(meeting.dateTime);
     const timezone = city.timezone;
-    const channel = meeting.administrativeBody?.youtubeChannelUrl ?? null;
+    // A meeting by circulation has no stream to point to, also before it starts.
+    const channel = hasPublicRecording(meeting) ? meeting.administrativeBody?.youtubeChannelUrl ?? null : null;
     const video = meeting.youtubeUrl ?? null;
-    const explainHref = meetingStageExplainHref(city.realm, stage);
+    const explainHref = presentationExplainHref(city.realm, presentation);
     const track = (action: string) =>
         captureEvent('meeting_page_action', { action, city_id: meeting.cityId, meeting_id: meeting.id, stage });
 
@@ -80,10 +86,10 @@ export function MeetingStageStrip({ stage, deadline }: { stage: PublicMeetingSta
         </Link>
     );
     const channelPill = channel
-        ? pill('channel', t('actions.channel'), 'youtube_channel', channel, Youtube, { external: true, iconClass: 'text-red-600' })
+        ? pill('channel', t('actions.channel'), 'youtube_channel', channel, SiYoutube, { external: true, iconClass: 'text-red-600' })
         : null;
     const videoPill = video
-        ? pill('video', t('actions.video'), 'youtube_video', video, Youtube, { external: true, iconClass: 'text-red-600' })
+        ? pill('video', t('actions.video'), 'youtube_video', video, SiYoutube, { external: true, iconClass: 'text-red-600' })
         : null;
     const agendaPill = meeting.agendaUrl
         ? pill('agenda', tMeeting('agendaDocument'), 'agenda_pdf', meeting.agendaUrl, FileText, { external: true })
@@ -99,16 +105,20 @@ export function MeetingStageStrip({ stage, deadline }: { stage: PublicMeetingSta
     let actions: ReactNode[];
     switch (stage) {
         case 'upcoming':
-            text = t.rich(subjects.length > 0 ? 'strip.upcoming' : 'strip.upcomingNoAgenda', {
-                when: formatWeekdayDateTime(date, timezone, locale),
-                b: (chunks: ReactNode) => <strong className="font-semibold">{chunks}</strong>,
-            });
+            text = t.rich(
+                subjects.length === 0 ? 'strip.upcomingNoAgenda'
+                    : hasPublicRecording(meeting) ? 'strip.upcoming' : 'strip.upcomingByCirculation',
+                {
+                    when: formatWeekdayDateTime(date, timezone, locale),
+                    b: (chunks: ReactNode) => <strong className="font-semibold">{chunks}</strong>,
+                },
+            );
             actions = [channelPill, agendaPill, notifyPill];
             break;
         case 'live':
             text = t('strip.live', { time: formatClockTime(date, timezone, locale) });
             actions = [
-                liveUrl ? pill('watchLive', t('actions.watchLive'), 'watch_live', liveUrl, Youtube, { variant: 'live', external: true }) : null,
+                liveUrl ? pill('watchLive', t('actions.watchLive'), 'watch_live', liveUrl, SiYoutube, { variant: 'live', external: true }) : null,
                 notifyPill,
             ];
             break;
@@ -139,6 +149,22 @@ export function MeetingStageStrip({ stage, deadline }: { stage: PublicMeetingSta
         case 'archive':
             text = t('strip.archive');
             actions = [videoPill, agendaPill];
+            break;
+        case 'postponed':
+        case 'cancelled': {
+            const reason = presentation.type === stage ? presentation.reason : null;
+            text = (
+                <>
+                    {t(`strip.${stage}`, { date: formatDate(date, timezone, locale) })}
+                    {reason && <> {t('strip.reason', { reason })}</>}
+                </>
+            );
+            actions = [agendaPill];
+            break;
+        }
+        case 'noRecording':
+            text = t('strip.byCirculation');
+            actions = [agendaPill];
             break;
     }
     const shown = actions.filter(Boolean);

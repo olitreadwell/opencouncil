@@ -5,8 +5,12 @@ import {
     getAdministrativeBodyTypesForPeople,
     getBodiesOfTypeFromMeetings,
     getBodiesOfTypeFromPeople,
-    filterMeetingByAdminBodyTypes,
     filterPersonByAdminBodyTypes,
+    ADMIN_BODY_TYPE_ORDER,
+    isAdministrativeBodyType,
+    toAdministrativeBodyType,
+    getBodyOptions,
+    personSitsOnBody,
 } from '../administrativeBodies';
 
 function makeAdminBody(overrides: Partial<AdministrativeBody> = {}): AdministrativeBody {
@@ -21,6 +25,8 @@ function makeAdminBody(overrides: Partial<AdministrativeBody> = {}): Administrat
         youtubeChannelUrl: null,
         contactEmails: [],
         diavgeiaUnitIds: [],
+        decisionConventions: null,
+        place: null,
         createdAt: new Date('2020-01-01'),
         updatedAt: new Date('2020-01-01'),
         ...overrides,
@@ -162,24 +168,6 @@ describe('getBodiesOfTypeFromPeople', () => {
 
 // --- Filters ---
 
-describe('filterMeetingByAdminBodyTypes', () => {
-    it('returns true when selectedTypes is empty (show all)', () => {
-        expect(filterMeetingByAdminBodyTypes(makeMeeting(councilBody), [])).toBe(true);
-    });
-
-    it('returns false for a meeting with no admin body', () => {
-        expect(filterMeetingByAdminBodyTypes(makeMeeting(null), ['council'])).toBe(false);
-    });
-
-    it('returns true when meeting type matches', () => {
-        expect(filterMeetingByAdminBodyTypes(makeMeeting(councilBody), ['council'])).toBe(true);
-    });
-
-    it('returns false when meeting type does not match', () => {
-        expect(filterMeetingByAdminBodyTypes(makeMeeting(councilBody), ['community'])).toBe(false);
-    });
-});
-
 describe('filterPersonByAdminBodyTypes', () => {
     it('returns true when selectedTypes is empty (show all)', () => {
         const person = makePerson([{ administrativeBody: councilBody }]);
@@ -231,5 +219,65 @@ describe('filterPersonByAdminBodyTypes', () => {
         ]);
         expect(filterPersonByAdminBodyTypes(person, ['committee'])).toBe(false);
         expect(filterPersonByAdminBodyTypes(person, ['council'])).toBe(true);
+    });
+});
+
+describe('administrative body type guards', () => {
+    it('accepts every type of the Prisma enum and nothing else', () => {
+        for (const type of Object.values(AdministrativeBodyType)) {
+            expect(isAdministrativeBodyType(type)).toBe(true);
+            expect(toAdministrativeBodyType(type)).toBe(type);
+        }
+        expect(isAdministrativeBodyType('κοινότητα')).toBe(false);
+        expect(isAdministrativeBodyType(undefined)).toBe(false);
+        expect(toAdministrativeBodyType('')).toBeUndefined();
+    });
+
+    // A type added to the enum (a youth body, say) must also get a place in
+    // the order every list of bodies uses, or it sorts after "no seat".
+    it('orders every type of the Prisma enum', () => {
+        expect([...ADMIN_BODY_TYPE_ORDER].sort()).toEqual([...Object.values(AdministrativeBodyType)].sort());
+    });
+});
+
+describe('getBodyOptions', () => {
+    it('lists each body once, council first, then by type and by name', () => {
+        expect(getBodyOptions([communityBodyA, councilBody, null, communityBodyB, committeeBody, councilBody])).toEqual([
+            { value: 'council-1', label: 'Δημοτικό Συμβούλιο' },
+            { value: 'committee-1', label: 'Επιτροπή Α' },
+            { value: 'community-2', label: 'Κοινότητα Α' },
+            { value: 'community-1', label: 'Κοινότητα Β' },
+        ]);
+    });
+});
+
+describe('personSitsOnBody', () => {
+    it('takes the active seat on that body only', () => {
+        const member = makePerson([{ administrativeBody: communityBodyA }]);
+        expect(personSitsOnBody(member, communityBodyA)).toBe(true);
+        expect(personSitsOnBody(member, communityBodyB)).toBe(false);
+        const former = makePerson([{ administrativeBody: communityBodyA, endDate: new Date('2021-01-01') }]);
+        expect(personSitsOnBody(former, communityBodyA)).toBe(false);
+    });
+
+    it('seats a city-level role with the council and nowhere else', () => {
+        const deputyMayor = makePerson([{ administrativeBody: null, cityId: 'city-1' }]);
+        expect(personSitsOnBody(deputyMayor, councilBody)).toBe(true);
+        expect(personSitsOnBody(deputyMayor, committeeBody)).toBe(false);
+    });
+
+    // One council rule for both filters: the page's body chip and the city
+    // page's type chip must agree on who is in the council's view.
+    it('agrees with the type filter on the council', () => {
+        const people = [
+            makePerson([{ administrativeBody: councilBody }]),
+            makePerson([{ administrativeBody: null, cityId: 'city-1' }]),
+            makePerson([{ administrativeBody: committeeBody }]),
+            makePerson([{ administrativeBody: councilBody, endDate: new Date('2021-01-01') }]),
+            makePerson([{ administrativeBody: communityBodyA }]),
+        ];
+        for (const person of people) {
+            expect(personSitsOnBody(person, councilBody)).toBe(filterPersonByAdminBodyTypes(person, ['council']));
+        }
     });
 });

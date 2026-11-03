@@ -5,20 +5,23 @@
 import "server-only";
 
 import { getTranscript } from "./transcript";
-import { getPeopleForMeeting } from "./people";
+import { getPeopleWhoMaySpeak } from "./people";
 import { getPartiesForCity } from "./parties";
 import { getTopics } from "./topics";
 import { getCity } from "./cities";
 import { getCouncilMeetingDirect } from "./meetings";
-import { RequestOnTranscript, SummarizeRequest, SummarizeResult, TranscribeRequest, Subject } from "../apiTypes";
+import { FixTranscriptRequest, RequestOnTranscript, RosterPerson, SummarizeRequest, SummarizeResult, TranscribeRequest, Subject } from "../apiTypes";
+import { buildSpeakerRoster, describeRolesAt } from "@/lib/tasks/speakerRoster";
 import prisma from "./prisma";
 import { getSubjectsForMeeting, extractUtteranceIdsFromContributions } from "./subject";
 import { DiscussionStatus, Subject as DbSubject } from "@prisma/client";
-import { getPartyFromRoles, getRoleNameForPerson } from "../utils";
+import { getPartyFromRoles } from "../utils";
 import { roleWithRelationsInclude } from "./types";
-import { categorizeSubjectsForUpsert } from "./subject-helpers";
+import { agendaDescriptionsByRowId, categorizeSubjectsForUpsert } from "./subject-helpers";
+import { getLatestProcessAgendaSubjects } from "./tasksInternal";
 import { getRealmCountry } from "@/lib/realm";
 import { getCityRealm } from "./cityRealm";
+import { getRoleTitles } from "@/i18n/roleTitles";
 
 // discussionStatus arrives from the external task server, so it is validated before it
 // reaches Prisma. An unknown value is a PrismaClientValidationError, which would abort the
@@ -29,8 +32,15 @@ const VALID_DISCUSSION_STATUSES = new Set<string>(Object.values(DiscussionStatus
 // Type for the Prisma interactive transaction client
 type PrismaTxClient = Omit<typeof prisma, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>;
 
-export async function getRequestOnTranscriptRequestBody(councilMeetingId: string, cityId: string): Promise<Omit<RequestOnTranscript, 'callbackUrl'>> {
-    const transcript = await getTranscript(councilMeetingId, cityId, { joinAdjacentSameSpeakerSegments: true });
+export async function getRequestOnTranscriptRequestBody(
+    councilMeetingId: string,
+    cityId: string,
+    { keepSpeakerTagsApart = false }: { keepSpeakerTagsApart?: boolean } = {}
+): Promise<Omit<RequestOnTranscript, 'callbackUrl'>> {
+    const transcript = await getTranscript(councilMeetingId, cityId, {
+        joinAdjacentSameSpeakerSegments: true,
+        joinSameSpeakerTagOnly: keepSpeakerTagsApart,
+    });
     // Ungated: the task-server callback carries no session (see getCouncilMeetingDirect).
     const councilMeeting = await getCouncilMeetingDirect(cityId, councilMeetingId);
 
@@ -51,14 +61,15 @@ export async function getRequestOnTranscriptRequestBody(councilMeetingId: string
         })
         : [];
 
-    // People filtered by meeting's administrative body (for LLM context)
-    const meetingPeople = await getPeopleForMeeting(cityId, councilMeeting.administrativeBodyId);
+    // The people who may speak at this meeting (for LLM context)
+    const meetingPeople = await getPeopleWhoMaySpeak(cityId, councilMeeting.administrativeBodyId, councilMeeting.dateTime);
     const parties = await getPartiesForCity(cityId);
     const city = await getCity(cityId);
 
     if (!city) {
         throw new Error('City not found');
     }
+    const roleTitles = await getRoleTitles(city.language);
 
     // Realm-scoped taxonomy — use the city's realm, not a global topic set.
     const topics = await getTopics(city.realm);
@@ -67,13 +78,14 @@ export async function getRequestOnTranscriptRequestBody(councilMeetingId: string
         transcript: transcript.map(segment => {
             const speakerTag = segment.speakerTag;
             const person = identifiedPeople.find(p => p.id === speakerTag.personId);
-            const party = person ? getPartyFromRoles(person.roles) : null;
+            const party = person ? getPartyFromRoles(person.roles, councilMeeting.dateTime) : null;
 
             return {
                 speakerName: person?.name || speakerTag.label,
                 speakerParty: party?.name || null,
-                speakerRole: person ? getRoleNameForPerson(person.roles, councilMeeting.dateTime, councilMeeting.administrativeBodyId) || null : null,
+                speakerRole: person ? describeRolesAt(person.roles, councilMeeting.dateTime, councilMeeting.administrativeBodyId, roleTitles) : null,
                 speakerSegmentId: segment.id,
+                speakerTagId: segment.speakerTagId,
                 speakerId: person?.id || null,
                 text: segment.utterances.map(u => u.text).join(' '),
                 utterances: segment.utterances.map(u => ({
@@ -90,6 +102,8 @@ export async function getRequestOnTranscriptRequestBody(councilMeetingId: string
         // Scopes geocoding of subject locations to the right country.
         country: getRealmCountry(city.realm),
         administrativeBodyName: councilMeeting.administrativeBody?.name || null,
+        people: buildSpeakerRoster(meetingPeople, councilMeeting.dateTime, councilMeeting.administrativeBodyId, roleTitles),
+        // For a task server that predates `people`: the same people by party.
         partiesWithPeople: parties.map(p => ({
             name: p.name,
             people: meetingPeople.filter(person => {
@@ -98,12 +112,22 @@ export async function getRequestOnTranscriptRequestBody(councilMeetingId: string
             }).map((person) => {
                 return {
                     name: person.name,
-                    role: getRoleNameForPerson(person.roles, councilMeeting.dateTime, councilMeeting.administrativeBodyId)
+                    role: describeRolesAt(person.roles, councilMeeting.dateTime, councilMeeting.administrativeBodyId, roleTitles) ?? ''
                 }
             })
         })),
         date: councilMeeting.dateTime.toISOString().split('T')[0]
     };
+}
+
+/**
+ * The fixTranscript request. With the meeting's people and a speaker tag id on
+ * every segment, the task returns speaker hints alongside the text corrections.
+ */
+export async function getFixTranscriptRequestBody(councilMeetingId: string, cityId: string): Promise<Omit<FixTranscriptRequest, 'callbackUrl'>> {
+    // Speaker hints judge each diarization speaker on its own, so two tags the
+    // voiceprint matched to one person must not reach the task as one speaker.
+    return getRequestOnTranscriptRequestBody(councilMeetingId, cityId, { keepSpeakerTagsApart: true });
 }
 
 let getAgendaItemIndex = (subject: DbSubject): number | "BEFORE_AGENDA" | "OUT_OF_AGENDA" | null => {
@@ -119,6 +143,11 @@ let getAgendaItemIndex = (subject: DbSubject): number | "BEFORE_AGENDA" | "OUT_O
 export async function getSummarizeRequestBody(councilMeetingId: string, cityId: string, requestedSubjects: string[], additionalInstructions?: string, { force = false }: { force?: boolean } = {}): Promise<Omit<SummarizeRequest, 'callbackUrl'>> {
     const baseRequest = await getRequestOnTranscriptRequestBody(councilMeetingId, cityId);
     const existingSubjects = await getSubjectsForMeeting(cityId, councilMeetingId);
+    // A summarize that already succeeded runs again only with force, and its rows then hold the previous summary.
+    // Without force, the rows still hold the text that processAgenda wrote.
+    const agendaDescriptions = force
+        ? agendaDescriptionsByRowId(await getLatestProcessAgendaSubjects(cityId, councilMeetingId), existingSubjects)
+        : new Map<string, string>();
     return {
         ...baseRequest,
         requestedSubjects,
@@ -127,8 +156,10 @@ export async function getSummarizeRequestBody(councilMeetingId: string, cityId: 
             // (BEFORE_AGENDA/OUT_OF_AGENDA) will be rediscovered fresh by the backend
             .filter(s => force ? s.agendaItemIndex : (s.agendaItemIndex || s.nonAgendaReason))
             .map(s => ({
+            // The row's own id, so the result names the row it updates (issue 366).
+            id: s.id,
             name: s.name,
-            description: s.description,
+            description: agendaDescriptions.get(s.id) ?? s.description,
             introducedByPersonId: s.introducedBy?.id || null,
             topicLabel: s.topic?.name || null,
             location: s.location && s.location.coordinates ? {
@@ -314,12 +345,12 @@ async function linkDiscussedInReferences(
  */
 async function applyUtteranceDiscussionStatusesInTx(
     tx: PrismaTxClient,
-    statuses: SummarizeResult['utteranceDiscussionStatuses'],
+    statuses: NonNullable<SummarizeResult['utteranceDiscussionStatuses']>,
     subjectIdMap: Map<string, string>
 ): Promise<number> {
     // Keep the last entry per utterance; the response can repeat one. Entries carrying a
     // status outside the enum are dropped here rather than allowed to abort the transaction.
-    const deduped = new Map<string, SummarizeResult['utteranceDiscussionStatuses'][number]>();
+    const deduped = new Map<string, NonNullable<SummarizeResult['utteranceDiscussionStatuses']>[number]>();
     let unknownStatuses = 0;
     for (const status of statuses) {
         if (!VALID_DISCUSSION_STATUSES.has(status.status)) {
@@ -379,6 +410,8 @@ export async function saveSubjectsForMeeting(
     subjects: Subject[],
     cityId: string,
     councilMeetingId: string,
+    /** When given, these replace every discussion tag in the meeting, even
+     *  when empty. `undefined` leaves the existing tags alone. */
     utteranceDiscussionStatuses?: SummarizeResult['utteranceDiscussionStatuses'],
     /** `pruneUnmatched` deletes existing agenda subjects that the incoming set
      *  does not account for. The agenda is authoritative, so processAgenda
@@ -393,7 +426,7 @@ export async function saveSubjectsForMeeting(
         where: { councilMeetingId, cityId },
         // `name` feeds the matcher's first pass: it is what identifies a
         // subject across a renumbered agenda.
-        select: { id: true, agendaItemIndex: true, nonAgendaReason: true, name: true }
+        select: { id: true, agendaItemIndex: true, agendaSectionIndex: true, nonAgendaReason: true, name: true }
     });
 
     const { toUpdate, toCreate, unmatched } = categorizeSubjectsForUpsert(
@@ -474,8 +507,16 @@ export async function saveSubjectsForMeeting(
                         ? incoming.agendaItemIndex
                         : null,
                     description: incoming.description,
+                    // undefined leaves the stored outcome alone; null clears it.
+                    outcome: incoming.outcome,
                     // undefined leaves the stored title alone; null clears it.
                     agendaItemTitle: incoming.agendaItemTitle,
+                    // undefined leaves the stored section alone (summarize); null
+                    // clears it (a re-run on an agenda that is now one list).
+                    ...(incoming.agendaSection !== undefined ? {
+                        agendaSectionIndex: incoming.agendaSection?.index ?? null,
+                        agendaSectionTitle: incoming.agendaSection?.title ?? null,
+                    } : {}),
                     topicId,
                     locationId: locationId ?? null,
                     personId: validIntroducedBy ?? null,
@@ -541,7 +582,10 @@ export async function saveSubjectsForMeeting(
                 data: {
                     name: subject.name,
                     description: subject.description,
+                    outcome: subject.outcome,
                     agendaItemTitle: subject.agendaItemTitle,
+                    agendaSectionIndex: subject.agendaSection?.index,
+                    agendaSectionTitle: subject.agendaSection?.title,
                     councilMeeting: {
                         connect: { cityId_id: { cityId, id: councilMeetingId } }
                     },
@@ -592,8 +636,16 @@ export async function saveSubjectsForMeeting(
 
         // Inside the transaction on purpose: the tags must commit with their subjects, or the
         // search index never learns about them. See applyUtteranceDiscussionStatusesInTx.
-        if (utteranceDiscussionStatuses && utteranceDiscussionStatuses.length > 0) {
-            await applyUtteranceDiscussionStatusesInTx(tx, utteranceDiscussionStatuses, subjectIdMap);
+        // The response tags only some utterances, so the others must lose the tags of the
+        // previous run. The reset is in this transaction so that a failure keeps the old tags.
+        if (utteranceDiscussionStatuses) {
+            await tx.utterance.updateMany({
+                where: { speakerSegment: { meetingId: councilMeetingId, cityId } },
+                data: { discussionStatus: null, discussionSubjectId: null }
+            });
+            if (utteranceDiscussionStatuses.length > 0) {
+                await applyUtteranceDiscussionStatusesInTx(tx, utteranceDiscussionStatuses, subjectIdMap);
+            }
         }
     }, { timeout: 60000 });
 

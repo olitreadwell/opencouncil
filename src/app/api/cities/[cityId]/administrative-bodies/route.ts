@@ -1,46 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { revalidatePath, revalidateTag } from 'next/cache';
-import { getAdministrativeBodiesForCity, createAdministrativeBody } from '@/lib/db/administrativeBodies';
-import { z } from 'zod';
-import prisma from '@/lib/db/prisma';
-import { withUserAuthorizedToEdit } from '@/lib/auth';
+import { getAdministrativeBodiesForCity, getPublicAdministrativeBodiesForCity, createAdministrativeBody } from '@/lib/db/administrativeBodies';
+import { isUserAuthorizedToEdit, withUserAuthorizedToEdit } from '@/lib/auth';
+import { administrativeBodySchema } from '@/lib/zod-schemas/administrativeBody';
+import { handleApiError } from '@/lib/api/errors';
 
-const bodySchema = z.object({
-    name: z.string().min(2, {
-        message: "Name must be at least 2 characters.",
-    }),
-    name_en: z.string().min(2, {
-        message: "Name (English) must be at least 2 characters.",
-    }),
-    type: z.enum(['council', 'committee', 'community']),
-    youtubeChannelUrl: z.union([
-        z.string().url({
-            message: "Must be a valid URL.",
-        }),
-        z.literal('')
-    ]).optional().transform(val => val === '' ? undefined : val),
-    contactEmails: z.array(z.string().email()).optional().default([]),
-    notificationBehavior: z.enum(['NOTIFICATIONS_DISABLED', 'NOTIFICATIONS_AUTO', 'NOTIFICATIONS_APPROVAL']).optional(),
-    showUnreviewedTranscript: z.boolean().optional(),
-    diavgeiaUnitIds: z.string().optional().transform(val => {
-        if (!val || val.trim() === '') return [];
-        return val.split(',').map(s => s.trim()).filter(Boolean);
-    }),
-});
 
 export async function GET(request: NextRequest, props: { params: Promise<{ cityId: string }> }) {
     const params = await props.params;
     try {
         const { cityId } = params;
 
-        const administrativeBodies = await prisma.administrativeBody.findMany({
-            where: {
-                cityId,
-            },
-            orderBy: {
-                name: 'asc',
-            },
-        });
+        // The route has no auth of its own (the proxy skips /api), so the
+        // body's settings go only to an editor of the city: the body form in
+        // the city form edits them. Everyone else, a body admin included,
+        // gets the public fields of every body.
+        const administrativeBodies = await isUserAuthorizedToEdit({ cityId })
+            ? await getAdministrativeBodiesForCity(cityId)
+            : await getPublicAdministrativeBodiesForCity(cityId);
 
         return NextResponse.json(administrativeBodies);
     } catch (error) {
@@ -58,19 +35,20 @@ export async function POST(request: NextRequest, props: { params: Promise<{ city
         await withUserAuthorizedToEdit({ cityId: params.cityId });
         const cityId = params.cityId;
         const body = await request.json();
-        const parsed = bodySchema.parse(body);
-        const { name, name_en, type, youtubeChannelUrl, contactEmails, notificationBehavior, showUnreviewedTranscript, diavgeiaUnitIds } = parsed;
+        const parsed = administrativeBodySchema.parse(body);
+        const { name, name_en, type, youtubeChannelUrl, contactEmails, notificationBehavior, showUnreviewedTranscript, diavgeiaUnitIds, place } = parsed;
 
         const newBody = await createAdministrativeBody({
             name,
             name_en,
             type,
             cityId,
-            youtubeChannelUrl: youtubeChannelUrl && youtubeChannelUrl.trim() !== '' ? youtubeChannelUrl : null,
+            youtubeChannelUrl: youtubeChannelUrl ?? null,
             contactEmails: contactEmails || [],
             notificationBehavior: notificationBehavior || 'NOTIFICATIONS_APPROVAL',
             showUnreviewedTranscript: showUnreviewedTranscript ?? true,
-            diavgeiaUnitIds: diavgeiaUnitIds || [],
+            diavgeiaUnitIds: diavgeiaUnitIds ?? [],
+            place,
         });
 
         revalidateTag(`city:${cityId}:administrativeBodies`, 'max');
@@ -78,13 +56,6 @@ export async function POST(request: NextRequest, props: { params: Promise<{ city
 
         return NextResponse.json(newBody, { status: 201 });
     } catch (error) {
-        if (error instanceof z.ZodError) {
-            return NextResponse.json({ error: error.errors }, { status: 400 });
-        }
-        console.error('Failed to create administrative body:', error);
-        return NextResponse.json(
-            { error: 'Failed to create administrative body' },
-            { status: 500 }
-        );
+        return handleApiError(error, 'Failed to create administrative body');
     }
 } 

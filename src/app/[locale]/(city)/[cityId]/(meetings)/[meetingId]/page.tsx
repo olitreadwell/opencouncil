@@ -6,9 +6,13 @@ import { TOPICLESS_COLOR } from '@/lib/topicStyle';
 import { useCouncilMeetingData } from "@/components/meetings/CouncilMeetingDataContext";
 import { SubjectSection } from "@/components/meetings/subject-section";
 import { TopicFilter } from "@/components/TopicFilter";
-import { CalendarIcon, ExternalLink, FileIcon, FileText } from "lucide-react";
+import { CalendarIcon, ExternalLink, FileIcon, FileText, History, Lock, MapPin, Table2, Video } from "lucide-react";
+import { DecisionsTablePanel } from "@/components/meetings/decisions-table/DecisionsTablePanel";
+import { decisionsTableAvailable } from "@/lib/decisionsTable/availability";
 import { formatDate } from "@/lib/formatters/time";
-import { pendingKind, type PublicMeetingStage } from "@/lib/meetingStage";
+import { presentationPendingKind, type PresentationKey } from "@/lib/meetingPresentation";
+import { effectivePlace } from "@/lib/meetingPublic";
+import { formatRules } from "@/lib/meetingLifecycleRules";
 import { MeetingStageChip } from "@/components/meetings/stage/MeetingStageChip";
 import { MeetingStageStrip } from "@/components/meetings/stage/MeetingStageStrip";
 import { PendingSubjectsNote } from "@/components/meetings/stage/PendingSubjectsNote";
@@ -22,6 +26,8 @@ import { HighlightCards } from "@/components/meetings/highlight-cards";
 import { useLocale, useTranslations } from "next-intl";
 import { useState, useMemo } from "react";
 import type { Topic } from "@prisma/client";
+import { meetingDisplayName } from '@/lib/meetingName';
+import { getLocalizedName } from '@/lib/formatters/name';
 
 export default function MeetingPage() {
     const { meeting, subjects, city } = useCouncilMeetingData();
@@ -29,9 +35,9 @@ export default function MeetingPage() {
     const subjectCategories = getSubjectCategories(t);
     const [selectedTopicId, setSelectedTopicId] = useState<string | null>(null);
     const [agendaSortMode, setAgendaSortMode] = useState<'speakingTime' | 'agendaIndex'>('speakingTime');
-    const { stage, deadline, now } = useMeetingStage();
+    const { presentation, stage, deadline, now } = useMeetingStage();
     // What a row says in place of the stats it does not have yet.
-    const pending = pendingKind(stage);
+    const pending = presentationPendingKind(presentation, meeting);
 
     // The subjects as the shared map language's dense mode: plain topic-coloured
     // dots — what the landing draws when pins crowd. The band is decorative (a
@@ -102,7 +108,7 @@ export default function MeetingPage() {
             </div>
 
             <div className="p-4 sm:p-6">
-                <MeetingStageStrip stage={stage} deadline={deadline} />
+                <MeetingStageStrip presentation={presentation} stage={stage} deadline={deadline} />
                 <HighlightCards subjects={subjects} />
 
                 {availableTopics.length > 0 && (
@@ -156,15 +162,25 @@ export default function MeetingPage() {
     )
 }
 
-function MeetingInfo({ stage, now }: { stage: PublicMeetingStage; now: Date }) {
+function MeetingInfo({ stage, now }: { stage: PresentationKey; now: Date }) {
     const tMeeting = useTranslations("CouncilMeeting");
     const tStage = useTranslations("meetingStage");
+    const tTable = useTranslations("decisionsTable");
     const { meeting, subjects, city } = useCouncilMeetingData();
     const locale = useLocale();
+    const [tableOpen, setTableOpen] = useState(false);
+    // The Πίνακας αποφάσεων exists once the meeting has been held and decides things.
+    const showTable = decisionsTableAvailable(stage, meeting, subjects);
     return (
         <div className="absolute bottom-0 left-0 right-0 p-4 sm:p-6">
             <div className="max-w-4xl mx-auto space-y-3 sm:space-y-4">
-                <h1 className="text-xl sm:text-2xl font-bold">{meeting.name}</h1>
+                {/* The title «3η Τακτική» names no body, so the body sits above it. */}
+                <div>
+                    {meeting.administrativeBody && (
+                        <p className="text-xs sm:text-sm font-medium text-gray-600">{getLocalizedName(meeting.administrativeBody, locale)}</p>
+                    )}
+                    <h1 className="text-xl sm:text-2xl font-bold">{meetingDisplayName(meeting, locale, city.timezone)}</h1>
+                </div>
                 {/* The stage opens the facts row; on a phone the row wraps and the chip takes
                     the first slot. A complete meeting has no chip: the full ring is its absence. */}
                 <div className="flex flex-wrap items-center gap-4 sm:gap-6 text-xs sm:text-sm text-gray-600">
@@ -179,6 +195,37 @@ function MeetingInfo({ stage, now }: { stage: PublicMeetingStage; now: Date }) {
                         {formatDate(new Date(meeting.dateTime), city.timezone, locale)}
                     </div>
 
+                    {/* The new meeting after a postponement: the date for which it was
+                        first scheduled, with no link to the postponed meeting. */}
+                    {meeting.postponedFromDate && (
+                        <div className="flex items-center">
+                            <History className="w-3.5 h-3.5 sm:w-4 sm:h-4 mr-2 sm:mr-2.5" />
+                            {tStage('facts.postponedFrom', { date: formatDate(new Date(meeting.postponedFromDate), city.timezone, locale) })}
+                        </div>
+                    )}
+
+                    {meeting.format !== null && formatRules(meeting.format).namedInFacts && (
+                        <div className="flex items-center">
+                            <Video className="w-3.5 h-3.5 sm:w-4 sm:h-4 mr-2 sm:mr-2.5" />
+                            {tStage(`facts.format.${meeting.format}`)}
+                        </div>
+                    )}
+
+                    {/* The place of the meeting: its own, else the hall of its body. */}
+                    {effectivePlace(meeting) && (
+                        <div className="flex items-center">
+                            <MapPin className="w-3.5 h-3.5 sm:w-4 sm:h-4 mr-2 sm:mr-2.5" />
+                            {effectivePlace(meeting)}
+                        </div>
+                    )}
+
+                    {meeting.closedToPublic && (
+                        <div className="flex items-center">
+                            <Lock className="w-3.5 h-3.5 sm:w-4 sm:h-4 mr-2 sm:mr-2.5" />
+                            {tStage('facts.closedToPublic')}
+                        </div>
+                    )}
+
                     {meeting.agendaUrl && (
                         <div className="flex items-center">
                             <FileText className="w-3.5 h-3.5 sm:w-4 sm:h-4 mr-2 sm:mr-2.5" />
@@ -189,12 +236,29 @@ function MeetingInfo({ stage, now }: { stage: PublicMeetingStage; now: Date }) {
                         </div>
                     )}
 
+                    {showTable && (
+                        <div className="flex items-center">
+                            <Table2 className="w-3.5 h-3.5 sm:w-4 sm:h-4 mr-2 sm:mr-2.5" />
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    captureEvent('meeting_page_action', { action: 'decisions_table', city_id: meeting.cityId, meeting_id: meeting.id });
+                                    setTableOpen(true);
+                                }}
+                                className="hover:text-primary transition-colors"
+                            >
+                                {tTable('title')}
+                            </button>
+                        </div>
+                    )}
+
                     <div className="flex items-center">
                         <FileIcon className="w-3.5 h-3.5 sm:w-4 sm:h-4 mr-2 sm:mr-2.5" />
                         {tMeeting('subjectsCount', { count: subjects.length })}
                     </div>
                 </div>
             </div>
+            {showTable && <DecisionsTablePanel open={tableOpen} onOpenChange={setTableOpen} />}
         </div>
     )
 }

@@ -8,7 +8,7 @@ jest.mock('../db/prisma', () => ({
     }
 }));
 jest.mock('../db/transcript', () => ({ getTranscript: jest.fn() }));
-jest.mock('../db/people', () => ({ getPeopleForMeeting: jest.fn() }));
+jest.mock('../db/people', () => ({ getPeopleWhoMaySpeak: jest.fn() }));
 jest.mock('../db/parties', () => ({ getPartiesForCity: jest.fn() }));
 jest.mock('../db/topics', () => ({
     getTopics: jest.fn(),
@@ -23,18 +23,25 @@ jest.mock('../db/meetings', () => ({
 
 import prisma from '../db/prisma';
 import { getTranscript } from '../db/transcript';
-import { getPeopleForMeeting } from '../db/people';
+import { getPeopleWhoMaySpeak } from '../db/people';
 import { getPartiesForCity } from '../db/parties';
 import { getTopics } from '../db/topics';
 import { getCity } from '../db/cities';
 import { getCouncilMeeting, getCouncilMeetingDirect } from '../db/meetings';
-import { getRequestOnTranscriptRequestBody } from '../db/utils';
+import { getFixTranscriptRequestBody, getRequestOnTranscriptRequestBody } from '../db/utils';
+import { roleWithRelationsInclude } from '@/lib/db/types';
 import { makeTranscriptSegment, makePersonWithRoles } from '../../../tests/helpers/builders';
+
+// The real catalog of the locale the code asks for.
+jest.mock('next-intl/server', () => ({
+    getTranslations: (o: { locale: string; namespace: string }) =>
+        jest.requireActual('../../../tests/helpers/catalog').getTranslationsFromCatalog(o),
+}));
 
 const mockGetTranscript = getTranscript as jest.MockedFunction<typeof getTranscript>;
 const mockGetCouncilMeetingDirect = getCouncilMeetingDirect as jest.MockedFunction<typeof getCouncilMeetingDirect>;
 const mockGetCouncilMeeting = getCouncilMeeting as jest.MockedFunction<typeof getCouncilMeeting>;
-const mockGetPeopleForMeeting = getPeopleForMeeting as jest.MockedFunction<typeof getPeopleForMeeting>;
+const mockGetPeopleWhoMaySpeak = getPeopleWhoMaySpeak as jest.MockedFunction<typeof getPeopleWhoMaySpeak>;
 const mockGetPartiesForCity = getPartiesForCity as jest.MockedFunction<typeof getPartiesForCity>;
 const mockGetActiveTopicsForTasks = getTopics as jest.MockedFunction<typeof getTopics>;
 const mockGetCity = getCity as jest.MockedFunction<typeof getCity>;
@@ -85,7 +92,7 @@ describe('getRequestOnTranscriptRequestBody', () => {
 
     it('reads the meeting through the ungated getter, so a callback with no session still resolves a draft', async () => {
         mockGetTranscript.mockResolvedValue([]);
-        mockGetPeopleForMeeting.mockResolvedValue([]);
+        mockGetPeopleWhoMaySpeak.mockResolvedValue([]);
 
         await getRequestOnTranscriptRequestBody(MEETING_ID, CITY_ID);
 
@@ -106,7 +113,7 @@ describe('getRequestOnTranscriptRequestBody', () => {
             makeTranscriptSegment({ id: 'seg-1', personId: 'person-1', label: 'Maria (raw)' }),
         ] as any);
         mockPrismaPersonFindMany.mockResolvedValue([person]);
-        mockGetPeopleForMeeting.mockResolvedValue([person] as any);
+        mockGetPeopleWhoMaySpeak.mockResolvedValue([person]);
 
         const result = await getRequestOnTranscriptRequestBody(MEETING_ID, CITY_ID);
 
@@ -116,9 +123,39 @@ describe('getRequestOnTranscriptRequestBody', () => {
         expect(result.topicLabels).toEqual([{ name: 'Environment', description: '' }]);
     });
 
+    it('sends the party a speaker held on the meeting date, not the party they hold today', async () => {
+        const person = makePersonWithRoles({ id: 'person-1', name: 'Maria K.', partyId: 'party-a', partyName: 'Party A' });
+        // Party A until after the meeting, Party B since then.
+        person.roles[0].endDate = new Date('2025-01-01T00:00:00Z');
+        const later = makePersonWithRoles({ id: 'person-1', name: 'Maria K.', partyId: 'party-b', partyName: 'Party B' });
+        person.roles.push({ ...later.roles[0], id: 'role-later', startDate: new Date('2025-01-01T00:00:00Z') });
+
+        mockGetTranscript.mockResolvedValue([makeTranscriptSegment({ id: 'seg-1', personId: 'person-1' })] as any);
+        mockPrismaPersonFindMany.mockResolvedValue([person]);
+        mockGetPeopleWhoMaySpeak.mockResolvedValue([person]);
+
+        const result = await getRequestOnTranscriptRequestBody(MEETING_ID, CITY_ID);
+
+        expect(result.transcript[0].speakerParty).toBe('Party A');
+    });
+
+    it('titles a president without a stored name in the city language', async () => {
+        mockCity({ id: CITY_ID, name: 'Rouen', language: 'fr', realm: 'france' });
+        const chair = makePersonWithRoles({ id: 'person-1', name: 'Marie D.', partyId: 'party-a', partyName: 'Party A' });
+        chair.roles.push({ ...chair.roles[0], id: 'chair', partyId: null, party: null,
+            administrativeBodyId: ADMIN_BODY_ID, isHead: true, name: null, name_en: null });
+        mockGetTranscript.mockResolvedValue([makeTranscriptSegment({ id: 'seg-1', personId: 'person-1' })] as any);
+        mockPrismaPersonFindMany.mockResolvedValue([chair]);
+        mockGetPeopleWhoMaySpeak.mockResolvedValue([chair]);
+
+        const result = await getRequestOnTranscriptRequestBody(MEETING_ID, CITY_ID);
+
+        expect(result.transcript[0].speakerRole).toBe('Président(e), Body');
+    });
+
     it('sends the country of the city realm, so locations geocode in the right country', async () => {
         mockGetTranscript.mockResolvedValue([]);
-        mockGetPeopleForMeeting.mockResolvedValue([]);
+        mockGetPeopleWhoMaySpeak.mockResolvedValue([]);
         mockCity({ id: CITY_ID, name: 'Novi Sad', language: 'sr', realm: 'serbia' });
 
         const result = await getRequestOnTranscriptRequestBody(MEETING_ID, CITY_ID);
@@ -141,8 +178,8 @@ describe('getRequestOnTranscriptRequestBody', () => {
         ] as any);
         // Direct DB query finds the person
         mockPrismaPersonFindMany.mockResolvedValue([outsidePerson]);
-        // Meeting filter does NOT include this person
-        mockGetPeopleForMeeting.mockResolvedValue([]);
+        // The meeting's people do NOT include this person
+        mockGetPeopleWhoMaySpeak.mockResolvedValue([]);
 
         const result = await getRequestOnTranscriptRequestBody(MEETING_ID, CITY_ID);
 
@@ -156,7 +193,7 @@ describe('getRequestOnTranscriptRequestBody', () => {
         mockGetTranscript.mockResolvedValue([
             makeTranscriptSegment({ id: 'seg-1', personId: null, label: 'Unknown Speaker 1' }),
         ] as any);
-        mockGetPeopleForMeeting.mockResolvedValue([]);
+        mockGetPeopleWhoMaySpeak.mockResolvedValue([]);
 
         const result = await getRequestOnTranscriptRequestBody(MEETING_ID, CITY_ID);
 
@@ -166,7 +203,7 @@ describe('getRequestOnTranscriptRequestBody', () => {
         expect(result.transcript[0].speakerRole).toBeNull();
     });
 
-    it('uses meetingPeople (filtered) for partiesWithPeople, not identifiedPeople', async () => {
+    it('uses the meeting\'s people for people and partiesWithPeople, not identifiedPeople', async () => {
         const councilMember = makePersonWithRoles({
             id: 'person-1', name: 'Anna S.',
             partyId: 'party-a', partyName: 'Party A',
@@ -182,8 +219,8 @@ describe('getRequestOnTranscriptRequestBody', () => {
             makeTranscriptSegment({ id: 'seg-2', personId: 'person-outside' }),
         ] as any);
         mockPrismaPersonFindMany.mockResolvedValue([councilMember, outsideSpeaker]);
-        // Only councilMember is in the meeting's filtered list
-        mockGetPeopleForMeeting.mockResolvedValue([councilMember] as any);
+        // Only councilMember may speak at the meeting
+        mockGetPeopleWhoMaySpeak.mockResolvedValue([councilMember]);
 
         const result = await getRequestOnTranscriptRequestBody(MEETING_ID, CITY_ID);
 
@@ -194,6 +231,25 @@ describe('getRequestOnTranscriptRequestBody', () => {
         expect(partyA?.people[0].name).toBe('Anna S.');
         // outsideSpeaker is NOT in meetingPeople, so Party B has no members
         expect(partyB?.people).toHaveLength(0);
+        expect(result.people.map(p => p.id)).toEqual(['person-1']);
+        // One selection for both: who may speak at this body's meeting, on its date.
+        expect(mockGetPeopleWhoMaySpeak).toHaveBeenCalledTimes(1);
+        expect(mockGetPeopleWhoMaySpeak).toHaveBeenCalledWith(CITY_ID, ADMIN_BODY_ID, MEETING_DATE);
+    });
+
+    it('lists in people those who have no party, whom partiesWithPeople leaves out', async () => {
+        const member = makePersonWithRoles({ id: 'p-member', name: 'Anna S.', partyId: 'party-a', partyName: 'Party A' });
+        const official = makePersonWithRoles({ id: 'p-official', name: 'General Secretary', partyId: 'party-a' });
+        mockGetTranscript.mockResolvedValue([]);
+        mockGetPeopleWhoMaySpeak.mockResolvedValue([
+            member,
+            { ...official, roles: official.roles.map(role => ({ ...role, partyId: null, party: null })) },
+        ]);
+
+        const result = await getRequestOnTranscriptRequestBody(MEETING_ID, CITY_ID);
+
+        expect(result.people.map(p => [p.name, p.party])).toEqual([['Anna S.', 'Party A'], ['General Secretary', null]]);
+        expect(result.partiesWithPeople.flatMap(party => party.people.map(p => p.name))).toEqual(['Anna S.']);
     });
 
     it('skips prisma.person.findMany when no speakers have personId', async () => {
@@ -201,7 +257,7 @@ describe('getRequestOnTranscriptRequestBody', () => {
             makeTranscriptSegment({ id: 'seg-1', personId: null, label: 'Speaker 1' }),
             makeTranscriptSegment({ id: 'seg-2', personId: null, label: 'Speaker 2' }),
         ] as any);
-        mockGetPeopleForMeeting.mockResolvedValue([]);
+        mockGetPeopleWhoMaySpeak.mockResolvedValue([]);
 
         await getRequestOnTranscriptRequestBody(MEETING_ID, CITY_ID);
 
@@ -220,13 +276,51 @@ describe('getRequestOnTranscriptRequestBody', () => {
             makeTranscriptSegment({ id: 'seg-3', personId: 'person-1' }),
         ] as any);
         mockPrismaPersonFindMany.mockResolvedValue([person]);
-        mockGetPeopleForMeeting.mockResolvedValue([person] as any);
+        mockGetPeopleWhoMaySpeak.mockResolvedValue([person]);
 
         await getRequestOnTranscriptRequestBody(MEETING_ID, CITY_ID);
 
         expect(mockPrismaPersonFindMany).toHaveBeenCalledWith({
             where: { id: { in: ['person-1'] } },
-            include: { roles: { include: { party: true, administrativeBody: true, city: true } } },
+            include: { roles: roleWithRelationsInclude },
         });
+    });
+});
+
+describe('getFixTranscriptRequestBody', () => {
+    beforeEach(() => {
+        jest.clearAllMocks();
+        setupCommonMocks();
+        mockGetTranscript.mockResolvedValue([makeTranscriptSegment({ id: 'seg-1' })]);
+        mockGetPeopleWhoMaySpeak.mockResolvedValue([]);
+        mockPrismaPersonFindMany.mockResolvedValue([]);
+    });
+
+    it('sends the meeting\'s people, members and visitors, and each segment\'s speaker tag', async () => {
+        // A role belongs to a party or to a body, never both (validateRoles), so the
+        // shared builder's combined role is narrowed to a body role here.
+        const withBodyRole = (id: string, name: string, adminBodyId: string) => {
+            const person = makePersonWithRoles({ id, name, partyId: 'party-a', adminBodyId });
+            return { ...person, roles: person.roles.map(role => ({ ...role, partyId: null, party: null })) };
+        };
+        mockGetPeopleWhoMaySpeak.mockResolvedValue([
+            withBodyRole('p-visitor', 'Visiting Councillor', 'another-body'),
+            withBodyRole('p-member', 'Body Member', ADMIN_BODY_ID),
+        ]);
+
+        const result = await getFixTranscriptRequestBody(MEETING_ID, CITY_ID);
+
+        expect(result.people.map(p => [p.id, p.memberOfMeetingBody])).toEqual([['p-member', true], ['p-visitor', false]]);
+        expect(result.transcript[0].speakerTagId).toBe('tag-seg-1');
+        // One load of the meeting, shared with the plain transcript request.
+        expect(mockGetCouncilMeetingDirect).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps speaker tags apart, which the plain transcript request does not', async () => {
+        await getFixTranscriptRequestBody(MEETING_ID, CITY_ID);
+        expect(mockGetTranscript).toHaveBeenLastCalledWith(MEETING_ID, CITY_ID, { joinAdjacentSameSpeakerSegments: true, joinSameSpeakerTagOnly: true });
+
+        await getRequestOnTranscriptRequestBody(MEETING_ID, CITY_ID);
+        expect(mockGetTranscript).toHaveBeenLastCalledWith(MEETING_ID, CITY_ID, { joinAdjacentSameSpeakerSegments: true, joinSameSpeakerTagOnly: false });
     });
 });

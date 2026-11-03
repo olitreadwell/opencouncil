@@ -1,4 +1,5 @@
-import { AdministrativeBody, City, CouncilMeeting } from "@prisma/client";
+import { City, CouncilMeeting } from "@prisma/client";
+import type { PublicAdministrativeBody } from "@/lib/db/types";
 import { useSubjectBarHover } from '@/components/meetings/bar/BarHighlightContext';
 import { Statistics } from "@/lib/statistics";
 import { SubjectWithRelations } from "@/lib/db/subject";
@@ -21,12 +22,13 @@ import { Clock, Loader2, MapPin, ScrollText } from "lucide-react";
 import { useState, useEffect } from "react";
 import { usePathname } from "next/navigation";
 import { useLocale, useTranslations } from "next-intl";
+import { meetingDisplayName } from '@/lib/meetingName';
 
 
 interface SubjectRowProps {
     subject: SubjectWithRelations & { statistics?: Statistics; matches?: SearchMatches };
     city: City;
-    meeting: CouncilMeeting & { administrativeBody?: AdministrativeBody | null };
+    meeting: CouncilMeeting & { administrativeBody?: PublicAdministrativeBody | null };
     /** Show the city / body / date line — off when the row already sits inside a meeting. */
     showContext?: boolean;
     /** What a row says in place of the stats it does not have yet — the meeting's stage decides. */
@@ -182,8 +184,9 @@ export function SubjectRow({ subject, city, meeting, showContext = true, pending
 
                             <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
                                 {/* The meeting name is context too: on the meeting's own page
-                                    the h1 already says it, N rows repeating it said nothing. */}
-                                {showContext && <MetaItem icon={ScrollText}>{getLocalizedName(meeting, locale)}</MetaItem>}
+                                    the h1 already says it, N rows repeating it said nothing. The
+                                    context line above holds the body and the date, so the title. */}
+                                {showContext && <MetaItem icon={ScrollText}>{meetingDisplayName(meeting, locale, city.timezone)}</MetaItem>}
                                 <MetaItem icon={MapPin}>{locationText ?? t("noLocation")}</MetaItem>
                             </div>
                         </div>

@@ -6,6 +6,7 @@ import { getLocalizedName } from '@/lib/formatters/name';
 import { localizeText } from '@/lib/serbian';
 import { cn, filterActiveRoles } from '@/lib/utils';
 import { getPartyFromRoles, getRoleText, sortRolesByPriority } from '@/lib/utils/roles';
+import { useRoleTitles } from '@/hooks/useRoleTitles';
 import { surfaceCardClass } from '@/components/ui/surface-card';
 
 /** Titled roles before the card stops being a summary. */
@@ -13,6 +14,7 @@ const ROLES_SHOWN = 2;
 
 interface PersonCardProps {
     item: PersonWithRelations;
+    cityLanguage?: string;
     /** Which surface renders the card — the person_opened analytics discriminator. */
     analyticsSurface?: string;
     editable: boolean;
@@ -32,9 +34,10 @@ interface PersonCardProps {
  * Deliberately hook-light so it renders in a Server Component and inside List,
  * which is a client component.
  */
-export default function PersonCard({ item: person, analyticsSurface = 'people_list' }: PersonCardProps) {
+export default function PersonCard({ item: person, cityLanguage, analyticsSurface = 'people_list' }: PersonCardProps) {
     const t = useTranslations('Person');
     const locale = useLocale();
+    const roleTitles = useRoleTitles(cityLanguage);
     const party = getPartyFromRoles(person.roles);
     // getRoleText, not `role.name`: two thirds of councillors hold no titled
     // role, and filtering on the name column left their cards with an empty role
@@ -86,7 +89,7 @@ export default function PersonCard({ item: person, analyticsSurface = 'people_li
                         <span className="mt-2 flex flex-col gap-0.5">
                             {shown.map(role => (
                                 <span key={role.id} className="truncate text-xs text-foreground/80">
-                                    {localizeText(getRoleText(role, t), locale)}
+                                    {localizeText(getRoleText(role, roleTitles), locale)}
                                 </span>
                             ))}
                             {rest > 0 && (

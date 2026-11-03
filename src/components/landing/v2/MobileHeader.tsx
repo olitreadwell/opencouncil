@@ -3,20 +3,20 @@
 import { useState, type ReactNode } from 'react';
 import { useTranslations } from 'next-intl';
 import Image from 'next/image';
-import { Menu, Home, ChevronDown, User, LogOut, LogIn, Search, Plug, Phone, Mail, ArrowRight, HelpCircle } from 'lucide-react';
+import { Menu, Home, ChevronDown, User, LogOut, LogIn, Search, Plug, Bell, Phone, Mail, ArrowRight, HelpCircle, Download, Check } from 'lucide-react';
 import { useSession, signOut } from 'next-auth/react';
 import { Link } from '@/i18n/routing';
-import { openAfterMenuCloses } from '@/lib/utils/menus';
 import { useAccountLinks } from '@/components/layout/account-links';
 import { cn } from '@/lib/utils';
 import { Sheet, SheetContent, SheetTrigger, SheetClose, SheetTitle } from '@/components/ui/sheet';
-import { footerGroups, isInternalHref, reopenCookiePreferences, type FooterLink } from './navLinks';
+import { captureMenuLink, footerGroups, isInternalHref, reopenCookiePreferences, type FooterLink } from './navLinks';
 import ScriptSwitcher from '@/components/layout/ScriptSwitcher';
-import { NotifyMunicipalityDialog } from './NotifyMunicipalityDialog';
 import { captureLandingAction } from '@/lib/landing/analytics';
 import type { InfoSurface } from '@/lib/landing/landingCore';
-import type { LandingListCity } from '@/lib/landing/landingData';
 import type { Realm } from '@prisma/client';
+import { useInstallApp } from '@/hooks/useInstallApp';
+import { installAction } from '@/components/pwa/InstallAppMenuItem';
+import InstallStepsDialog from '@/components/pwa/InstallStepsDialog';
 
 /* Mobile top bar — a pill with the burger nav-drawer trigger + logo on the left and a separate
    bordered keyword-search box on the right. Tapping search opens the search overlay (owned by the
@@ -24,7 +24,6 @@ import type { Realm } from '@prisma/client';
 export function MobileHeader({
     onOpenSearch,
     onToggleInfo,
-    cities,
     searchActive,
     query,
     realm,
@@ -33,8 +32,6 @@ export function MobileHeader({
     /** opens the "Τι είναι αυτό;" guide — the same panel the map's "?" opens. Offered here too
      *  because that is where people looked for it and didn't find it. */
     onToggleInfo: (surface?: InfoSurface) => void;
-    /** cooperating δήμοι, for the "which δήμος?" notifications dialog opened from the menu */
-    cities: LandingListCity[];
     /** a keyword search is active — the search box goes orange and shows the query */
     searchActive?: boolean;
     /** the active search text, shown (truncated) inside the search box while searchActive */
@@ -45,11 +42,12 @@ export function MobileHeader({
     const t = useTranslations('landingV2');
     const tAccount = useTranslations('account');
     const accountLinks = useAccountLinks();
-    const [notifyOpen, setNotifyOpen] = useState(false);
     const { data: session, status } = useSession();
+    const tInstall = useTranslations('pwa.install');
+    const install = useInstallApp();
+    const [installStepsOpen, setInstallStepsOpen] = useState(false);
+    const installEntry = installAction(install, () => setInstallStepsOpen(true));
     return (
-        <>
-        <NotifyMunicipalityDialog open={notifyOpen} onOpenChange={setNotifyOpen} cities={cities} />
         <div className="absolute inset-x-3 top-3 z-[9] flex items-center gap-1.5">
             {/* header pill: burger + logo + brand (both the burger/logo open the nav drawer). While a
                 search is active it shrinks to fit its content, giving the width to the search box. */}
@@ -93,9 +91,9 @@ export function MobileHeader({
                         <DrawerAction onClick={() => onToggleInfo('menu')} icon={<HelpCircle className="h-[18px] w-[18px]" />}>
                             {t('info.title')}
                         </DrawerAction>
-                        {/* /search and /mcp repeat in the Σύνδεσμοι accordion (it mirrors the site
-                            footer), but an accordion is closed by default — these two are product
-                            surfaces, so they get top-level rows. */}
+                        {/* /search, the notifications signup and /mcp repeat in the Σύνδεσμοι
+                            accordion (it mirrors the site footer), but an accordion is closed by
+                            default — these are product surfaces, so they get top-level rows. */}
                         <DrawerLink
                             href="/search"
                             icon={<Search className="h-[18px] w-[18px]" />}
@@ -104,12 +102,37 @@ export function MobileHeader({
                             {t('nav.searchPage')}
                         </DrawerLink>
                         <DrawerLink
+                            href="/notifications"
+                            icon={<Bell className="h-[18px] w-[18px]" />}
+                            onNavigate={() => captureLandingAction('nav_link', { target: 'notifications', surface: 'drawer' })}
+                        >
+                            {t('footer.links.notifications')}
+                        </DrawerLink>
+                        <DrawerLink
                             href="/mcp"
                             icon={<Plug className="h-[18px] w-[18px]" />}
                             onNavigate={() => captureLandingAction('nav_link', { target: 'mcp', surface: 'drawer' })}
                         >
                             {t('footer.links.ai')}
                         </DrawerLink>
+                        {installEntry.state === 'installed' && (
+                            <div className="flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium text-muted-foreground/60">
+                                <Check className="h-[18px] w-[18px] shrink-0" />
+                                {tInstall('installed')}
+                            </div>
+                        )}
+                        {installEntry.state === 'install' && (
+                            <SheetClose asChild>
+                                <button
+                                    type="button"
+                                    onClick={installEntry.onSelect}
+                                    className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                                >
+                                    <Download className="h-[18px] w-[18px] shrink-0" />
+                                    {tInstall('menu')}
+                                </button>
+                            </SheetClose>
+                        )}
                         {footerGroups(realm).map((group) => (
                             <details key={group.title} className="group">
                                 <summary className="flex cursor-pointer list-none items-center justify-between rounded-xl px-3 py-2.5 text-sm font-medium text-foreground transition-colors hover:bg-muted [&::-webkit-details-marker]:hidden">
@@ -118,14 +141,7 @@ export function MobileHeader({
                                 </summary>
                                 <div className="flex flex-col gap-0.5 py-0.5 pl-3">
                                     {group.links.map((link) => (
-                                        <DrawerFooterLink
-                                            key={link.label}
-                                            link={link}
-                                            onNotify={() => {
-                                                captureLandingAction('notify_dialog_opened', { surface: 'menu' });
-                                                openAfterMenuCloses(() => setNotifyOpen(true));
-                                            }}
-                                        />
+                                        <DrawerFooterLink key={link.label} link={link} />
                                     ))}
                                 </div>
                             </details>
@@ -190,6 +206,7 @@ export function MobileHeader({
                     </div>
                 </SheetContent>
             </Sheet>
+            <InstallStepsDialog open={installStepsOpen} onOpenChange={setInstallStepsOpen} platform={install.platform} />
 
             <span className="truncate text-base text-foreground">OpenCouncil</span>
             </div>
@@ -213,7 +230,6 @@ export function MobileHeader({
                 )}
             </button>
         </div>
-        </>
     );
 }
 
@@ -252,7 +268,7 @@ function DrawerLink({ href, icon, children, onNavigate }: { href: string; icon?:
 
 /* an expandable-group link row (internal Link / external-mailto-tel anchor / cookie button),
    closes the drawer on tap */
-function DrawerFooterLink({ link, onNotify }: { link: FooterLink; onNotify: () => void }) {
+function DrawerFooterLink({ link }: { link: FooterLink }) {
     const t = useTranslations('landingV2');
     const cls =
         'rounded-lg px-3 py-2 text-sm text-muted-foreground no-underline transition-colors hover:bg-muted hover:text-foreground hover:no-underline';
@@ -269,15 +285,6 @@ function DrawerFooterLink({ link, onNotify }: { link: FooterLink; onNotify: () =
         return (
             <SheetClose asChild>
                 <button type="button" onClick={reopenCookiePreferences} className={cn('text-left', cls)}>
-                    {t(link.labelKey!)}
-                </button>
-            </SheetClose>
-        );
-    }
-    if (link.notify) {
-        return (
-            <SheetClose asChild>
-                <button type="button" onClick={onNotify} className={cn('text-left', cls)}>
                     {t(link.labelKey!)}
                 </button>
             </SheetClose>
@@ -300,7 +307,7 @@ function DrawerFooterLink({ link, onNotify }: { link: FooterLink; onNotify: () =
     if (isInternalHref(link.href!)) {
         return (
             <SheetClose asChild>
-                <Link href={link.href!} className={cls}>
+                <Link href={link.href!} className={cls} onClick={() => captureMenuLink(link)}>
                     {t(link.labelKey!)}
                 </Link>
             </SheetClose>

@@ -3,28 +3,32 @@
 // wrapped in lib/actions/meetings.ts.
 //
 // Keep a gated wrapper and its ungated core next to each other in this file
-// (createCouncilMeeting/createCouncilMeetingDirect,
-// getCouncilMeeting/getCouncilMeetingDirect). Choosing between them is choosing
-// whether the viewer's session applies.
+// (getCouncilMeeting/getCouncilMeetingDirect). Choosing between them is
+// choosing whether the viewer's session applies. A meeting is created through
+// the lifecycle module (meetingLifecycle.ts), which meetingWrites.ts calls.
 import "server-only";
-import { CouncilMeeting, AdministrativeBodyType, Prisma, Realm } from '@prisma/client';
+import { AdministrativeBodyType, Prisma, Realm } from '@prisma/client';
 import { revalidateTag, revalidatePath } from 'next/cache';
+import { after } from 'next/server';
 import prisma from "./prisma";
 import { withUserAuthorizedToEdit, isUserAuthorizedToEdit } from '../auth';
 import { buildDateFilter } from './reviews/dateFilters';
 import { formatDateAsMeetingId } from '../utils/meetingId';
+import { parseVideoId } from '@/lib/utils/youtube';
 import { landingSubjectsTag } from './subject';
-import { CUSTOMER_CITY_WHERE, PUBLIC_CITY_WHERE } from '../cityStatus';
+import { CUSTOMER_CITY_WHERE, publicMeetingWhere } from '../cityStatus';
 // Import from the cache leaf (see the note in subject.ts) to keep the barrel's heavy chain out.
 import { createCache } from '../cache/index';
 import { getCityRealm } from "./cityRealm";
+import { deleteMeetingRecord, setMeetingReleased } from "./meetingLifecycle";
+import { LifecycleRuleError, PUBLIC_RECORDING_WHERE, TAKES_PLACE_WHERE } from "@/lib/meetingLifecycleRules";
+import { hideLinks } from "@/lib/meetingPublic";
+import { meetingWithAdminBodyInclude } from "./types/meeting";
+import { publicAdministrativeBodyRelation } from "./types/administrativeBody";
+import { notifySubscribersOnRelease } from "@/lib/notifications/meetingNotifications";
 // List reads and their payload types live in meetingsList.ts. Re-exported here
 // as types only, so callers of this module keep one import.
 export type { CouncilMeetingWithAdminBodyAndSubjects, CouncilMeetingWithSubjectPreview, MeetingListOptions } from './meetingsList';
-
-const meetingWithAdminBodyInclude = {
-    administrativeBody: true,
-} satisfies Prisma.CouncilMeetingInclude;
 
 export type CouncilMeetingWithAdminBody = Prisma.CouncilMeetingGetPayload<{
     include: typeof meetingWithAdminBodyInclude
@@ -33,35 +37,9 @@ export type CouncilMeetingWithAdminBody = Prisma.CouncilMeetingGetPayload<{
 
 
 export async function deleteCouncilMeeting(cityId: string, id: string): Promise<void> {
-    await withUserAuthorizedToEdit({ councilMeetingId: id, cityId: cityId });
-    try {
-        await prisma.councilMeeting.delete({
-            where: { cityId_id: { cityId, id } },
-        });
-    } catch (error) {
-        console.error('Error deleting council meeting:', error);
-        throw new Error('Failed to delete council meeting');
-    }
-}
-
-export async function createCouncilMeeting(meetingData: Omit<CouncilMeeting, 'createdAt' | 'updatedAt' | 'audioUrl' | 'videoUrl' | 'calendarEventId'> & { audioUrl?: string, videoUrl?: string }): Promise<CouncilMeetingWithAdminBody> {
-    await withUserAuthorizedToEdit({ cityId: meetingData.cityId });
-    return createCouncilMeetingDirect(meetingData);
-}
-
-/**
- * Create a council meeting with no auth check, for a caller that has already
- * authorized the write: the meetings API route, which admits service keys as
- * well as user sessions. A session gate inside this function would reject the
- * service keys.
- */
-export async function createCouncilMeetingDirect(
-    meetingData: Omit<CouncilMeeting, 'createdAt' | 'updatedAt' | 'audioUrl' | 'videoUrl' | 'calendarEventId'> & { audioUrl?: string; videoUrl?: string },
-): Promise<CouncilMeetingWithAdminBody> {
-    return prisma.councilMeeting.create({
-        data: meetingData,
-        include: meetingWithAdminBodyInclude,
-    });
+    // The city's, not the body admin's: deletion is not among their rights (#828).
+    await withUserAuthorizedToEdit({ cityId });
+    await deleteMeetingRecord(cityId, id);
 }
 
 /**
@@ -96,21 +74,6 @@ export async function generateUniqueMeetingId(cityId: string, date: Date): Promi
     throw new Error(`Could not generate unique meeting ID for ${cityId} on ${baseId} — too many meetings on this date`);
 }
 
-export async function editCouncilMeeting(cityId: string, id: string, meetingData: Partial<Omit<CouncilMeeting, 'id' | 'cityId' | 'createdAt' | 'updatedAt'>>): Promise<CouncilMeetingWithAdminBody> {
-    await withUserAuthorizedToEdit({ councilMeetingId: id, cityId: cityId });
-    try {
-        const updatedMeeting = await prisma.councilMeeting.update({
-            where: { cityId_id: { cityId, id } },
-            data: meetingData,
-            include: meetingWithAdminBodyInclude,
-        });
-        return updatedMeeting;
-    } catch (error) {
-        console.error('Error editing council meeting:', error);
-        throw new Error('Failed to edit council meeting');
-    }
-}
-
 /**
  * A council meeting, as the current viewer may see it.
  *
@@ -127,7 +90,7 @@ export async function getCouncilMeeting(cityId: string, id: string): Promise<Cou
     try {
         const meeting = await getCouncilMeetingDirect(cityId, id);
 
-        if (meeting && !meeting.released && !(await isUserAuthorizedToEdit({ cityId }))) {
+        if (meeting && !meeting.released && !(await isUserAuthorizedToEdit({ cityId, councilMeetingId: id }))) {
             return null;
         }
         return meeting;
@@ -152,9 +115,32 @@ export async function getCouncilMeetingDirect(cityId: string, id: string): Promi
     });
 }
 
+const meetingByYouTubeVideoSelect = {
+    cityId: true,
+    id: true,
+    youtubeUrl: true,
+    city: { select: { realm: true } },
+} satisfies Prisma.CouncilMeetingSelect;
+
+/**
+ * The released council meeting whose stored youtubeUrl is the given YouTube
+ * video, or null. The SQL `contains` only narrows the candidates; each stored
+ * URL is parsed, so an id inside a playlist parameter or at the start of a
+ * longer path segment never counts. When several meetings share the video
+ * (e.g. re-uploads), the most recent one wins.
+ */
+export async function findCouncilMeetingByYouTubeVideoId(videoId: string) {
+    const candidates = await prisma.councilMeeting.findMany({
+        where: { released: true, youtubeUrl: { contains: videoId } },
+        orderBy: [{ dateTime: 'desc' }, { createdAt: 'desc' }],
+        select: meetingByYouTubeVideoSelect,
+    });
+    return candidates.find(candidate => parseVideoId(candidate.youtubeUrl) === videoId) ?? null;
+}
+
 const upcomingMeetingInclude = {
     city: { select: { id: true, name: true, name_municipality: true, logoImage: true, timezone: true } },
-    administrativeBody: true,
+    administrativeBody: publicAdministrativeBodyRelation,
 } satisfies Prisma.CouncilMeetingInclude;
 
 export type UpcomingMeetingWithCity = Prisma.CouncilMeetingGetPayload<{
@@ -163,17 +149,18 @@ export type UpcomingMeetingWithCity = Prisma.CouncilMeetingGetPayload<{
 
 export async function getUpcomingMeetings(realm: Realm, { limit = 10 }: { limit?: number } = {}): Promise<UpcomingMeetingWithCity[]> {
     try {
-        return await prisma.councilMeeting.findMany({
+        const meetings = await prisma.councilMeeting.findMany({
             where: {
-                // public visibility guard: never expose unreleased (draft) meetings
-                released: true,
+                ...publicMeetingWhere(realm),
                 dateTime: { gt: new Date() },
-                city: { ...PUBLIC_CITY_WHERE, realm },
+                // A postponed or cancelled meeting is not coming up.
+                ...TAKES_PLACE_WHERE,
             },
             orderBy: [{ dateTime: 'asc' }, { createdAt: 'asc' }],
             take: limit,
             include: upcomingMeetingInclude,
         });
+        return meetings.map(hideLinks);
     } catch (error) {
         console.error('Error fetching upcoming meetings:', error);
         throw new Error('Failed to fetch upcoming meetings');
@@ -182,7 +169,7 @@ export async function getUpcomingMeetings(realm: Realm, { limit = 10 }: { limit?
 
 // Cache tag for a realm's upcoming-meetings list — revalidated when a meeting's release toggles.
 // Not exported: a "use server" module may only export async functions, and it's used only here.
-const upcomingMeetingsTag = (realm: Realm) => `realm:${realm}:upcoming-meetings`;
+export const upcomingMeetingsTag = (realm: Realm) => `realm:${realm}:upcoming-meetings`;
 
 /**
  * Realm-scoped, cached wrapper around getUpcomingMeetings for the landing (read on every render).
@@ -200,11 +187,12 @@ export async function getUpcomingMeetingsCached(realm: Realm, { limit = 10 }: { 
 export async function toggleMeetingRelease(cityId: string, id: string, released: boolean): Promise<CouncilMeetingWithAdminBody> {
     await withUserAuthorizedToEdit({ councilMeetingId: id, cityId: cityId });
     try {
-        const updatedMeeting = await prisma.councilMeeting.update({
-            where: { cityId_id: { cityId, id } },
-            data: { released },
-            include: meetingWithAdminBodyInclude,
-        });
+        // The module also releases or hides the other meetings of a postponement.
+        const { meeting: updatedMeeting, changed } = await setMeetingReleased(cityId, id, released);
+        // The tasks create no notifications for an unreleased meeting: the
+        // release does. After the response: rendering one email per reader
+        // must not hold the admin's toggle.
+        if (released && changed) after(() => notifySubscribersOnRelease(cityId, id));
         // TODO: utilize api/cities/[cityId]/meetings/[meetingId] to edit the meeting
         revalidateTag(`city:${cityId}:meetings`, 'max');
         revalidatePath(`/${cityId}`, "layout");
@@ -216,6 +204,8 @@ export async function toggleMeetingRelease(cityId: string, id: string, released:
         }
         return updatedMeeting;
     } catch (error) {
+        // A lifecycle rule explains itself to the admin (lib/actions/meetings.ts).
+        if (error instanceof LifecycleRuleError) throw error;
         console.error('Error toggling council meeting release:', error);
         throw new Error('Failed to toggle council meeting release');
     }
@@ -233,12 +223,16 @@ export async function getMeetingDataForOG(cityId: string, meetingId: string) {
             select: {
                 name: true,
                 name_en: true,
+                kind: true,
+                sessionNumber: true,
+                urgent: true,
                 dateTime: true,
                 subjects: {
                     select: {
                         id: true,
                         name: true,
                         agendaItemIndex: true,
+                        agendaSectionIndex: true,
                         nonAgendaReason: true,
                         _count: { select: { contributions: true } },
                         topic: {
@@ -282,7 +276,7 @@ export async function getLatestReleasedMeetingIdForCity(cityId: string): Promise
     const now = new Date();
 
     const upcoming = await prisma.councilMeeting.findFirst({
-        where: { cityId, released: true, dateTime: { gt: now } },
+        where: { cityId, released: true, dateTime: { gt: now }, ...TAKES_PLACE_WHERE },
         orderBy: { dateTime: 'asc' },
         select: { id: true },
     });
@@ -290,7 +284,7 @@ export async function getLatestReleasedMeetingIdForCity(cityId: string): Promise
     if (upcoming) return upcoming.id;
 
     const latest = await prisma.councilMeeting.findFirst({
-        where: { cityId, released: true },
+        where: { cityId, released: true, ...TAKES_PLACE_WHERE },
         orderBy: { dateTime: 'desc' },
         select: { id: true },
     });
@@ -340,6 +334,10 @@ export async function getMeetingUploadLists(last30Days: boolean = false): Promis
             where: {
                 AND: [
                     { city: CUSTOMER_CITY_WHERE },
+                    // A postponed or cancelled meeting has nothing to upload, and
+                    // a meeting by circulation takes no transcription.
+                    TAKES_PLACE_WHERE,
+                    PUBLIC_RECORDING_WHERE,
                     {
                         NOT: {
                             taskStatuses: {
@@ -360,7 +358,8 @@ export async function getMeetingUploadLists(last30Days: boolean = false): Promis
         prisma.councilMeeting.findMany({
             where: {
                 dateTime: { gt: now },
-                city: CUSTOMER_CITY_WHERE
+                city: CUSTOMER_CITY_WHERE,
+                ...TAKES_PLACE_WHERE,
             },
             select: meetingListItemSelect,
             orderBy: { dateTime: 'asc' }

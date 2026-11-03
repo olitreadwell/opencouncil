@@ -34,7 +34,7 @@ jest.mock('@/lib/cache', () => ({
     getCityPetitionBucketCached: jest.fn(),
     getPartiesForCityCached: jest.fn(),
     getPeopleForCityCached: jest.fn(),
-    getAdministrativeBodiesForCityCached: jest.fn(),
+    getPublicAdministrativeBodiesForCityCached: jest.fn(),
     getAdministrativeBodiesWithPublicMeetingsCached: jest.fn(),
     getCityCached: jest.fn(),
     getCityMessageCached: jest.fn(),
@@ -46,6 +46,8 @@ jest.mock('@/lib/cache', () => ({
 
 jest.mock('@/lib/auth', () => ({
     isUserAuthorizedToEdit: jest.fn(),
+    getRoleLimitForCity: jest.fn(),
+    getUnreleasedScope: jest.fn(),
     getCurrentUser: jest.fn(),
 }));
 
@@ -55,6 +57,11 @@ jest.mock('@/lib/getMeetingData', () => ({
 
 jest.mock('@/lib/db/notifications', () => ({
     getNotificationPreferenceForCity: jest.fn(),
+}));
+
+// Its real module reaches next-auth's ESM entry through the magic-link helper.
+jest.mock('@/lib/db/consultations', () => ({
+    countOpenConsultationsForCity: jest.fn(),
 }));
 
 // A client component the layout mounts in the header; it pulls next-intl's
@@ -240,6 +247,8 @@ describe('PR1: server-side awaits run concurrently', () => {
         const cache = require('@/lib/cache');
         const auth = require('@/lib/auth');
         const notifications = require('@/lib/db/notifications');
+        const consultations = require('@/lib/db/consultations');
+        consultations.countOpenConsultationsForCity.mockResolvedValue(1);
 
         const cityD = deferred<unknown>();
         const messageD = deferred<unknown>();
@@ -280,7 +289,7 @@ describe('PR1: server-side awaits run concurrently', () => {
         // Both scopes of both bookends: the band's scope switch must not refetch.
         expect(cache.getCouncilMeetingsPreviewPublicCached).toHaveBeenCalledTimes(4);
         expect(cache.getCouncilMeetingsPreviewPublicCached).toHaveBeenCalledWith('athens', {
-            timeFilter: 'past', limit: 1, administrativeBodyTypes: ['council'],
+            timeFilter: 'past', limit: 1, administrativeBodyTypes: ['council'], takesPlace: true,
         });
         expect(cache.getSubjectCountForCityCached).toHaveBeenCalledTimes(1);
         // The petition bucket needs the city's status (a supported city has no
@@ -288,10 +297,13 @@ describe('PR1: server-side awaits run concurrently', () => {
         expect(cache.getCityPetitionBucketCached).not.toHaveBeenCalled();
         // The notification preference needs the user id, so it cannot fire yet.
         expect(notifications.getNotificationPreferenceForCity).not.toHaveBeenCalled();
+        // The open-consultation count needs to know whether the city has consultations.
+        expect(consultations.countOpenConsultationsForCity).not.toHaveBeenCalled();
 
-        cityD.resolve({ id: 'athens', status: 'listed', timezone: 'Europe/Athens', _count: { councilMeetings: 1, persons: 1, parties: 1 } });
+        cityD.resolve({ id: 'athens', status: 'listed', timezone: 'Europe/Athens', consultationsEnabled: true, _count: { councilMeetings: 1, persons: 1, parties: 1 } });
         await flushMicrotasks();
         expect(cache.getCityPetitionBucketCached).toHaveBeenCalledTimes(1);
+        expect(consultations.countOpenConsultationsForCity).toHaveBeenCalledWith('athens');
 
         // Resolve the user on its own; the preference chains off currentUserPromise
         // rather than off the whole batch, so it must fire now even though
@@ -375,19 +387,19 @@ describe('PR1: server-side awaits run concurrently', () => {
         await pending;
     });
 
-    it('people/page.tsx folds isUserAuthorizedToEdit into the Promise.all batch', async () => {
+    it('people/page.tsx folds getRoleLimitForCity into the Promise.all batch', async () => {
         const cache = require('@/lib/cache');
         const auth = require('@/lib/auth');
 
         const partiesD = deferred<unknown[]>();
         const adminD = deferred<unknown[]>();
         const peopleD = deferred<unknown[]>();
-        const authD = deferred<boolean>();
+        const authD = deferred<ReadonlySet<string> | null>();
 
         cache.getPartiesForCityCached.mockReturnValue(partiesD.promise);
-        cache.getAdministrativeBodiesForCityCached.mockReturnValue(adminD.promise);
+        cache.getPublicAdministrativeBodiesForCityCached.mockReturnValue(adminD.promise);
         cache.getPeopleForCityCached.mockReturnValue(peopleD.promise);
-        auth.isUserAuthorizedToEdit.mockReturnValue(authD.promise);
+        auth.getRoleLimitForCity.mockReturnValue(authD.promise);
 
         const { default: PeoplePage } = require('@/app/[locale]/(city)/[cityId]/(other)/(tabs)/people/page');
 
@@ -396,15 +408,15 @@ describe('PR1: server-side awaits run concurrently', () => {
         await flushMicrotasks();
 
         // The crucial assertion: auth must be invoked BEFORE the Promise.all batch resolves.
-        expect(auth.isUserAuthorizedToEdit).toHaveBeenCalledTimes(1);
+        expect(auth.getRoleLimitForCity).toHaveBeenCalledTimes(1);
         expect(cache.getPartiesForCityCached).toHaveBeenCalledTimes(1);
-        expect(cache.getAdministrativeBodiesForCityCached).toHaveBeenCalledTimes(1);
+        expect(cache.getPublicAdministrativeBodiesForCityCached).toHaveBeenCalledTimes(1);
         expect(cache.getPeopleForCityCached).toHaveBeenCalledTimes(1);
 
         partiesD.resolve([{ id: 'p', people: [] }]);
         adminD.resolve([]);
         peopleD.resolve([]);
-        authD.resolve(false);
+        authD.resolve(null);
 
         await pending;
     });

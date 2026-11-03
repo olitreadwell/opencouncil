@@ -25,13 +25,15 @@ Run commands (`npm`, `npx`, etc.) directly. Optionally, use `nix develop` for a 
 - `npm run prisma:migrate` - Run migrations in dev
 - `npm run prisma:studio` - Open Prisma Studio (visual editor)
 - `npm run prisma:migrate:reset` - Reset database and re-run migrations
-- `npx prisma db seed` - Seed database with sample data
+- `npm run db:deploy:seed` - Migrate and seed a local database: the published seed artifact on an empty one (see `docs/database-seeding.md`)
 
 **IMPORTANT**: When making schema changes, always use `--create-only` to generate the migration file without applying it:
 ```
 npx prisma migrate dev --name <migration_name> --create-only
 ```
 This allows testing the migration against a local database first before applying to production. Never run `npx prisma migrate dev` directly, as it both creates and applies the migration to whatever database `DATABASE_URL` points to.
+
+**New models and personal data**: the seed pipeline ships content tables to developers and previews, and never ships private tables. When you add a Prisma model, add it to `packages/seed-pipeline/config/tables.json` as `content` (public record) or `private` (personal data). `packages/seed-pipeline/src/tables.test.ts` fails until you do. If you are not sure, choose `private` and say so in the pull request. When you add a column with personal data to a content table, add a masking rule for it in the same file. When a code path writes rows of a private person into a content table (as reader addresses go into `Location`), add a `delete-when` rule for those rows. No test catches these cases. See `packages/seed-pipeline/README.md`.
 
 ### Direct Database Access
 
@@ -171,7 +173,7 @@ OpenCouncil uses a **decoupled async job processing system**:
 
 **Task types** in `src/lib/tasks/`:
 - `transcribe.ts` - Audio transcription
-- `fixTranscript.ts` - Automatic transcript correction
+- `fixTranscript.ts` - Automatic transcript correction, and transcript speaker identifications (see `src/lib/speakerIdentifications.ts`)
 - `summarize.ts` - AI-generated summaries
 - `processAgenda.ts` - Subject extraction from the agenda PDF
 - `generateHighlight.ts` - Highlight video rendering
@@ -194,7 +196,7 @@ Located in `src/lib/search/`:
 
 Multi-channel delivery in `src/lib/notifications/`:
 - **Email**: Via Resend
-- **WhatsApp and SMS**: the Notis service (`services/notis`) — this app sends neither
+- **WhatsApp and SMS**: the Notis service (`services/notis`). This app sends one thing only: the SMS with a phone verification code (`src/lib/phone-verification/sms.ts`)
 - Matching engine for user preferences (topics, locations, people, parties)
 - Approval workflow with pending queue
 - Rate limiting (500ms delays between sends)
@@ -397,7 +399,8 @@ Do not narrate each step. Do not repeat what the diff already shows.
 ## Environment Setup
 
 Required services:
-- PostgreSQL 14+ with PostGIS extension
+- PostgreSQL 16+ with PostGIS extension
+- PostgreSQL 16 with PostGIS extension; the seed restore needs the PostgreSQL 16 client tools
 - Elasticsearch instance
 - Task API server (separate backend)
 - S3-compatible storage (DigitalOcean Spaces)

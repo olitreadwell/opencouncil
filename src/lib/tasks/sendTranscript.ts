@@ -5,12 +5,14 @@ import prisma from '@/lib/db/prisma';
 import { sendEmail } from '@/lib/email/resend';
 import { TranscriptEmail } from '@/lib/email/templates/TranscriptEmail';
 import { generateMeetingDocxBuffer } from '@/lib/export/meetings-server';
+import { generateMeetingFileName } from '@/lib/export/download';
 import { sendTranscriptSentAdminAlert, sendTranscriptSendFailedAdminAlert } from '@/lib/discord';
 import { realmBaseUrl } from '@/lib/utils/realmBaseUrl';
 import { formatDate } from '@/lib/formatters/time';
 import { revalidateTag } from 'next/cache';
 import { withUserAuthorizedToEdit } from '@/lib/auth';
 import { checkTaskIdempotency } from './tasks';
+import { meetingLabelInCity } from '@/lib/meetingName';
 
 export interface SendTranscriptResult {
     success: boolean;
@@ -30,7 +32,9 @@ export async function sendTranscriptToMunicipality(
     meetingId: string
 ): Promise<SendTranscriptResult> {
     try {
-        await withUserAuthorizedToEdit({ councilMeetingId: meetingId, cityId });
+        // The city's, not the body admin's: sending the transcript is part of
+        // the human review, which a body admin does not complete (#828).
+        await withUserAuthorizedToEdit({ cityId });
 
         const idempotency = await checkTaskIdempotency('transcriptSent', cityId, meetingId);
         if (!idempotency.proceed) {
@@ -72,8 +76,7 @@ export async function sendTranscriptToMunicipality(
             return { success: false, error: errorMessage };
         }
 
-        // Filename format matches generateMeetingFileName in src/lib/export/meetings.tsx
-        const filename = `${cityId}_council_meeting_${meetingId}.docx`;
+        const filename = generateMeetingFileName(cityId, meetingId, 'docx');
 
         const transcriptUrl = `${realmBaseUrl(meeting.city.realm)}/${cityId}/${meetingId}/transcript`;
 
@@ -95,7 +98,7 @@ export async function sendTranscriptToMunicipality(
         // Send email with attachment (first email as 'to', rest as 'cc')
         const [primaryEmail, ...ccEmails] = contactEmails;
         const result = await sendEmail({
-            from: 'OpenCouncil <operations@opencouncil.gr>',
+            from: 'operations',
             to: primaryEmail,
             cc: ccEmails.length > 0 ? ccEmails : undefined,
             subject,
@@ -138,7 +141,7 @@ export async function sendTranscriptToMunicipality(
             cityId,
             cityName: meeting.city.name_en,
             meetingId,
-            meetingName: meeting.name,
+            meetingName: meetingLabelInCity(meeting, 'el'),
             recipientEmails: contactEmails,
             administrativeBodyName,
         });

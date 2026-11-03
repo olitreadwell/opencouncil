@@ -10,19 +10,25 @@ import { CityPreference } from "./types";
  */
 export function seedProfileFromPreferences(cities: CityPreference[]): string {
   if (cities.length === 0) {
-    return "Δεν έχει δηλώσει προτιμήσεις ειδοποιήσεων.";
+    return "Δεν έχει δηλώσει προτιμήσεις ενημερώσεων.";
   }
   return cities
     .map((city) => {
-      const parts = [`Έχει ενεργοποιήσει ειδοποιήσεις για ${city.cityName}.`];
+      const parts = [`Έχει ενεργοποιήσει ενημερώσεις για ${city.cityName}.`];
       if (city.topics.length > 0) {
         parts.push(`Θέματα που έχει επιλέξει: ${city.topics.join(", ")}.`);
       }
       if (city.locations.length > 0) {
         parts.push(`Περιοχές που τον αφορούν: ${city.locations.map(locationText).join(", ")}.`);
       }
-      if (city.topics.length === 0 && city.locations.length === 0) {
-        parts.push("Χωρίς συγκεκριμένα θέματα ή περιοχές.");
+      // An empty topic list is not «no interests»: the signup calls topics
+      // optional hints and its summary says «Όλα τα θέματα». Seeded as «no
+      // specific topics», the model read it as a reason for silence 69 times.
+      if (city.topics.length === 0) {
+        parts.push("Δεν περιόρισε θέματα: όλα τα θέματα του δήμου τον αφορούν.");
+      }
+      if (city.locations.length === 0) {
+        parts.push("Χωρίς συγκεκριμένες περιοχές.");
       }
       return parts.join(" ");
     })

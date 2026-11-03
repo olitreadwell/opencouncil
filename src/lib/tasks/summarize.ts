@@ -1,28 +1,46 @@
 "use server";
-import { CouncilMeeting, Prisma, SpeakerSegment } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 import { Utterance as ApiUtterance, SummarizeRequest, SummarizeResult } from "../apiTypes";
 import { getTranscript } from "../db/transcript";
 import { getPartiesForCity } from "../db/parties";
-import { startTask } from "./tasks";
 import { getCity } from "../db/cities";
 import { getCouncilMeeting } from "../db/meetings";
 import prisma from "../db/prisma";
 import { revalidateMeeting } from "../cache";
-import { getAvailableSpeakerSegmentIds, getSummarizeRequestBody, saveSubjectsForMeeting } from "../db/utils";
+import { getAvailableSpeakerSegmentIds, saveSubjectsForMeeting } from "../db/utils";
+import { requestSummarizeInternal } from "./summarizeInternal";
 import { withUserAuthorizedToEdit } from "../auth";
+import { taskScope } from "./types";
 import { after } from "next/server";
+import * as z from "zod";
 import { generateImagesForMeeting } from "../subjectImages";
 
+// A Server Action has no runtime types. Both fields land in the summarize
+// prompt, so they are bounded here.
+const summarizeInputSchema = z.object({
+    requestedSubjects: z.array(z.string().max(500)).max(100),
+    additionalInstructions: z.string().max(4000).optional(),
+});
+
+/**
+ * Browser-facing entry point for the admin panel's summarize button. Callers
+ * with no session, such as the MCP admin tools, use requestSummarizeInternal.
+ * A rejected input comes back as a value: production Next hides the message
+ * of an error that a Server Action throws.
+ */
 export async function requestSummarize(cityId: string, councilMeetingId: string, requestedSubjects: string[] = [], additionalInstructions?: string, {
     force = false
 }: {
     force?: boolean;
-} = {}) {
-    await withUserAuthorizedToEdit({ cityId });
-
-    const body = await getSummarizeRequestBody(councilMeetingId, cityId, requestedSubjects, additionalInstructions, { force });
-
-    return startTask('summarize', body, councilMeetingId, cityId, { force });
+} = {}): Promise<{ ok: true } | { ok: false; message: string }> {
+    await withUserAuthorizedToEdit(taskScope({ type: 'summarize', cityId, councilMeetingId }));
+    const input = summarizeInputSchema.safeParse({ requestedSubjects, additionalInstructions });
+    if (!input.success) {
+        const issue = input.error.issues[0];
+        return { ok: false, message: `${issue.path.join('.')}: ${issue.message}` };
+    }
+    await requestSummarizeInternal(cityId, councilMeetingId, input.data.requestedSubjects, input.data.additionalInstructions, { force });
+    return { ok: true };
 }
 
 export async function handleSummarizeResult(taskId: string, response: SummarizeResult) {
@@ -46,34 +64,6 @@ export async function handleSummarizeResult(taskId: string, response: SummarizeR
 
     const { councilMeeting } = task;
 
-    // Clean up stale data before saving new results.
-    // This runs on every successful callback (not just force), ensuring the DB
-    // is consistent even if a previous run left partial data.
-    // Summaries use upsert (keyed on speakerSegmentId) so they're overwritten naturally.
-    // TopicLabels and utterance discussion statuses need explicit cleanup because:
-    // - TopicLabels: upsert only creates/updates matching pairs; old labels for topics
-    //   no longer assigned to a segment remain as stale data.
-    // - Utterance statuses: only utterances present in the new response get updated;
-    //   utterances that had statuses from the previous run but aren't in the new
-    //   response keep their old (now stale) values.
-    console.log(`Cleaning up stale summarize data for meeting ${councilMeeting.id}`);
-
-    await prisma.topicLabel.deleteMany({
-        where: {
-            speakerSegment: { meetingId: councilMeeting.id, cityId: councilMeeting.cityId }
-        }
-    });
-
-    await prisma.utterance.updateMany({
-        where: {
-            speakerSegment: { meetingId: councilMeeting.id, cityId: councilMeeting.cityId }
-        },
-        data: {
-            discussionStatus: null,
-            discussionSubjectId: null
-        }
-    });
-
     const availableSpeakerSegmentIds = await getAvailableSpeakerSegmentIds(councilMeeting.id, councilMeeting.cityId);
 
     // Pre-fetch all topics to avoid repeated queries
@@ -89,8 +79,14 @@ export async function handleSummarizeResult(taskId: string, response: SummarizeR
     });
     const topicByName = new Map(topics.map(t => [t.name, t]));
 
-    // Prepare all operations for batch execution
-    const operations: any[] = [];
+    // The upserts below keep a label for a topic that is no longer assigned to its
+    // segment, so the old labels are deleted first. The delete is in the same
+    // transaction, so that a failure keeps the old labels.
+    const operations: Prisma.PrismaPromise<unknown>[] = [
+        prisma.topicLabel.deleteMany({
+            where: { speakerSegment: { meetingId: councilMeeting.id, cityId: councilMeeting.cityId } }
+        }),
+    ];
 
     for (const segmentSummary of response.speakerSegmentSummaries) {
         if (!availableSpeakerSegmentIds.includes(segmentSummary.speakerSegmentId)) {
@@ -146,22 +142,23 @@ export async function handleSummarizeResult(taskId: string, response: SummarizeR
     // With batching, this should complete quickly (< 10 seconds)
     await prisma.$transaction(operations);
 
-    // Save subjects: matches by agendaItemIndex to preserve existing IDs (avoids ES orphans)
-    // The discussion tags go in with the subjects: they must commit together, or the search
-    // index keeps the pre-tagging discussion metrics (elasticsearch/README.md).
+    // Save subjects: matches by the id the task hands back, then name, then agenda
+    // position, so existing IDs survive (avoids ES orphans). The discussion tags go in
+    // with the subjects: they must commit together, or the search index keeps the
+    // pre-tagging discussion metrics (elasticsearch/README.md). A response without
+    // tags passes an empty list, so that the tags of the previous run are still removed.
     await saveSubjectsForMeeting(
         response.subjects,
         councilMeeting.cityId,
         councilMeeting.id,
-        response.utteranceDiscussionStatuses
+        response.utteranceDiscussionStatuses ?? []
     );
 
     console.log(`Saved summaries and topic labels for meeting ${councilMeeting.id}`);
 
-    // Bust the meeting/subject cache now that all summarize results are persisted,
-    // BEFORE sending notifications below. The notification send is rate-limited
-    // (~500ms/recipient), so revalidating only after it finishes would let early
-    // recipients open the meeting and see stale, pre-summarize content.
+    // Bust the meeting/subject cache now that all summarize results are
+    // persisted. The notifications follow once the task reads as succeeded
+    // (tasks.ts), so their first readers open the new content.
     revalidateMeeting(councilMeeting.cityId, councilMeeting.id);
 
     // Illustrations for the non-agenda subjects, which only exist now. Agenda
@@ -169,59 +166,4 @@ export async function handleSummarizeResult(taskId: string, response: SummarizeR
     // callback must not wait on Gemini, and minutes of Gemini calls must
     // outlive the response rather than escape it. Each failure alerts on its own.
     after(() => generateImagesForMeeting(councilMeeting.cityId, councilMeeting.id));
-
-    // Create notifications if administrative body allows it
-    const adminBody = councilMeeting.administrativeBody;
-    if (adminBody && adminBody.notificationBehavior !== 'NOTIFICATIONS_DISABLED') {
-        const { createNotificationsForMeeting } = await import('../db/notifications');
-        const { releaseNotifications } = await import('../notifications/deliver');
-        const { sendNotificationsCreatedAdminAlert, sendNotificationsSentAdminAlert } = await import('../discord');
-
-        try {
-            const stats = await createNotificationsForMeeting(
-                councilMeeting.cityId,
-                councilMeeting.id,
-                'afterMeeting'
-            );
-
-            console.log(`Created ${stats.notificationsCreated} afterMeeting notifications for ${stats.subjectsTotal} subjects`);
-
-            const autoSend = adminBody.notificationBehavior === 'NOTIFICATIONS_AUTO';
-
-            // Send Discord admin alert about notification creation
-            if (stats.notificationsCreated > 0) {
-                sendNotificationsCreatedAdminAlert({
-                    cityName: councilMeeting.city.name_en,
-                    meetingName: councilMeeting.name,
-                    notificationType: 'afterMeeting',
-                    notificationsCreated: stats.notificationsCreated,
-                    subjectsTotal: stats.subjectsTotal,
-                    cityId: councilMeeting.cityId,
-                    meetingId: councilMeeting.id,
-                    autoSend
-                });
-            }
-
-            // If auto-send is enabled, release notifications immediately
-            if (autoSend) {
-                console.log('Auto-sending notifications...');
-                const releaseResult = await releaseNotifications(stats.notificationIds);
-                console.log(`Released notifications: ${releaseResult.emailsSent} emails`);
-
-                // Send Discord admin alert about sending
-                sendNotificationsSentAdminAlert({
-                    cityId: councilMeeting.cityId,
-                    meetingId: councilMeeting.id,
-                    cityName: councilMeeting.city.name_en,
-                    meetingName: councilMeeting.name,
-                    notificationCount: stats.notificationsCreated,
-                    emailsSent: releaseResult.emailsSent,
-                    failed: releaseResult.failed
-                });
-            }
-        } catch (error) {
-            console.error('Error creating notifications after summarize:', error);
-            // Don't throw - we don't want to fail the entire task if notifications fail
-        }
-    }
 }

@@ -17,7 +17,9 @@ const props = {
     onCancelConfirm: jest.fn(),
     onConfirm: jest.fn(),
     onLink: jest.fn(),
-    onAdaSubmit: jest.fn(),
+    offerableCount: 1,
+    renderAdaStep: ({ noCandidates }: { noCandidates: boolean }) => <div>ada-step {String(noCandidates)}</div>,
+    renderManualStep: () => <div>manual-step</div>,
     onOpenDocument: jest.fn(),
     onClose: jest.fn(),
     saving: false,
@@ -100,23 +102,11 @@ describe('LinkPanel', () => {
         ).toBeInTheDocument();
     });
 
-    it('names the primary row button with the subject when it has an agenda number', () => {
+    it('labels every row button with the plain outcome word', () => {
+        // The panel sits under the subject's row, so the visible text need not
+        // repeat the subject; the aria-label still names both.
         renderPanel();
-        // The aria-label always names the decision, so the visible text —
-        // what would actually overflow the button — is asserted separately.
         const button = screen.getByRole('button', { name: 'Σύνδεση της απόφασης 670/2026 με το θέμα 30' });
-        expect(button).toHaveTextContent('Σύνδεση με το θέμα 30');
-    });
-
-    it('falls back to a plain button label when the subject has no agenda number', () => {
-        // A named subject's full label ("το θέμα «Ανάθεση υπηρεσιών
-        // καθαριότητας σε ιδιώτη»") does not fit a button — see
-        // QuestionsCard's `hasAgendaNumber` for the established pattern.
-        const subjectLabel = 'το θέμα «Ανάθεση υπηρεσιών καθαριότητας σε ιδιώτη»';
-        renderPanel({ subjectLabel, hasAgendaNumber: false });
-        const button = screen.getByRole('button', {
-            name: `Σύνδεση της απόφασης 670/2026 με ${subjectLabel}`,
-        });
         expect(button.textContent).toBe('Σύνδεση');
     });
 
@@ -165,6 +155,79 @@ describe('LinkPanel', () => {
         expect(screen.getByRole('button', { name: /Δοκιμή ξανά/ })).toBeInTheDocument();
     });
 
+    it('opens on the ΑΔΑ step when no decision is free to link', () => {
+        renderPanel({ rows: [], offerableCount: 0 });
+        expect(screen.getByText('ada-step true')).toBeInTheDocument();
+    });
+
+    it('leaves the title to the ΑΔΑ step and the manual form, which carry their own', async () => {
+        const current = { id: 'd1', number: '640/2026', title: 'Παλιά απόφαση', reversible: true };
+        renderPanel({ current });
+        expect(screen.getByRole('heading', { name: /Αλλαγή απόφασης για το θέμα 30/ })).toBeInTheDocument();
+        expect(screen.getByText(/Τώρα:/)).toBeInTheDocument();
+
+        await userEvent.click(screen.getByRole('button', { name: /Προσθήκη με ΑΔΑ/ }));
+        expect(screen.getByText('ada-step false')).toBeInTheDocument();
+        expect(screen.queryByRole('heading')).not.toBeInTheDocument();
+        expect(screen.queryByText(/Τώρα:/)).not.toBeInTheDocument();
+    });
+
+    it('hands both steps the way to close the panel', async () => {
+        const onClose = jest.fn();
+        renderPanel({
+            onClose,
+            renderAdaStep: ({ onClose: close }: { onClose: () => void }) => <button onClick={close}>ada-close</button>,
+            renderManualStep: ({ onClose: close }: { onClose: () => void }) => <button onClick={close}>manual-close</button>,
+        });
+        await userEvent.click(screen.getByRole('button', { name: /Προσθήκη με ΑΔΑ/ }));
+        await userEvent.click(screen.getByRole('button', { name: 'ada-close' }));
+        expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it('shows no panel title over the manual form', async () => {
+        renderPanel();
+        await userEvent.click(screen.getByRole('button', { name: 'Χειροκίνητη προσθήκη' }));
+        expect(screen.getByText('manual-step')).toBeInTheDocument();
+        expect(screen.queryByRole('heading')).not.toBeInTheDocument();
+    });
+
+    it('offers no ΑΔΑ search for a meeting that takes no decisions', () => {
+        renderPanel({ rows: [], offerableCount: 0, renderAdaStep: null });
+        expect(screen.getByText('manual-step')).toBeInTheDocument();
+        expect(screen.queryByText(/ada-step/)).not.toBeInTheDocument();
+    });
+
+    it('offers no way back when there is neither a list nor an ΑΔΑ step', () => {
+        const renderManualStep = jest.fn(() => <div>manual-step</div>);
+        renderPanel({ rows: [], offerableCount: 0, renderAdaStep: null, renderManualStep });
+        expect(renderManualStep).toHaveBeenCalledWith(expect.objectContaining({ onBack: null }));
+    });
+
+    it('lists no ΑΔΑ route for a meeting that takes no decisions', () => {
+        renderPanel({ renderAdaStep: null });
+        expect(screen.queryByRole('button', { name: /Προσθήκη με ΑΔΑ/ })).not.toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'Χειροκίνητη προσθήκη' })).toBeInTheDocument();
+    });
+
+    it('opens on the list when a decision is free to link, and reaches both other routes', async () => {
+        renderPanel();
+        expect(screen.getByText('670/2026')).toBeInTheDocument();
+        expect(screen.getByText('Έγκριση απόφασης Δημάρχου')).toBeInTheDocument();
+        await userEvent.click(screen.getByRole('button', { name: 'Χειροκίνητη προσθήκη' }));
+        expect(screen.getByText('manual-step')).toBeInTheDocument();
+    });
+
+    it('shows the first eight rows and a count of the rest', async () => {
+        const rows = Array.from({ length: 10 }, (_, i) => ({
+            kind: 'free' as const, likely: false, elsewhere: null,
+            candidate: { ...candidate, id: `c${i}`, decisionNumber: `${i + 1}/2026` },
+        }));
+        renderPanel({ rows, offerableCount: 10 });
+        expect(screen.queryByText('10/2026')).not.toBeInTheDocument();
+        await userEvent.click(screen.getByRole('button', { name: 'Εμφάνιση όλων (10)' }));
+        expect(screen.getByText('10/2026')).toBeInTheDocument();
+    });
+
     // jsdom applies no stylesheet, so this checks the class the panel carries,
     // not a measured indent. The panel opens under a table row, so it lines its
     // contents up with the Θέμα column — from `md` up, where that column exists.
@@ -185,7 +248,7 @@ describe('LinkPanel', () => {
         // could fail and leave nothing on screen to say so.
         renderPanel({ error: 'Η απόφαση ΨΞΚ1ΩΗΔ-Α1Β είναι ήδη συνδεδεμένη με το θέμα 30.' });
         await userEvent.click(screen.getByRole('button', { name: /Προσθήκη με ΑΔΑ/ }));
-        expect(screen.getByRole('heading', { name: /Προσθήκη απόφασης με ΑΔΑ/ })).toBeInTheDocument();
+        expect(screen.getByText('ada-step false')).toBeInTheDocument();
         expect(screen.getByText(/Δεν άλλαξε τίποτα/)).toBeInTheDocument();
         expect(screen.getByText(/είναι ήδη συνδεδεμένη με το θέμα 30/)).toBeInTheDocument();
         expect(screen.getByRole('button', { name: /Δοκιμή ξανά/ })).toBeInTheDocument();

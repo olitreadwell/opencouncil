@@ -4,7 +4,7 @@
 
 Start here to build a mental model of how OpenCouncil works.
 
-- **[infrastructure.md](./infrastructure.md)** — Deployment topology: which branch deploys where, how environments and databases connect, known limitations. Includes a visual diagram of the full system.
+- **[infrastructure.md](./infrastructure.md)** — Deployment topology: which branch deploys where, how environments and databases connect and how they are backed up, known limitations. Includes a visual diagram of the full system.
 - **[task-architecture.md](./task-architecture.md)** — How the async task system works: the callback flow between this app and the opencouncil-tasks server, task lifecycle, handler registry pattern, and how to add new task types.
 - **[pricing-system.md](./pricing-system.md)** — Centralized pricing configuration, calculation logic, and immutability guarantees.
 
@@ -23,6 +23,7 @@ How to get the app running on your machine.
 Deep dives into specific features — architecture, data flow, and implementation details.
 
 - **[guides/meeting-lifecycle.md](./guides/meeting-lifecycle.md)** — The complete meeting pipeline from agenda PDF to searchable, summarized page. Processing stages, status tracking, and the task orchestration behind it.
+- **[../elasticsearch/README.md](../elasticsearch/README.md)** — Search: the hybrid query, and how PGSync copies PostgreSQL rows to Elasticsearch. It lists the changes that sync live, the rules for `schema.json` and `views.sql`, and the deployment of a schema change.
 - **[guides/editing-interface.md](./guides/editing-interface.md)** — Transcript editing mode: lifecycle, keyboard shortcuts, speaker management, timestamp adjustment
 - **[guides/consultations.md](./guides/consultations.md)** — Public consultation feature: regulation viewer, comments, geo-editor, JSON schema
 - **[guides/meeting-highlights.md](./guides/meeting-highlights.md)** — Video highlight generation: multi-page flow, video formats (16:9, 9:16), rendering
@@ -32,14 +33,13 @@ Deep dives into specific features — architecture, data flow, and implementatio
 - **[guides/embed-widgets.md](./guides/embed-widgets.md)** — Iframe widgets for external sites: the meetings, hot subjects and meeting summary widgets, their params, theming, caching and the configurator
 - **[guides/serbian-localization.md](./guides/serbian-localization.md)** — Serbian dual-script support: Cyrillic-canonical catalogs, generated Latin, render-time transliteration, glossary, and the native-review workflow gating the serbia realm launch
 - **[notifications.prd.md](./notifications.prd.md)** — Notifications: matching subjects to preferences, email deliveries, admin approval, the signup flow, the profile switch
-- **[../services/notis/README.md](../services/notis/README.md)** — Νότης, the WhatsApp agent: enrollment, wakes, templates, and the subscriptions API the main app calls
+- **[../services/notis/README.md](../services/notis/README.md)** — Νότης, the WhatsApp agent: enrollment, wakes, templates, support requests to the team, and the subscriptions API the main app calls
 - **[bird-setup.md](./bird-setup.md)** — Bird (WhatsApp + SMS): workspace, channels, webhook secret, and the Notis webhook subscription
 
 ## Operations & Infrastructure
 
 Procedures for working with the deployed environments.
 
-- **[guides/database-access.md](./guides/database-access.md)** — Database roles (readonly, readandwrite), copying production data with `scripts/copy_db.sh`, connecting locally to remote databases
 - **[guides/preview-deployments.md](./guides/preview-deployments.md)** — Automated per-PR preview environments: GitHub Actions flow, NixOS droplet, port mapping, Caddy config
 - **[guides/cachix-setup.md](./guides/cachix-setup.md)** — Nix binary cache configuration for preview deployment builds
 - **[admin-alerts.md](./admin-alerts.md)** — Discord webhook setup for system event notifications

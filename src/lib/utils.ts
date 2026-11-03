@@ -26,13 +26,8 @@ export {
   getDateRangeFromRoles,
   getActivePartyRole,
   getPartyFromRoles,
-  getNonPartyRoles,
-  getSingleCityRole,
   hasCityLevelRole,
-  simplifyRoleName,
   getActiveRoleCondition,
-  getRoleNameForPerson,
-  getSpeakerDisplayInfo,
   sortRolesByPriority,
   getRoleTypePriority,
   getPrimaryRole,
@@ -44,13 +39,8 @@ export const IS_DEV = process.env.NODE_ENV === 'development';
 
 export const SUBJECT_POINT_COLOR = '#E57373'; // A nice red color that contrasts with the blue city polygons
 
-export const UNKNOWN_SPEAKER_LABEL = "Άγνωστος Ομιλητής";
-
 /** The grey for speakers without a party — one value across transcript borders, search results and the playback bar. */
 export const UNKNOWN_SPEAKER_COLOR = '#D3D3D3';
-
-export const buildUnknownSpeakerLabel = (index: number) =>
-  `${UNKNOWN_SPEAKER_LABEL} ${index}`;
 
 export function subjectToMapFeature(subject: SubjectWithRelations) {
   if (!subject.location?.coordinates) return null;
@@ -131,6 +121,30 @@ export function monthsBetween(startDate: Date, endDate: Date): number {
 
 // Removed time formatting functions as they are now re-exported from src/lib/formatters/time.ts
 
+export interface AgendaPositioned {
+  agendaItemIndex?: number | null;
+  agendaSectionIndex?: number | null;
+}
+
+/**
+ * Agenda order as the document prints it: the numbered rows first, by section
+ * and then by number. A subject without a number sorts after every numbered
+ * one. A subject without a section sorts as section 0, which keeps a one-list
+ * agenda in plain number order. (issue 366)
+ */
+export function compareAgendaPosition(a: AgendaPositioned, b: AgendaPositioned): number {
+  const aNumbered = a.agendaItemIndex != null ? 0 : 1;
+  const bNumbered = b.agendaItemIndex != null ? 0 : 1;
+  if (aNumbered !== bNumbered) return aNumbered - bNumbered;
+  const aSection = a.agendaSectionIndex ?? 0;
+  const bSection = b.agendaSectionIndex ?? 0;
+  if (aSection !== bSection) return aSection - bSection;
+  const aIndex = a.agendaItemIndex ?? Infinity;
+  const bIndex = b.agendaItemIndex ?? Infinity;
+  if (aIndex === bIndex) return 0;
+  return aIndex - bIndex;
+}
+
 /**
  * Minimal interface for subjects that can be sorted by importance.
  * Only declares the fields actually used by the sorting logic.
@@ -142,6 +156,7 @@ interface SortableSubject {
   statistics?: Statistics;
   speakerSegments?: unknown[];
   agendaItemIndex?: number | null;
+  agendaSectionIndex?: number | null;
   nonAgendaReason?: string | null;
   // Notification importance assigned during agenda processing ('high' | 'normal' |
   // 'doNotNotify'). Available before summarization, so it is a meaningful tie-breaker
@@ -199,10 +214,9 @@ export function sortSubjectsByImportance<T extends SortableSubject>(
         }
       }
 
-      // Fallback to agenda item index
-      const aIndex = a.agendaItemIndex ?? Infinity;
-      const bIndex = b.agendaItemIndex ?? Infinity;
-      if (aIndex !== bIndex) return aIndex - bIndex;
+      // Fallback to agenda position
+      const byPosition = compareAgendaPosition(a, b);
+      if (byPosition !== 0) return byPosition;
 
       return a.name.localeCompare(b.name);
     });
@@ -222,10 +236,9 @@ export function sortSubjectsByImportance<T extends SortableSubject>(
     const bScore = scores.get(b) ?? 0;
     if (aScore !== bScore) return bScore - aScore;
 
-    // 3. Agenda item index (ascending), non-agenda items sort after agenda items
-    const aIndex = a.agendaItemIndex ?? Infinity;
-    const bIndex = b.agendaItemIndex ?? Infinity;
-    if (aIndex !== bIndex) return aIndex - bIndex;
+    // 3. Agenda position (section, then number); non-agenda items sort after agenda items
+    const byPosition = compareAgendaPosition(a, b);
+    if (byPosition !== 0) return byPosition;
 
     // Final tie-breaker: alphabetical by name
     return a.name.localeCompare(b.name);
@@ -257,28 +270,31 @@ export function sortSubjectsBySpeakerContributionCount<T extends SortableSubject
     const bRank = topicImportanceRank(b.topicImportance);
     if (aRank !== bRank) return aRank - bRank;
 
-    const aIndex = a.agendaItemIndex ?? Infinity;
-    const bIndex = b.agendaItemIndex ?? Infinity;
-    if (aIndex !== bIndex) return aIndex - bIndex;
+    const byPosition = compareAgendaPosition(a, b);
+    if (byPosition !== 0) return byPosition;
 
     return a.name.localeCompare(b.name);
   });
 }
 
 export function sortSubjectsByAgendaIndex<T extends SortableSubject>(subjects: T[]): T[] {
-  return [...subjects].sort((a, b) => {
-    const aIndex = a.agendaItemIndex ?? Infinity;
-    const bIndex = b.agendaItemIndex ?? Infinity;
-    if (aIndex !== bIndex) return aIndex - bIndex;
-    return a.name.localeCompare(b.name);
-  });
+  return [...subjects].sort((a, b) => compareAgendaPosition(a, b) || a.name.localeCompare(b.name));
 }
 
 // Re-export calculateOfferTotals from the pricing module for backward compatibility
 export { calculateOfferTotals } from './pricing'
 
 
-export function joinTranscriptSegments(speakerSegments: Transcript): Transcript {
+/**
+ * Joins adjacent segments of the same person into one.
+ *
+ * With sameSpeakerTagOnly, the segments must also share their speaker tag.
+ * Two tags can point at one person while being two diarization speakers — two
+ * voices the voiceprint matched to the same person. Joining those would pass
+ * the second voice off as the first, so a reader who must judge each voice
+ * on its own (fixTranscript's speaker hints) keeps them apart.
+ */
+export function joinTranscriptSegments(speakerSegments: Transcript, { sameSpeakerTagOnly = false }: { sameSpeakerTagOnly?: boolean } = {}): Transcript {
   if (speakerSegments.length === 0) {
     return speakerSegments;
   }
@@ -290,6 +306,7 @@ export function joinTranscriptSegments(speakerSegments: Transcript): Transcript 
     const nextSegment = speakerSegments[i];
     if (nextSegment.speakerTag.personId && currentSegment.speakerTag.personId
       && nextSegment.speakerTag.personId === currentSegment.speakerTag.personId
+      && (!sameSpeakerTagOnly || nextSegment.speakerTagId === currentSegment.speakerTagId)
       && nextSegment.startTimestamp >= currentSegment.startTimestamp) {
       // Join adjacent segments with the same speaker
       currentSegment = {
@@ -339,6 +356,21 @@ export function normalizeText(text: string): string {
     .replace(/ϋ/g, 'υ')
     .replace(/ΐ/g, 'ι')
     .replace(/ΰ/g, 'υ');
+}
+
+/**
+ * The words of a list search, normalized. A list search needs every word, so
+ * "μαρια παπα" finds "Μαρία Παπαδοπούλου" in either order. The meetings tab
+ * searches on the server and the people and parties tabs in the browser; both
+ * read the words here, so the two agree.
+ */
+export function searchTerms(query: string): string[] {
+  return normalizeText(query).split(/\s+/).filter(Boolean);
+}
+
+/** Whether a normalized text holds every term. */
+export function matchesEveryTerm(normalizedText: string, terms: string[]): boolean {
+  return terms.every(term => normalizedText.includes(term));
 }
 
 /**

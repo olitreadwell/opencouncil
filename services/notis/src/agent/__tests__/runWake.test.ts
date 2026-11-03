@@ -1,7 +1,13 @@
+import fs from "node:fs";
+import path from "node:path";
 import { applyOutcome, runWake } from "../runWake";
+import { buildDecisionEntry } from "../decisions";
+import { decisionLine } from "../prompt";
 import {
   FIXED_NOW,
   FakeAnthropic,
+  ScriptedTurn,
+  makeBrief,
   makeDeps,
   makeState,
   meetingEvent,
@@ -530,12 +536,12 @@ describe("runWake", () => {
     expect(trace.turns).toHaveLength(3);
   });
 
-  it("the dangling-tool-call backstop still fires when a reader update lands the same turn", async () => {
-    // An end_turn that carries a tool_use block: the repair path appends the
-    // assistant turn verbatim, so the call sits unanswered in the MIDDLE of
-    // the message list. A message absorbed at the next turn's start must not
-    // hide it — the request would 400 with «`tool_use` ids were found without
-    // `tool_result` blocks», and every retry reproduces that.
+  it("an end_turn that carries a tool_use block is dispatched like a tool turn, and no call is left dangling", async () => {
+    // The model sometimes ends a turn that carries tool calls with end_turn.
+    // Those calls run like any other — the send below reaches the reader —
+    // and every request stays well-formed even when a reader update lands at
+    // the next turn's start (the request would 400 with «`tool_use` ids were
+    // found without `tool_result` blocks», and every retry reproduces that).
     const fake = new FakeAnthropic([
       { content: [text("σκέψη"), toolUse("d1", "send_message", { text: "x" })], stop_reason: "end_turn" },
       { content: [toolUse("t1", "send_message", { text: "Η απάντηση." })], stop_reason: "tool_use" },
@@ -554,7 +560,10 @@ describe("runWake", () => {
       }),
     );
 
-    expect(outcome.repairs).toContain("dangling-tool-calls");
+    // The reader update lands right before «x» leaves, so that send is held
+    // and re-decided; the second turn's answer goes out.
+    expect(outcome.messages).toEqual(["Η απάντηση."]);
+    expect(outcome.repairs).toEqual(["reader-update/held-sends"]);
     for (const req of fake.requests) {
       const msgs = req.messages as Array<{ role?: string; content?: unknown }>;
       msgs.forEach((m, i) => {
@@ -719,8 +728,10 @@ describe("runWake", () => {
     );
 
     expect(trace.turns.filter((t) => t.role !== "injected")).toHaveLength(5);
-    // The wake really did run out without finishing, and it says so.
-    expect(outcome.finishWakeMissing).toBe(true);
+    // The nudge went unanswered, which the repairs record — but finish_wake
+    // WAS called, so the wake is not a finish_wake breach.
+    expect(outcome.repairs).toEqual(["zero-send/finish", "nudge/unanswered"]);
+    expect(outcome.finishWakeMissing).toBeUndefined();
     expect(outcome.rationale).toBe("Της απάντησα ήδη νοερά.");
   });
 
@@ -833,15 +844,15 @@ describe("runWake", () => {
     expect(outcome.rationale.length).toBeGreaterThan(0);
   });
 
-  it("usage sums across turns and prices at opus-5 rates", async () => {
+  it("usage sums across turns and prices at sonnet-5 rates", async () => {
     const fake = new FakeAnthropic([
       { content: [toolUse("t1", "send_message", { text: "μήνυμα" })], stop_reason: "tool_use" },
       { content: [text("done")], stop_reason: "end_turn" },
     ]);
     const { trace } = await runWake(makeState(), [meetingEvent()], makeDeps(fake));
     expect(trace.usageTotal).toEqual({ input: 2000, output: 200, cacheWrite: 0, cacheRead: 0 });
-    // 2000/1M * $3 + 200/1M * $15 = 0.006 + 0.003
-    expect(trace.costUsd).toBeCloseTo(0.009, 10);
+    // 2000/1M * $2 + 200/1M * $10 = 0.004 + 0.002
+    expect(trace.costUsd).toBeCloseTo(0.006, 10);
   });
 
   it("purity: the input state is never mutated", async () => {
@@ -1214,5 +1225,1061 @@ describe("runWake incremental delivery (deps.deliver)", () => {
         deliver: async () => ({ ok: true }),
       }),
     ).rejects.toThrow("exhausted");
+  });
+});
+
+describe("runWake — production repairs (2026-10)", () => {
+  const userEvent = { type: "user_message" as const, at: FIXED_NOW.toISOString(), text: "τι έγινε;" };
+
+  it("runs the client tool calls of an end_turn response (finish_wake is not dropped)", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          text("Routine items only."),
+          toolUse("t1", "finish_wake", { decision: "silence", rationale: "Τίποτα για εκείνη." }),
+        ],
+        stop_reason: "end_turn",
+      },
+    ]);
+    const { outcome, trace } = await runWake(makeState(), [meetingEvent()], makeDeps(fake));
+    expect(outcome.rationale).toBe("Τίποτα για εκείνη.");
+    expect(outcome.finishWakeMissing).toBeUndefined();
+    expect(outcome.repairs).toBeUndefined();
+    expect(trace.turns).toHaveLength(1);
+  });
+
+  it("does not run the tool calls of a max_tokens turn", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [toolUse("t1", "send_message", { text: "Κομμένο μήνυμ" })],
+        stop_reason: "max_tokens",
+      },
+    ]);
+    const { outcome } = await runWake(makeState(), [meetingEvent()], makeDeps(fake));
+    expect(outcome.messages).toEqual([]);
+    expect(outcome.truncated).toBe(true);
+  });
+
+  it("a proactive wake that declares «send» without sending gets the delivery nudge", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          toolUse("t1", "finish_wake", {
+            decision: "send",
+            rationale: "Αξίζει σύντομη ειδοποίηση για την πλατεία.",
+            learnedSomethingLasting: false,
+            promisedFollowUp: false,
+          }),
+        ],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [
+          toolUse("t2", "send_message", { text: "Η πλατεία Κυψέλης παίρνει 2,3 εκατ." }),
+          toolUse("t3", "finish_wake", {
+            decision: "send",
+            rationale: "Την αφορά άμεσα.",
+            learnedSomethingLasting: false,
+            promisedFollowUp: false,
+          }),
+        ],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const { outcome } = await runWake(makeState(), [meetingEvent()], makeDeps(fake));
+    expect(outcome.repairs).toEqual(["zero-send/finish"]);
+    expect(outcome.decision).toBe("send");
+    expect(outcome.messages).toEqual(["Η πλατεία Κυψέλης παίρνει 2,3 εκατ."]);
+    expect(outcome.rationale).toBe("Την αφορά άμεσα.");
+  });
+
+  it("a reply wake that declares «silence» is asked once, and a «thanks» confirms it", async () => {
+    const silence = {
+      decision: "silence",
+      rationale: "Απλώς ευχαρίστησε.",
+      learnedSomethingLasting: false,
+      promisedFollowUp: false,
+    };
+    const fake = new FakeAnthropic([
+      { content: [toolUse("t1", "finish_wake", silence)], stop_reason: "tool_use" },
+      { content: [toolUse("t2", "finish_wake", silence)], stop_reason: "tool_use" },
+    ]);
+    const { outcome, trace } = await runWake(
+      makeState(),
+      [{ ...userEvent, text: "Ευχαριστώ!" }],
+      makeDeps(fake),
+    );
+    expect(outcome.repairs).toEqual(["declared-silence/finish"]);
+    expect(outcome.decision).toBe("silence");
+    expect(outcome.rationale).toBe("Απλώς ευχαρίστησε.");
+    expect(trace.turns).toHaveLength(3);
+    expect(trace.turns[1].role).toBe("injected");
+    expect(JSON.stringify(fake.requests[1].messages)).toContain("you chose silence");
+  });
+
+  it("a declared «silence» on a question the record cannot answer still gets the reply", async () => {
+    // Observed in production: the searches found nothing, the model
+    // declared silence so as not to guess, and the reader never heard back.
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          toolUse("t1", "finish_wake", {
+            decision: "silence",
+            rationale: "Δύο αναζητήσεις δεν βρήκαν τον ΟΣΕ· δεν θέλω να μαντέψω.",
+            learnedSomethingLasting: false,
+            promisedFollowUp: false,
+          }),
+        ],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [
+          toolUse("t2", "send_message", {
+            text: "Έψαξα για τον ΟΣΕ στην Κυψέλη και δεν βρήκα κάτι. Εννοείς τις γραμμές ή κάτι άλλο;",
+          }),
+          toolUse("t3", "finish_wake", {
+            decision: "send",
+            rationale: "Ρώτησε για τον ΟΣΕ· το αρχείο δεν έχει κάτι, της ζήτησα διευκρίνιση.",
+            learnedSomethingLasting: false,
+            promisedFollowUp: false,
+          }),
+        ],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const { outcome, trace } = await runWake(
+      makeState(),
+      [{ ...userEvent, text: "Τι γίνεται με τον ΟΣΕ;" }],
+      makeDeps(fake),
+    );
+    expect(outcome.repairs).toEqual(["declared-silence/finish"]);
+    expect(outcome.decision).toBe("send");
+    expect(outcome.messages).toEqual([
+      "Έψαξα για τον ΟΣΕ στην Κυψέλη και δεν βρήκα κάτι. Εννοείς τις γραμμές ή κάτι άλλο;",
+    ]);
+    expect(outcome.rationale).toBe("Ρώτησε για τον ΟΣΕ· το αρχείο δεν έχει κάτι, της ζήτησα διευκρίνιση.");
+    expect(trace.turns).toHaveLength(3);
+  });
+
+  it("English reasoning written as text next to finish_wake earns no nudge", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          text(
+            "The brief shows only routine committee items. Nothing here touches Kypseli or " +
+            "the reader's topics, so silence is the right call for this wake.",
+          ),
+          toolUse("t1", "finish_wake", { decision: "silence", rationale: "Ρουτίνα." }),
+        ],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const { outcome, trace } = await runWake(makeState(), [meetingEvent()], makeDeps(fake));
+    expect(outcome.repairs).toBeUndefined();
+    expect(outcome.rationale).toBe("Ρουτίνα.");
+    expect(trace.turns).toHaveLength(1);
+  });
+
+  it("Greek prose that reads like an unsent message still earns the nudge", async () => {
+    const draft =
+      "Μικρή ενημέρωση και για το δεύτερο θέμα: το πάρκινγκ στην Πατησίων αναβλήθηκε για τον " +
+      "Οκτώβριο, όπως ζήτησε η αντιπολίτευση.";
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          toolUse("t1", "send_message", { text: "Η πλατεία Κυψέλης παίρνει 2,3 εκατ." }),
+          text(draft),
+          toolUse("t2", "finish_wake", { decision: "send", rationale: "Την αφορά." }),
+        ],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [
+          toolUse("t3", "send_message", { text: draft }),
+          toolUse("t4", "finish_wake", { decision: "send", rationale: "Την αφορά." }),
+        ],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const { outcome } = await runWake(makeState(), [meetingEvent()], makeDeps(fake));
+    expect(outcome.repairs).toEqual(["stranded-prose/finish"]);
+    expect(outcome.messages).toHaveLength(2);
+  });
+
+  it("a promise in the sent text triggers the commitment nudge even when finish_wake denies it", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          toolUse("t1", "send_message", { text: "Θα σε ενημερώσω μόλις βγει η απόφαση." }),
+          toolUse("t2", "finish_wake", {
+            decision: "send",
+            rationale: "Ρώτησε για την απόφαση.",
+            learnedSomethingLasting: false,
+            promisedFollowUp: false,
+          }),
+        ],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [
+          toolUse("t3", "record_commitment", { slug: "apofasi", what: "Να της πω την απόφαση." }),
+          toolUse("t4", "finish_wake", {
+            decision: "send",
+            rationale: "Ρώτησε για την απόφαση· το κατέγραψα.",
+            learnedSomethingLasting: false,
+            promisedFollowUp: true,
+          }),
+        ],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake));
+    expect(outcome.repairs).toEqual(["promised/no-commitment"]);
+    expect(outcome.commitments?.record).toEqual([{ slug: "apofasi", what: "Να της πω την απόφαση." }]);
+  });
+
+  it("the learning nudge never fires on a wake without a reader message", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          toolUse("t1", "finish_wake", {
+            decision: "silence",
+            rationale: "Ο αναγνώστης μάλλον είναι ο σύμβουλος που μίλησε.",
+            learnedSomethingLasting: true,
+            promisedFollowUp: false,
+          }),
+        ],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const { outcome, trace } = await runWake(makeState(), [meetingEvent()], makeDeps(fake));
+    expect(outcome.repairs).toBeUndefined();
+    expect(outcome.profileRewrite).toBeUndefined();
+    expect(trace.turns).toHaveLength(1);
+  });
+
+  it("two nudges keep the first genuine rationale, not the answer to the first nudge", async () => {
+    const fake = new FakeAnthropic([
+      {
+        // Reply wake, nothing sent, promise declared: delivery nudge first.
+        content: [
+          toolUse("t1", "finish_wake", {
+            decision: "send",
+            rationale: "Της απάντησα για το πάρκινγκ.",
+            learnedSomethingLasting: false,
+            promisedFollowUp: true,
+          }),
+        ],
+        stop_reason: "tool_use",
+      },
+      {
+        // Still nothing sent; meta rationale about the check. Bookkeeping nudge follows.
+        content: [
+          toolUse("t2", "finish_wake", {
+            decision: "silence",
+            rationale: "That text was my own reasoning, nothing to send.",
+            learnedSomethingLasting: false,
+            promisedFollowUp: true,
+          }),
+        ],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [
+          toolUse("t3", "record_commitment", { slug: "parking", what: "Να της πω για το πάρκινγκ." }),
+          toolUse("t4", "finish_wake", {
+            decision: "silence",
+            rationale: "Recorded the commitment as asked by the check.",
+            learnedSomethingLasting: false,
+            promisedFollowUp: true,
+          }),
+        ],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake));
+    expect(outcome.repairs).toEqual(["zero-send/finish", "promised/no-commitment"]);
+    expect(outcome.rationale).toBe("Της απάντησα για το πάρκινγκ.");
+    expect(outcome.finishWakeMissing).toBeUndefined();
+  });
+
+  it("strips citation markup from a sent message", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          toolUse("t1", "send_message", {
+            text: 'Ο δήμος <cite index="3-1">ανακοίνωσε την παράταση</cite> έως τον Νοέμβριο.',
+          }),
+          toolUse("t2", "finish_wake", { decision: "send", rationale: "Ρώτησε." }),
+        ],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake));
+    expect(outcome.messages).toEqual(["Ο δήμος ανακοίνωσε την παράταση έως τον Νοέμβριο."]);
+  });
+});
+
+describe("runWake helpers", () => {
+  const { PROMISE_PATTERN, proseLooksLikeAMessage, sanitizeMessageText } = jest.requireActual<
+    typeof import("../runWake")
+  >("../runWake");
+
+  it("PROMISE_PATTERN catches follow-up promises, not immediate sends or negations", () => {
+    expect(PROMISE_PATTERN.test("Θα σε ενημερώσω μόλις βγει η απόφαση.")).toBe(true);
+    expect(PROMISE_PATTERN.test("Θα σου πω τι αποφασίστηκε την Τρίτη.")).toBe(true);
+    expect(PROMISE_PATTERN.test("Το κρατάω και επανέρχομαι.")).toBe(true);
+    expect(PROMISE_PATTERN.test("Θα σου στείλω το link τώρα: https://opencouncil.gr/athens")).toBe(false);
+    expect(PROMISE_PATTERN.test("Δεν θα σε ενημερώσω για κάθε συνεδρίαση.")).toBe(false);
+  });
+
+  it("proseLooksLikeAMessage ignores links and tiny sends when judging the prose", () => {
+    const draft =
+      "Η πλατεία Κυψέλης παίρνει 2,3 εκατ. για ανάπλαση, ομόφωνα. " +
+      "https://opencouncil.gr/athens/meetings/abc123/subjects/xyz789abcdef";
+    expect(proseLooksLikeAMessage(draft, [])).toBe(true);
+    expect(proseLooksLikeAMessage(draft, ["Ναι."])).toBe(true);
+    expect(proseLooksLikeAMessage(draft, [draft])).toBe(false);
+    expect(
+      proseLooksLikeAMessage("The brief shows routine items only; silence is right for this wake.", []),
+    ).toBe(false);
+  });
+
+  it("sanitizeMessageText drops citation tags and keeps the words", () => {
+    expect(sanitizeMessageText('Ο δήμος <cite index="3-1">ανακοίνωσε</cite> παράταση.')).toBe(
+      "Ο δήμος ανακοίνωσε παράταση.",
+    );
+  });
+
+  it("English reasoning next to a declared silence on a reply wake is not quoted as a draft", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          text(
+            "The reader is just thanking me for the earlier answer. There is nothing new to " +
+            "research or to send, so I will stay silent on this wake.",
+          ),
+          toolUse("t1", "finish_wake", { decision: "silence", rationale: "Ευχαρίστησε." }),
+        ],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [toolUse("t2", "finish_wake", { decision: "silence", rationale: "Ευχαρίστησε." })],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const { outcome, trace } = await runWake(
+      makeState(),
+      [{ type: "user_message", at: FIXED_NOW.toISOString(), text: "Ευχαριστώ!" }],
+      makeDeps(fake),
+    );
+    // The reader wrote, so the one delivery nudge still fires — but as the
+    // silence check, not as a stranded-prose quote of the reasoning.
+    expect(outcome.repairs).toEqual(["declared-silence/finish"]);
+    expect(outcome.decision).toBe("silence");
+    expect(trace.turns).toHaveLength(3);
+    const secondReq = JSON.stringify(fake.requests[1].messages);
+    expect(secondReq).toContain("you chose silence");
+    expect(secondReq).not.toContain("The undelivered text was");
+  });
+});
+
+describe("runWake — links nothing vouches for (2026-10)", () => {
+  const userEvent = { type: "user_message" as const, at: FIXED_NOW.toISOString(), text: "Είναι καλός δήμαρχος;" };
+  const MAYOR_ID = "cm0tqeh9m08mj4o47a2xw2265";
+  const mcpResult = (text: string) => ({
+    type: "mcp_tool_result",
+    tool_use_id: "m1",
+    is_error: false,
+    content: [{ type: "text", text }],
+  });
+
+  it("holds a send whose link came from nowhere, nudges once, and delivers the corrected one", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          toolUse("t1", "send_message", {
+            text: "Δεν κρίνω εγώ — δες τι λέει: https://opencouncil.gr/athens/people/dukas",
+          }),
+          toolUse("t2", "finish_wake", { decision: "send", rationale: "Ζήτησε κρίση, έδωσα το αρχείο." }),
+        ],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [
+          { type: "mcp_tool_use", id: "m1", name: "list_people", input: { cityId: "athens" }, server_name: "opencouncil" },
+          mcpResult(`{"people":[{"id":"${MAYOR_ID}","name":"Χάρης Δούκας","role":"Δήμαρχος"}]}`),
+          toolUse("t3", "send_message", {
+            text: `Δεν κρίνω εγώ — δες τι λέει: https://opencouncil.gr/athens/people/${MAYOR_ID}`,
+          }),
+          toolUse("t4", "finish_wake", { decision: "send", rationale: "Ζήτησε κρίση, έδωσα το αρχείο." }),
+        ],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const delivered: string[] = [];
+    const { outcome, trace } = await runWake(
+      makeState(),
+      [userEvent],
+      makeDeps(fake, { deliver: async (t) => (delivered.push(t), { ok: true }) }),
+    );
+
+    expect(outcome.decision).toBe("send");
+    expect(outcome.messages).toEqual([`Δεν κρίνω εγώ — δες τι λέει: https://opencouncil.gr/athens/people/${MAYOR_ID}`]);
+    expect(delivered).toEqual(outcome.messages);
+    expect(outcome.repairs).toEqual(["ungrounded-link/held"]);
+    expect(outcome.rationale).toBe("Ζήτησε κρίση, έδωσα το αρχείο.");
+    // The tool_result told the model what was wrong, and the nudge was recorded.
+    const second = fake.requests[1].messages[2] as { content: Array<{ type: string; content?: string; text?: string }> };
+    expect(second.content[0].type).toBe("tool_result");
+    expect(second.content[0].content).toContain("not sent: the link https://opencouncil.gr/athens/people/dukas");
+    expect(trace.turns[1].role).toBe("injected");
+    expect(trace.turns).toHaveLength(3);
+  });
+
+  it("a link the brief, the reader's own message or an id in a tool result vouches for goes out untouched", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          mcpResult(`{"introducedBy":{"id":"${MAYOR_ID}","name":"Χάρης Δούκας"}}`),
+          // The meeting page cut from the brief's subject url.
+          toolUse("t1", "send_message", { text: "Η συνεδρίαση: https://opencouncil.gr/athens/m1" }),
+          // An id lifted from a tool result field.
+          toolUse("t2", "send_message", { text: `Ο δήμαρχος: https://opencouncil.gr/athens/people/${MAYOR_ID}.` }),
+          // A link the reader sent, and a host that is not ours.
+          toolUse("t3", "send_message", {
+            text: "Όπως έστειλες: https://opencouncil.gr/athens/parties/cm0tq4fgs08m54o47ljf1jxxd και https://diavgeia.gov.gr/doc/ΨΑΔΑ",
+          }),
+          toolUse("t4", "finish_wake", { decision: "send", rationale: "Το ζήτησε." }),
+        ],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const state = makeState({
+      conversation: [
+        {
+          at: "2026-03-01T10:00:00.000Z",
+          from: "reader",
+          text: "Τι λέει αυτή η παράταξη; https://opencouncil.gr/athens/parties/cm0tq4fgs08m54o47ljf1jxxd",
+        },
+      ],
+    });
+    const brief = makeBrief();
+    brief.subjects[0].url = "https://opencouncil.gr/athens/m1/subjects/s1";
+    const { outcome } = await runWake(state, [userEvent, meetingEvent({ brief })], makeDeps(fake));
+
+    expect(outcome.messages).toHaveLength(3);
+    expect(outcome.repairs).toBeUndefined();
+  });
+
+  it("a link the model itself sent on an earlier wake does not vouch for itself", async () => {
+    // The production reader already received the 404; it sits in the
+    // conversation as a «you sent» line, in the profile and in the memory.
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          toolUse("t1", "send_message", { text: "Ξανά: https://opencouncil.gr/athens/people/dukas" }),
+          toolUse("t2", "finish_wake", { decision: "send", rationale: "Το ζήτησε." }),
+        ],
+        stop_reason: "tool_use",
+      },
+      { content: [toolUse("t3", "finish_wake", { decision: "silence", rationale: "Δεν βρήκα σελίδα." })], stop_reason: "tool_use" },
+      { content: [toolUse("t4", "finish_wake", { decision: "silence", rationale: "Δεν βρήκα σελίδα." })], stop_reason: "tool_use" },
+    ]);
+    const state = makeState({
+      profile: "Ρωτάει για τον δήμαρχο: https://opencouncil.gr/athens/people/dukas",
+      memory: "Στάλθηκε https://opencouncil.gr/athens/people/dukas στις 5/10.",
+      conversation: [
+        { at: "2026-03-01T10:00:00.000Z", from: "notis", text: "Δες: https://opencouncil.gr/athens/people/dukas" },
+      ],
+    });
+    const { outcome } = await runWake(state, [userEvent], makeDeps(fake));
+
+    expect(outcome.messages).toEqual([]);
+    // The link hold, then the silence check every reader message gets.
+    expect(outcome.repairs).toEqual(["ungrounded-link/held", "declared-silence/finish"]);
+  });
+
+  it("the shipped prompts vouch only for the links they carry, not for the example slug in their prose", async () => {
+    const promptsDir = path.join(__dirname, "../../../prompts");
+    const systemText = fs.readFileSync(path.join(promptsDir, "system.md"), "utf8");
+    expect(systemText).toContain("/people/dukas");
+    const prompts = { system: systemText, contextPack: "", editorial: "", compaction: "" };
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          toolUse("t1", "send_message", { text: "Κρίνε εσύ: https://opencouncil.gr/athens/people/dukas" }),
+          toolUse("t2", "send_message", { text: "Πώς δουλεύει ο δήμος: https://opencouncil.gr/explain" }),
+          toolUse("t3", "finish_wake", { decision: "send", rationale: "Το ζήτησε." }),
+        ],
+        stop_reason: "tool_use",
+      },
+      { content: [toolUse("t4", "finish_wake", { decision: "send", rationale: "Το ζήτησε." })], stop_reason: "tool_use" },
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake, { prompts }));
+
+    expect(outcome.messages).toEqual(["Πώς δουλεύει ο δήμος: https://opencouncil.gr/explain"]);
+    expect(outcome.repairs).toEqual(["ungrounded-link/held"]);
+  });
+
+  it("the model's own earlier link does not vouch for itself; the delivery check still gets its turn", async () => {
+    const bad = toolUse("t1", "send_message", { text: "Δες: https://opencouncil.gr/athens/people/dukas" });
+    const fake = new FakeAnthropic([
+      { content: [bad, toolUse("t2", "finish_wake", { decision: "send", rationale: "Το αρχείο." })], stop_reason: "tool_use" },
+      {
+        content: [
+          toolUse("t3", "send_message", { text: "Δες: https://opencouncil.gr/athens/people/dukas" }),
+          toolUse("t4", "finish_wake", { decision: "send", rationale: "Το αρχείο." }),
+        ],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [toolUse("t5", "finish_wake", { decision: "silence", rationale: "Δεν βρήκα σελίδα." })],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const { outcome, trace } = await runWake(makeState(), [userEvent], makeDeps(fake));
+
+    expect(outcome.messages).toEqual([]);
+    expect(outcome.decision).toBe("silence");
+    // One link nudge, then the ordinary zero-send check; the hold is tagged once.
+    expect(outcome.repairs).toEqual(["ungrounded-link/held", "zero-send/finish"]);
+    expect(trace.turns.filter((t) => t.role === "injected")).toHaveLength(2);
+  });
+});
+
+describe("support requests", () => {
+  const userEvent = {
+    type: "user_message" as const,
+    at: "2026-03-10T10:00:00.000Z",
+    text: "Δεν μου χρησιμεύουν αυτά τα μηνύματα.",
+  };
+  const openRequest = {
+    kind: "dissatisfaction",
+    summary: "Δεν βρίσκει χρήσιμα τα μηνύματα και είναι ενοχλημένος.",
+  };
+  /** The reader wrote, so a declared silence is asked once; this turn confirms it. */
+  const confirmSilence = (id: string): ScriptedTurn => ({
+    content: [toolUse(id, "finish_wake", { decision: "silence", rationale: "Τίποτα." })],
+    stop_reason: "tool_use",
+  });
+
+  /** The tool_result the loop sent back for one tool_use id. requests[]
+   *  aliases the live messages array, so search by id, not by position. */
+  function toolResult(fake: FakeAnthropic, id: string): string | undefined {
+    const blocks = fake.requests
+      .flatMap((r) => r.messages as Array<{ content: unknown }>)
+      .flatMap((m) => (Array.isArray(m.content) ? m.content : [])) as Array<{
+      type: string;
+      tool_use_id?: string;
+      content?: string;
+    }>;
+    return blocks.find((b) => b.type === "tool_result" && b.tool_use_id === id)?.content;
+  }
+
+  it("files a request on a reader-message wake, and the reply still goes out", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          toolUse("t1", "open_support_request", openRequest),
+          toolUse("t2", "send_message", {
+            text: "Το βλέπει η ομάδα του OpenCouncil και θα επικοινωνήσει μαζί σου.",
+          }),
+          toolUse("t3", "finish_wake", { decision: "send", rationale: "Δυσαρεστημένος αναγνώστης." }),
+        ],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake));
+
+    expect(outcome.supportRequest).toEqual({ open: openRequest });
+    expect(outcome.messages).toHaveLength(1);
+  });
+
+  it("ignores open_support_request on a wake without a reader message", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [toolUse("t1", "open_support_request", openRequest)],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [toolUse("t2", "finish_wake", { decision: "silence", rationale: "Τίποτα." })],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const { outcome } = await runWake(makeState(), [meetingEvent()], makeDeps(fake));
+
+    expect(outcome.supportRequest).toBeUndefined();
+    expect(toolResult(fake, "t1")).toMatch(/^ignored/);
+  });
+
+  it("ignores an unknown kind and an empty summary", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          toolUse("t1", "open_support_request", { kind: "complaint", summary: "Κάτι." }),
+          toolUse("t2", "open_support_request", { kind: "contact", summary: "   " }),
+        ],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [toolUse("t3", "finish_wake", { decision: "silence", rationale: "Τίποτα." })],
+        stop_reason: "tool_use",
+      },
+      confirmSilence("t4"),
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake));
+
+    expect(outcome.supportRequest).toBeUndefined();
+    expect(toolResult(fake, "t1")).toMatch(/^ignored/);
+    expect(toolResult(fake, "t2")).toMatch(/^ignored/);
+  });
+
+  it("tells the model when an open request is updated, not filed", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [toolUse("t1", "open_support_request", openRequest)],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [toolUse("t2", "finish_wake", { decision: "silence", rationale: "Ενημέρωση." })],
+        stop_reason: "tool_use",
+      },
+      confirmSilence("t3"),
+    ]);
+    const state = makeState({
+      supportRequest: {
+        kind: "contact",
+        status: "open",
+        summary: "Θέλει να μιλήσει με άνθρωπο.",
+        since: "2026-03-01T09:00:00.000Z",
+      },
+    });
+    const { outcome } = await runWake(state, [userEvent], makeDeps(fake));
+
+    expect(outcome.supportRequest).toEqual({ open: openRequest });
+    expect(toolResult(fake, "t1")).toMatch(/^updated/);
+  });
+
+  it("files a new request after the last one was closed, and cannot withdraw a closed one", async () => {
+    const closed = makeState({
+      supportRequest: {
+        kind: "help",
+        status: "closed",
+        summary: "Δεν μπορεί να συνδεθεί.",
+        since: "2026-03-01T09:00:00.000Z",
+        endedAt: "2026-03-04T09:00:00.000Z",
+      },
+    });
+    const filing = new FakeAnthropic([
+      { content: [toolUse("t1", "open_support_request", openRequest)], stop_reason: "tool_use" },
+      {
+        content: [toolUse("t2", "finish_wake", { decision: "silence", rationale: "Νέο αίτημα." })],
+        stop_reason: "tool_use",
+      },
+      confirmSilence("t3"),
+    ]);
+    const filed = await runWake(closed, [userEvent], makeDeps(filing));
+    expect(filed.outcome.supportRequest).toEqual({ open: openRequest });
+    expect(toolResult(filing, "t1")).toMatch(/^filed/);
+
+    const withdrawing = new FakeAnthropic([
+      {
+        content: [toolUse("t1", "withdraw_support_request", { reason: "δεν θέλει" })],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [toolUse("t2", "finish_wake", { decision: "silence", rationale: "Τίποτα." })],
+        stop_reason: "tool_use",
+      },
+      confirmSilence("t3"),
+    ]);
+    const withdrawn = await runWake(closed, [userEvent], makeDeps(withdrawing));
+    expect(withdrawn.outcome.supportRequest).toBeUndefined();
+    expect(toolResult(withdrawing, "t1")).toContain("no open support request");
+  });
+
+  it("withdrawing with nothing open is a no-op", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [toolUse("t1", "withdraw_support_request", { reason: "δεν θέλει" })],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [toolUse("t2", "finish_wake", { decision: "silence", rationale: "Τίποτα." })],
+        stop_reason: "tool_use",
+      },
+      confirmSilence("t3"),
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake));
+
+    expect(outcome.supportRequest).toBeUndefined();
+    expect(toolResult(fake, "t1")).toContain("no open support request");
+  });
+
+  it("withdraws the reader's open request", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          toolUse("t1", "withdraw_support_request", { reason: "δεν θέλει να τον πάρουν" }),
+          toolUse("t2", "send_message", { text: "Εντάξει, δεν θα σε ενοχλήσουν." }),
+          toolUse("t3", "finish_wake", { decision: "send", rationale: "Το απέσυρε." }),
+        ],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const state = makeState({
+      supportRequest: {
+        kind: "contact",
+        status: "open",
+        summary: "Θέλει να μιλήσει με άνθρωπο.",
+        since: "2026-03-01T09:00:00.000Z",
+      },
+    });
+    const { outcome } = await runWake(state, [userEvent], makeDeps(fake));
+
+    expect(outcome.supportRequest).toEqual({ withdraw: { reason: "δεν θέλει να τον πάρουν" } });
+  });
+
+  it("an open the reader declines in the same wake files nothing", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [toolUse("t1", "open_support_request", openRequest)],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [
+          toolUse("t2", "withdraw_support_request", { reason: "το πήρε πίσω" }),
+          toolUse("t3", "finish_wake", { decision: "silence", rationale: "Το πήρε πίσω." }),
+        ],
+        stop_reason: "tool_use",
+      },
+      confirmSilence("t4"),
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake));
+
+    expect(outcome.supportRequest).toBeUndefined();
+    expect(toolResult(fake, "t2")).toMatch(/^cancelled/);
+  });
+
+  it("a held turn files nothing", async () => {
+    const update = {
+      type: "user_message" as const,
+      at: "2026-03-10T10:00:30.000Z",
+      text: "Άσ' το, δεν πειράζει.",
+    };
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          toolUse("t1", "open_support_request", openRequest),
+          toolUse("t2", "send_message", { text: "Το βλέπει η ομάδα." }),
+          toolUse("t3", "finish_wake", { decision: "send", rationale: "Δυσαρέσκεια." }),
+        ],
+        stop_reason: "tool_use",
+      },
+      {
+        content: [
+          toolUse("t4", "send_message", { text: "Εντάξει." }),
+          toolUse("t5", "finish_wake", { decision: "send", rationale: "Το άφησε." }),
+        ],
+        stop_reason: "tool_use",
+      },
+    ]);
+    let calls = 0;
+    const { outcome } = await runWake(makeState(), [userEvent], {
+      ...makeDeps(fake),
+      deliver: async () => ({ ok: true }),
+      // The update lands in the pre-send probe of the first turn.
+      absorb: async () => (++calls === 2 ? [update] : []),
+    });
+
+    expect(outcome.supportRequest).toBeUndefined();
+    expect(toolResult(fake, "t1")).toMatch(/^held/);
+  });
+
+  it("applyOutcome opens, keeps and clears the simulated request", () => {
+    const base = makeState();
+    const opened = applyOutcome(base, [userEvent], {
+      decision: "send",
+      rationale: "r",
+      messages: [],
+      scheduledWakes: [],
+      supportRequest: { open: { kind: "contact", summary: "Θέλει άνθρωπο." } },
+    });
+    expect(opened.supportRequest).toEqual({
+      kind: "contact",
+      status: "open",
+      summary: "Θέλει άνθρωπο.",
+      since: "2026-03-10T10:00:00.000Z",
+    });
+
+    const later = { ...userEvent, at: "2026-03-12T09:00:00.000Z" };
+    const quiet = applyOutcome(opened, [later], {
+      decision: "silence",
+      rationale: "r",
+      messages: [],
+      scheduledWakes: [],
+    });
+    expect(quiet.supportRequest).toEqual(opened.supportRequest);
+
+    const updated = applyOutcome(quiet, [later], {
+      decision: "send",
+      rationale: "r",
+      messages: [],
+      scheduledWakes: [],
+      supportRequest: { open: { kind: "data_error", summary: "Λάθος όνομα." } },
+    });
+    // An update keeps the request's age, like the shell's single open row.
+    expect(updated.supportRequest).toEqual({
+      kind: "data_error",
+      status: "open",
+      summary: "Λάθος όνομα.",
+      since: "2026-03-10T10:00:00.000Z",
+    });
+
+    const withdrawn = applyOutcome(updated, [later], {
+      decision: "send",
+      rationale: "r",
+      messages: [],
+      scheduledWakes: [],
+      supportRequest: { withdraw: { reason: "δεν θέλει" } },
+    });
+    // A withdrawn request stays in view, the way the shell shows it.
+    expect(withdrawn.supportRequest).toEqual({
+      kind: "data_error",
+      status: "withdrawn",
+      summary: "Λάθος όνομα.",
+      since: "2026-03-10T10:00:00.000Z",
+      endedAt: "2026-03-12T09:00:00.000Z",
+    });
+  });
+});
+
+describe("runWake — holding line only", () => {
+  const userEvent = { type: "user_message" as const, at: FIXED_NOW.toISOString(), text: "Τι ειπώθηκε για το πάρκο;" };
+  const HOLD = "Μισό, να το κοιτάξω.";
+  const ANSWER = "Το πάρκο συζητήθηκε στις 5/5: εγκρίθηκε η μελέτη. https://opencouncil.gr/athens/m1";
+  const search = {
+    type: "mcp_tool_use",
+    id: "m1",
+    name: "search",
+    input: { query: "πάρκο" },
+    server_name: "opencouncil",
+  };
+  const searchResult = {
+    type: "mcp_tool_result",
+    tool_use_id: "m1",
+    is_error: false,
+    content: [{ type: "text", text: '{"results":[{"url":"https://opencouncil.gr/athens/m1"}]}' }],
+  };
+  const thinking = { type: "thinking", thinking: "Η απάντηση είναι η μελέτη του πάρκου.", signature: "sig" };
+  const finish = (id: string, rationale: string, decision: "send" | "silence" = "send") =>
+    toolUse(id, "finish_wake", { decision, rationale, learnedSomethingLasting: false, promisedFollowUp: false });
+
+  it("nudges once when the holding line is followed by research and finish, and delivers the answer", async () => {
+    const fake = new FakeAnthropic([
+      { content: [toolUse("t1", "send_message", { text: HOLD, holding: true }), search, searchResult], stop_reason: "pause_turn" },
+      { content: [thinking, finish("t2", "Απάντησα με τη μελέτη.")], stop_reason: "tool_use" },
+      { content: [toolUse("t3", "send_message", { text: ANSWER }), finish("t4", "Απάντησα μετά την έρευνα.")], stop_reason: "tool_use" },
+    ]);
+    const { outcome, trace } = await runWake(makeState(), [userEvent], makeDeps(fake));
+
+    expect(outcome.repairs).toEqual(["holding-only/finish"]);
+    expect(outcome.messages).toEqual([HOLD, ANSWER]);
+    expect(outcome.decision).toBe("send");
+    expect(outcome.holdingOnly).toBeUndefined();
+    expect(outcome.rationale).toBe("Απάντησα μετά την έρευνα.");
+    expect(trace.turns[2].role).toBe("injected");
+    expect(JSON.stringify(trace.turns[2].content)).toContain(HOLD);
+  });
+
+  it("marks the wake when the nudged turn finishes again without a send", async () => {
+    const fake = new FakeAnthropic([
+      { content: [toolUse("t1", "send_message", { text: HOLD, holding: true }), search, searchResult], stop_reason: "pause_turn" },
+      { content: [thinking, finish("t2", "Απάντησα με τη μελέτη.")], stop_reason: "tool_use" },
+      { content: [finish("t3", "Το είπα ήδη.")], stop_reason: "tool_use" },
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake));
+
+    expect(outcome.holdingOnly).toBe(true);
+    expect(outcome.messages).toEqual([HOLD]);
+    expect(outcome.decision).toBe("send");
+    expect(outcome.repairs).toEqual(["holding-only/finish"]);
+    // The pre-nudge rationale survives; the decision log carries the shell's own line above it.
+    expect(outcome.rationale).toBe("Απάντησα με τη μελέτη.");
+    const line = decisionLine(buildDecisionEntry([userEvent], outcome));
+    expect(line).toContain("(σύστημα) only the holding line reached the reader");
+    expect(line).toContain("why: Απάντησα με τη μελέτη.");
+  });
+
+  it("is quiet when the answer follows the research", async () => {
+    const fake = new FakeAnthropic([
+      { content: [toolUse("t1", "send_message", { text: HOLD, holding: true }), search, searchResult], stop_reason: "pause_turn" },
+      { content: [toolUse("t2", "send_message", { text: ANSWER }), finish("t3", "Απάντησα.")], stop_reason: "tool_use" },
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake));
+
+    expect(outcome.repairs).toBeUndefined();
+    expect(outcome.messages).toEqual([HOLD, ANSWER]);
+  });
+
+  it("is quiet when a send is followed only by client tools", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [
+          toolUse("t1", "send_message", { text: "Ναι, το ξέρω." }),
+          toolUse("t2", "update_taste_profile", { profile: "Ρωτά για πάρκα." }),
+          finish("t3", "Απάντησα από τη συζήτηση."),
+        ],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake));
+
+    expect(outcome.repairs).toBeUndefined();
+  });
+
+  it("is quiet when the research precedes the send", async () => {
+    const fake = new FakeAnthropic([
+      { content: [search, searchResult, toolUse("t1", "send_message", { text: ANSWER }), finish("t2", "Απάντησα.")], stop_reason: "tool_use" },
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake));
+
+    expect(outcome.repairs).toBeUndefined();
+  });
+
+  it("nudges on an end_turn that follows the holding line and the research", async () => {
+    const fake = new FakeAnthropic([
+      { content: [toolUse("t1", "send_message", { text: HOLD, holding: true }), search, searchResult], stop_reason: "pause_turn" },
+      { content: [text("The study was approved; nothing more to add.")], stop_reason: "end_turn" },
+      { content: [toolUse("t2", "send_message", { text: ANSWER })], stop_reason: "tool_use" },
+      { content: [text("Answered after the research.")], stop_reason: "end_turn" },
+    ]);
+    const { outcome, trace } = await runWake(makeState(), [userEvent], makeDeps(fake));
+
+    expect(outcome.repairs).toEqual(["holding-only/end-turn"]);
+    expect(outcome.messages).toEqual([HOLD, ANSWER]);
+    expect(trace.turns[2].role).toBe("injected");
+  });
+
+  it("sees research that arrives in a tool-less pause_turn", async () => {
+    const fake = new FakeAnthropic([
+      { content: [toolUse("t1", "send_message", { text: HOLD, holding: true })], stop_reason: "tool_use" },
+      { content: [search, searchResult], stop_reason: "pause_turn" },
+      { content: [finish("t2", "Απάντησα.")], stop_reason: "tool_use" },
+      { content: [toolUse("t3", "send_message", { text: ANSWER }), finish("t4", "Απάντησα.")], stop_reason: "tool_use" },
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake));
+
+    expect(outcome.repairs).toEqual(["holding-only/finish"]);
+    expect(outcome.messages).toEqual([HOLD, ANSWER]);
+  });
+
+  it("defers to a reader update that held the answer, and still nudges when the re-decided turn stays silent", async () => {
+    const script = () => [
+      { content: [toolUse("t1", "send_message", { text: HOLD, holding: true })], stop_reason: "tool_use" },
+      // The answer is held: the reader wrote again while it was being composed.
+      { content: [search, searchResult, toolUse("t2", "send_message", { text: ANSWER }), finish("t3", "Απάντησα.")], stop_reason: "tool_use" },
+    ];
+    const withUpdate = (fake: FakeAnthropic) => ({
+      ...makeDeps(fake),
+      deliver: async () => ({ ok: true }),
+      // Absorb runs at each turn start and in the pre-send probe: the fourth
+      // call is the probe of the second turn, where the answer is sent.
+      absorb: (() => {
+        let calls = 0;
+        return async () =>
+          ++calls === 4
+            ? [{ type: "user_message" as const, at: FIXED_NOW.toISOString(), text: "άκυρο, εννοώ το άλλο πάρκο" }]
+            : [];
+      })(),
+    });
+
+    const answered = new FakeAnthropic([
+      ...script(),
+      { content: [toolUse("t4", "send_message", { text: "Για το άλλο πάρκο: τίποτα νέο." }), finish("t5", "Απάντησα στο νέο.")], stop_reason: "tool_use" },
+    ]);
+    const first = await runWake(makeState(), [userEvent], withUpdate(answered));
+    expect(first.outcome.repairs).toEqual(["reader-update/held-sends"]);
+    expect(first.outcome.messages).toEqual([HOLD, "Για το άλλο πάρκο: τίποτα νέο."]);
+
+    const silent = new FakeAnthropic([
+      ...script(),
+      { content: [finish("t4", "Δεν χρειάζεται άλλο.")], stop_reason: "tool_use" },
+      { content: [finish("t5", "Δεν χρειάζεται άλλο.")], stop_reason: "tool_use" },
+    ]);
+    const second = await runWake(makeState(), [userEvent], withUpdate(silent));
+    expect(second.outcome.repairs).toEqual(["reader-update/held-sends", "holding-only/finish"]);
+    expect(second.outcome.holdingOnly).toBe(true);
+  });
+
+  it("records the lost answer when the turn budget runs out under the nudge", async () => {
+    const fake = new FakeAnthropic([
+      { content: [toolUse("t1", "send_message", { text: HOLD, holding: true }), search, searchResult], stop_reason: "pause_turn" },
+      { content: [thinking, finish("t2", "Απάντησα.")], stop_reason: "tool_use" },
+      ...Array.from({ length: 20 }, () => ({ content: [search, searchResult], stop_reason: "pause_turn" })),
+    ]);
+    const deps = makeDeps(fake);
+    deps.config = { ...deps.config, maxTurns: 2 };
+    const { outcome } = await runWake(makeState(), [userEvent], deps);
+
+    expect(outcome.repairs).toEqual(["holding-only/finish", "nudge/unanswered"]);
+    expect(outcome.holdingOnly).toBe(true);
+  });
+
+  it("leaves a short linkless answer alone when research follows it", async () => {
+    const fake = new FakeAnthropic([
+      { content: [toolUse("t1", "send_message", { text: "Όχι, δεν συζητήθηκε." }), search, searchResult], stop_reason: "pause_turn" },
+      { content: [finish("t2", "Απάντησα από μνήμης και επιβεβαίωσα.")], stop_reason: "tool_use" },
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake));
+
+    expect(outcome.repairs).toBeUndefined();
+    expect(outcome.holdingOnly).toBeUndefined();
+    expect(outcome.messages).toEqual(["Όχι, δεν συζητήθηκε."]);
+  });
+
+  it("records the lost answer even when a stranded-prose nudge took the repair budget", async () => {
+    const draft = "Το πάρκο συζητήθηκε στις 5/5 και εγκρίθηκε η μελέτη για την ανάπλαση με προϋπολογισμό διακόσιες χιλιάδες ευρώ.";
+    const fake = new FakeAnthropic([
+      { content: [toolUse("t1", "send_message", { text: HOLD, holding: true }), search, searchResult], stop_reason: "pause_turn" },
+      // The answer sits as Greek prose beside finish_wake: the stranded-prose check fires first.
+      { content: [text(draft), finish("t2", "Απάντησα.")], stop_reason: "tool_use" },
+      { content: [finish("t3", "Το είπα ήδη.")], stop_reason: "tool_use" },
+    ]);
+    const { outcome } = await runWake(makeState(), [userEvent], makeDeps(fake));
+
+    expect(outcome.repairs).toEqual(["stranded-prose/finish"]);
+    expect(outcome.messages).toEqual([HOLD]);
+    expect(outcome.holdingOnly).toBe(true);
+  });
+
+  it("never fires on a proactive wake", async () => {
+    const fake = new FakeAnthropic([
+      {
+        content: [toolUse("t1", "send_message", { text: "Μισό, να δω κάτι.", holding: true }), search, searchResult, finish("t2", "Έστειλα.")],
+        stop_reason: "tool_use",
+      },
+    ]);
+    const { outcome } = await runWake(makeState(), [meetingEvent()], makeDeps(fake));
+
+    expect(outcome.repairs).toBeUndefined();
+  });
+
+  it("runs a reader's wake at the reactive effort and a proactive one at the base effort", async () => {
+    // A declared silence on a reader message draws the one delivery nudge,
+    // so the reader's wake takes a second turn to confirm it.
+    const reactive = new FakeAnthropic([
+      { content: [finish("t1", "Τίποτα.", "silence")], stop_reason: "tool_use" },
+      { content: [finish("t2", "Τίποτα.", "silence")], stop_reason: "tool_use" },
+    ]);
+    const { trace: reactiveTrace } = await runWake(makeState(), [userEvent], makeDeps(reactive));
+    expect(reactive.requests.map((r) => r.output_config)).toEqual([{ effort: "medium" }, { effort: "medium" }]);
+    expect(reactiveTrace.effort).toBe("medium");
+
+    const proactive = new FakeAnthropic([{ content: [finish("t1", "Τίποτα.", "silence")], stop_reason: "tool_use" }]);
+    const { trace: proactiveTrace } = await runWake(makeState(), [meetingEvent()], makeDeps(proactive));
+    expect(proactive.requests[0].output_config).toEqual({ effort: "low" });
+    expect(proactiveTrace.effort).toBe("low");
   });
 });

@@ -1,30 +1,64 @@
 "use server";
 
-import { PollDecisionsRequest, PollDecisionsResult, PollDecisionsMatch, ExtractedDecisionData } from "../apiTypes";
+import { PollDecisionsRequest, PollDecisionsResult, PollDecisionsMatch, ExtractedDecisionData } from "@/lib/apiTypes";
+import { parseDecisionConventions } from "@/lib/decisionConventions";
+import { renderConventionsText, conventionsGlossaryEn } from "@/lib/decisionConventionsText";
+import { storeDecisionFacts } from "@/lib/db/decisionFacts";
+import { deriveAndPersist } from "@/lib/derivation/persist";
+import { readingStatesFacts } from "@/lib/derivation";
 import { startTask } from "./tasks";
-import prisma from "../db/prisma";
-import { AttendanceStatus, DataSource, VoteType, Prisma } from "@prisma/client";
-import { sortSubjectsByDiscussionOrder } from "../minutes/builders";
+import { after } from "next/server";
+import prisma from "@/lib/db/prisma";
+import { Prisma } from "@prisma/client";
+import * as z from "zod";
+import { TAKES_PLACE_WHERE, takesPlace } from "@/lib/meetingLifecycleRules";
 
-import { upsertDecision, deleteDecision, getDecisionForSubject, DECISION_ELIGIBLE_SUBJECT_WHERE } from "../db/decisions";
+import { sortSubjectsByDiscussionOrder } from "@/lib/minutes/builders";
+
+import { AWAITING_DECISIONS_MEETING_WHERE, decisionPollCandidateWhere } from "@/lib/db/decisionEligibility";
+import { isCustomer } from "@/lib/cityStatus";
+import { upsertDecision, deleteDecision, getDecisionForSubject, DECISION_ELIGIBLE_SUBJECT_WHERE } from "@/lib/db/decisions";
 export { getDecisionForSubject };
-import { getCurrentUser, withUserAuthorizedToEdit } from "../auth";
-import { getPeopleForMeeting } from "../db/people";
+import { getCurrentUser, withUserAuthorizedToEdit } from "@/lib/auth";
+import { getPeopleForMeeting } from "@/lib/db/people";
 import { deriveWindowDays } from "./decisionWindow";
 import { localCalendarDate } from "@/lib/formatters/time";
-import { applyCandidateConflictResolution, getUnresolvedCandidatesForMeeting } from "../db/decisionCandidates";
-import { isRoleActiveAt, isMayorRole } from "../utils/roles";
-import { shouldSkipPolling, getBackoffState, getPollableMeetingDateRange, isLogodosiaMeeting, LOGODOSIA_NAME_PATTERN, pendingPollTaskId, type BackoffTier } from "./pollDecisionsBackoff";
-import { interleaveByCity } from "./pollableMeetings";
-import { sendPollDecisionsBatchStartedAlert, sendPollDecisionsBatchCompletedAlert } from "../discord";
+import { dayBounds } from "@/lib/dates/dayBounds";
+import { applyCandidateConflictResolution, getUnresolvedCandidatesForMeeting } from "@/lib/db/decisionCandidates";
+import { isRoleActiveAt, isMayorRole } from "@/lib/utils/roles";
+import { shouldSkipPolling, getBackoffState, TAKES_DECISIONS_WHERE, pendingPollTaskId, takesNoDecisions, type BackoffTier } from "./pollDecisionsBackoff";
+import { orderForPolling } from "./pollableMeetings";
+import { sendPollDecisionsBatchStartedAlert, sendPollDecisionsBatchCompletedAlert } from "@/lib/discord";
 import { agendaItemTitleOrName, isRecordSubject } from "@/lib/utils/subjects";
+import { normalizeAda } from "@/lib/utils/ada";
+
+/** A manual poll either starts, or finds one already running for the meeting. */
+export type PollStart =
+    | { status: 'started'; taskId: string }
+    | { status: 'alreadyRunning'; taskId: string };
+
+// A Server Action has no runtime types. The ADAs reach the Diavgeia client on
+// the task server, so only a value in Diavgeia's own ADA form passes.
+const adaSchema = z.string().transform((value, ctx) => {
+    const ada = normalizeAda(value);
+    if (ada === null) {
+        ctx.addIssue({ code: 'custom', message: 'must be a Diavgeia ADA' });
+        return z.NEVER;
+    }
+    return ada;
+});
+const pollOptionsSchema = z.object({
+    forceExtract: z.boolean().optional(),
+    lookupAdas: z.array(adaSchema).max(50).optional(),
+}).optional();
 
 export async function requestPollDecisions(
     cityId: string,
     councilMeetingId: string,
-    options?: { forceExtract?: boolean },
-) {
+    rawOptions?: { forceExtract?: boolean; lookupAdas?: string[] },
+): Promise<PollStart> {
     await withUserAuthorizedToEdit({ cityId });
+    const options = pollOptionsSchema.parse(rawOptions);
 
     // The plain poll stays city-admin: a manual link starts extraction
     // automatically through this path. Cache-busting re-extraction is a
@@ -36,7 +70,17 @@ export async function requestPollDecisions(
         }
     }
 
-    return pollDecisionsForMeeting(cityId, councilMeetingId, options);
+    // Two polls of one meeting race on the same candidates and bill twice;
+    // the running one reads anything this one would.
+    const openTasks = await prisma.taskStatus.findMany({
+        where: { councilMeetingId, cityId, type: 'pollDecisions', status: { in: ['pending', 'processing'] } },
+        select: { id: true, status: true },
+    });
+    const runningId = pendingPollTaskId(openTasks);
+    if (runningId) return { status: 'alreadyRunning', taskId: runningId };
+
+    const task = await pollDecisionsForMeeting(cityId, councilMeetingId, options);
+    return { status: 'started', taskId: task.id };
 }
 
 /**
@@ -45,11 +89,12 @@ export async function requestPollDecisions(
  *
  * @param options.silent - When true, suppresses the per-task "started" Discord alert (used by cron batch)
  * @param options.forceExtract - When true, skips extraction cache and reprocesses all PDFs
+ * @param options.lookupAdas - Typed ΑΔΑ values the tasks server fetches outside the poll scope
  */
 export async function pollDecisionsForMeeting(
     cityId: string,
     councilMeetingId: string,
-    options?: { silent?: boolean; forceExtract?: boolean },
+    options?: { silent?: boolean; forceExtract?: boolean; lookupAdas?: string[] },
 ) {
     const councilMeeting = await prisma.councilMeeting.findUnique({
         where: {
@@ -70,6 +115,7 @@ export async function pollDecisionsForMeeting(
                     id: true,
                     name: true,
                     diavgeiaUnitIds: true,
+                    decisionConventions: true,
                 },
             },
             subjects: {
@@ -78,17 +124,27 @@ export async function pollDecisionsForMeeting(
                     name: true,
                     agendaItemTitle: true,
                     agendaItemIndex: true,
+                    agendaSectionIndex: true,
                     nonAgendaReason: true,
                     discussedIn: { select: { id: true } },
-                    decision: { select: { ada: true, title: true, pdfUrl: true, excerpt: true } },
+                    decision: { select: { ada: true, title: true, pdfUrl: true, extraction: true, extractorVersion: true } },
                 },
                 where: DECISION_ELIGIBLE_SUBJECT_WHERE,
             },
+            continuationOf: { select: { kind: true } },
         },
     });
 
     if (!councilMeeting) {
         throw new Error("Council meeting not found");
+    }
+
+    // The cron and the bulk dialog skip these meetings already; a direct call does not.
+    if (!takesPlace(councilMeeting)) {
+        throw new Error("The meeting did not take place (postponed or cancelled), so it has no decisions to poll");
+    }
+    if (takesNoDecisions(councilMeeting)) {
+        throw new Error("This kind of meeting takes no decisions");
     }
 
     if (!councilMeeting.city.diavgeiaUid) {
@@ -100,7 +156,7 @@ export async function pollDecisionsForMeeting(
     }
 
     // Fetch people for name matching during extraction
-    const people = await getPeopleForMeeting(cityId, councilMeeting.administrativeBody?.id ?? null);
+    const people = await getPeopleForMeeting(cityId, councilMeeting.administrativeBody?.id ?? null, councilMeeting.dateTime);
     const peopleForRequest = people.map(p => ({ id: p.id, name: p.name }));
 
     // Find the city mayor for presence extraction from decision narrative
@@ -108,9 +164,12 @@ export async function pollDecisionsForMeeting(
         p.roles.some(r => isMayorRole(r) && isRoleActiveAt(r, councilMeeting.dateTime))
     );
 
-    // Sort subjects by discussion order (transcript timestamps) so OA subjects
-    // are in the correct sequence. Uses the same sortSubjectsByDiscussionOrder
-    // used by the minutes renderer.
+    // The order of the subjects in the task request: each subject is keyed by its
+    // first linked utterance of any status, through sortSubjectsByDiscussionOrder.
+    // The minutes and the derivation key a subject by discussionOrderKeys instead,
+    // which skips procedural votes, so a subject can sort differently here.
+    // No derived row depends on this order: the task passes the anchors through,
+    // and the derivation places them in its own order (loadDerivationInput).
     const subjectIds = councilMeeting.subjects.map(s => s.id);
     const firstUtteranceBySubject = new Map<string, number>();
     if (subjectIds.length > 0) {
@@ -140,14 +199,32 @@ export async function pollDecisionsForMeeting(
     const windowToDate = localCalendarDate(new Date(councilMeeting.dateTime.getTime() + windowDays * 86400_000), cityTz);
 
     // Everything the city has already read whose publishDate falls in this
-    // window — mostly neighbouring meetings' decisions, which is the point.
+    // window — mostly neighbouring meetings' decisions, which is the point —
+    // plus this meeting's own open candidates. The window misses those whose
+    // issue date precedes the meeting or whose publication came late; the task
+    // fetches them by their ΑΔΑ. The window names days in the city's zone.
+    const ownOpen = { councilMeetingId, decisionId: null, dismissedAt: null };
     const known = await prisma.decisionCandidate.findMany({
         where: {
             cityId,
-            publishDate: { gte: new Date(windowFromDate), lte: new Date(`${windowToDate}T23:59:59Z`) },
+            OR: [
+                { publishDate: { gte: dayBounds(windowFromDate, cityTz).start, lte: dayBounds(windowToDate, cityTz).end } },
+                ownOpen,
+            ],
         },
-        select: { ada: true, meetingDate: true, readStatus: true },
+        select: { ada: true, meetingDate: true, readStatus: true, councilMeetingId: true, decisionId: true, dismissedAt: true },
     });
+
+    // The extractor is told the body's conventions as sentences; the glossary lives in messages/en/admin.json.
+    const conventions = parseDecisionConventions(councilMeeting.administrativeBody?.decisionConventions);
+    const conventionsText = conventions
+        ? renderConventionsText(conventions, conventionsGlossaryEn)
+        : null;
+    // No conventions record, no extraction: the poll only links the body's
+    // decisions. A page read without the hints keeps that reading, because the
+    // hints are part of the task's cache key. A page left unread has no usable
+    // reading, so the first poll after a person records the conventions reads it.
+    const extract = conventionsText !== null;
 
     const body: Omit<PollDecisionsRequest, 'callbackUrl'> = {
         // City-local: documents print local dates, and the partition compares
@@ -159,6 +236,8 @@ export async function pollDecisionsForMeeting(
             ? councilMeeting.administrativeBody.diavgeiaUnitIds
             : undefined,
         administrativeBodyName: councilMeeting.administrativeBody?.name ?? null,
+        conventionsText: conventionsText ?? undefined,
+        extract,
         mayorId: mayorPerson?.id,
         forceExtract: options?.forceExtract || undefined,
         people: peopleForRequest,
@@ -167,18 +246,24 @@ export async function pollDecisionsForMeeting(
             ada: k.ada,
             meetingDate: k.meetingDate ? k.meetingDate.toISOString().split('T')[0] : null,
             readStatus: k.readStatus,
+            ...(k.councilMeetingId === councilMeetingId && !k.decisionId && !k.dismissedAt ? { own: true } : {}),
         })),
+        lookupAdas: options?.lookupAdas?.length ? options.lookupAdas : undefined,
         subjects: sortedSubjects.map(s => ({
             subjectId: s.id,
             name: agendaItemTitleOrName(s),
             agendaItemIndex: s.agendaItemIndex,
             nonAgendaReason: s.nonAgendaReason,
-            ...(s.decision?.ada ? {
+            // A decision with no ΑΔΑ is an uploaded or external PDF: it has
+            // no Diavgeia record, but extraction reads it by its URL.
+            ...(s.decision ? {
                 existingDecision: {
-                    ada: s.decision.ada,
+                    ...(s.decision.ada ? { ada: s.decision.ada } : {}),
                     decisionTitle: s.decision.title ?? '',
                     pdfUrl: s.decision.pdfUrl,
-                    needsExtraction: !s.decision.excerpt, // linked but no extraction data
+                    // Linked but without a usable reading — never read, read before v4,
+                    // or reset — or a forced run, which reprocesses every linked document.
+                    needsExtraction: !readingStatesFacts(s.decision) || !!options?.forceExtract,
                 },
             } : {}),
         })),
@@ -187,8 +272,22 @@ export async function pollDecisionsForMeeting(
     return startTask('pollDecisions', body, councilMeetingId, cityId, { silent: options?.silent });
 }
 
+/** The candidates of the decision-polling cron: see decisionPollCandidateWhere. */
+export async function findDecisionPollCandidates() {
+    return prisma.councilMeeting.findMany({
+        where: decisionPollCandidateWhere(),
+        select: {
+            id: true,
+            cityId: true,
+        },
+        orderBy: { dateTime: 'desc' },
+        take: 200, // Fetch extra candidates since many may be skipped by backoff
+    });
+
+}
+
 /**
- * Polls decisions for recent meetings across all cities with Diavgeia configured.
+ * Polls decisions for recent meetings across the supported cities with Diavgeia configured.
  * Called by the cron endpoint. Finds meetings in the pollable date window
  * (see getPollableMeetingDateRange) that still have subjects without linked
  * decisions, and dispatches pollDecisions tasks for them.
@@ -202,59 +301,57 @@ export async function pollDecisionsForMeeting(
  * Limits to 10 dispatched tasks per invocation.
  */
 export async function pollDecisionsForRecentMeetings() {
-    // Find meetings in the pollable date window in cities with diavgeiaUid,
-    // that have at least one subject with agendaItemIndex but no decision.
-    // Λογοδοσία meetings are excluded — see isLogodosiaMeeting().
-    const meetings = await prisma.councilMeeting.findMany({
-        where: {
-            dateTime: getPollableMeetingDateRange(),
-            city: {
-                diavgeiaUid: { not: null },
-            },
-            NOT: {
-                name: { contains: LOGODOSIA_NAME_PATTERN },
-            },
-            subjects: {
-                some: {
-                    ...DECISION_ELIGIBLE_SUBJECT_WHERE,
-                    decision: null,
-                },
-            },
-        },
-        select: {
-            id: true,
-            cityId: true,
-        },
-        orderBy: { dateTime: 'desc' },
-        take: 200, // Fetch extra candidates since many may be skipped by backoff
-    });
+    const meetings = await findDecisionPollCandidates();
 
     if (meetings.length === 0) {
         return { meetingsProcessed: 0, results: [] };
     }
 
-    // One backlogged city must not fill the whole batch — see interleaveByCity.
-    const orderedMeetings = interleaveByCity(meetings);
-
-    // Batch-fetch polling history for all candidate meetings in one query
-    const pollHistory = await prisma.taskStatus.groupBy({
-        by: ['councilMeetingId', 'cityId'],
-        where: {
-            councilMeetingId: { in: meetings.map(m => m.id) },
-            type: 'pollDecisions',
-            status: 'succeeded',
-        },
-        _count: true,
-        _min: { createdAt: true },
-        _max: { createdAt: true },
-    });
+    // Batch-fetch polling history for all candidate meetings: succeeded polls
+    // drive backoff, attempts of any status drive dispatch order.
+    const meetingIds = meetings.map(m => m.id);
+    const [pollHistory, attemptHistory] = await Promise.all([
+        prisma.taskStatus.groupBy({
+            by: ['councilMeetingId', 'cityId'],
+            where: {
+                councilMeetingId: { in: meetingIds },
+                type: 'pollDecisions',
+                status: 'succeeded',
+            },
+            _count: true,
+            _min: { createdAt: true },
+            _max: { createdAt: true },
+        }),
+        prisma.taskStatus.groupBy({
+            by: ['councilMeetingId', 'cityId'],
+            where: {
+                councilMeetingId: { in: meetingIds },
+                type: 'pollDecisions',
+            },
+            _max: { createdAt: true },
+        }),
+    ]);
 
     const historyByMeeting = new Map(
         pollHistory.map(h => [
             `${h.cityId}:${h.councilMeetingId}`,
-            { count: h._count, firstPollAt: h._min.createdAt, lastPollAt: h._max.createdAt },
+            { firstPollAt: h._min.createdAt, lastPollAt: h._max.createdAt },
         ])
     );
+    const lastAttemptByMeeting = new Map(
+        attemptHistory.map(h => [`${h.cityId}:${h.councilMeetingId}`, h._max.createdAt])
+    );
+
+    const orderedMeetings = orderForPolling(meetings.map(m => {
+        const key = `${m.cityId}:${m.id}`;
+        const history = historyByMeeting.get(key);
+        return {
+            ...m,
+            firstPollAt: history?.firstPollAt ?? null,
+            lastPollAt: history?.lastPollAt ?? null,
+            lastAttemptAt: lastAttemptByMeeting.get(key) ?? null,
+        };
+    }));
 
     const results: Array<{ cityId: string; meetingId: string; status: string }> = [];
     let dispatched = 0;
@@ -265,13 +362,7 @@ export async function pollDecisionsForRecentMeetings() {
     for (const meeting of orderedMeetings) {
         if (dispatched >= 10) break;
 
-        const key = `${meeting.cityId}:${meeting.id}`;
-        const history = historyByMeeting.get(key);
-
-        const skipReason = shouldSkipPolling(
-            history?.firstPollAt ?? null,
-            history?.lastPollAt ?? null,
-        );
+        const skipReason = shouldSkipPolling(meeting.firstPollAt, meeting.lastPollAt);
         if (skipReason) {
             results.push({ cityId: meeting.cityId, meetingId: meeting.id, status: `skipped: ${skipReason}` });
             skipped++;
@@ -383,7 +474,9 @@ export async function requestPollDecisionForSubject(subjectId: string): Promise<
 
 /**
  * Returns polling history and current backoff state for a specific meeting.
- * Used by the meeting decisions page to show polling status.
+ * Used by the meeting decisions page to show polling status. A city that is not
+ * supported has no backoff state: the cron does not poll it (CUSTOMER_CITY_WHERE),
+ * so its meetings show their manual polls and no next automatic poll.
  */
 export async function getPollingHistoryForMeeting(
     cityId: string,
@@ -427,6 +520,19 @@ export async function getPollingHistoryForMeeting(
             lastPollAt: null,
             currentTier: null,
             currentTierLabel: null,
+            nextPollEligible: null,
+            pendingTaskId,
+        };
+    }
+
+    const city = await prisma.city.findUnique({ where: { id: cityId }, select: { status: true } });
+    if (!city || !isCustomer(city.status)) {
+        return {
+            totalPolls,
+            firstPollAt: firstPollAt.toISOString(),
+            lastPollAt: lastPollAt.toISOString(),
+            currentTier: null,
+            currentTierLabel: 'No automatic polls: the city is not supported',
             nextPollEligible: null,
             pendingTaskId,
         };
@@ -547,6 +653,7 @@ export async function checkBatchCompletionAndAlert(
             cityId: true,
             councilMeetingId: true,
             responseBody: true,
+            failureReason: true,
         },
     });
 
@@ -590,7 +697,7 @@ export async function checkBatchCompletionAndAlert(
                 unmatchedSubjects: 0,
                 readIssues: 0,
                 status: 'failed',
-                error: sibling.responseBody?.substring(0, ERROR_PREVIEW_LENGTH) ?? undefined,
+                error: sibling.failureReason?.substring(0, ERROR_PREVIEW_LENGTH) ?? undefined,
             });
             continue;
         }
@@ -737,15 +844,18 @@ export async function handlePollDecisionsResult(taskId: string, result: PollDeci
     const requestBody = JSON.parse(task.requestBody) as PollDecisionsRequest;
     const mayorId = requestBody.mayorId;
 
+    // A person typed these ΑΔΑ values from this meeting's page: that request,
+    // not the document's own reading, places them in this meeting's pool.
+    const typedAdas = new Set(requestBody.lookupAdas ?? []);
+
     let reassignmentCount = 0;
     let processedCount = 0;
     let conflictCount = 0;
+    // Other meetings this poll newly placed decisions on — polled once it is done.
+    const meetingsWithNewCandidates = new Set<string>();
 
-    // Collect all subjectIds from matches and non-decision attendance for validation
-    const allSubjectIds = [
-        ...result.matches.map(m => m.subjectId),
-        ...(result.extractions?.nonDecisionSubjectAttendance?.map(a => a.subjectId) ?? []),
-    ];
+    // Collect all subjectIds from matches for validation
+    const allSubjectIds = result.matches.map(m => m.subjectId);
 
     const validSubjectIds = await prisma.subject.findMany({
         where: {
@@ -882,16 +992,23 @@ export async function handlePollDecisionsResult(taskId: string, result: PollDeci
             // calendar date — the timezone conversion is load-bearing: without
             // it, midnight-stored meetings would shift a day.
             const cityMeetings = polledMeeting ? (await tx.councilMeeting.findMany({
-                where: { cityId: task.cityId },
-                select: { id: true, name: true, dateTime: true, administrativeBodyId: true },
+                // A decision never belongs to a meeting that did not take place,
+                // or to one that takes no decisions. Such a meeting must neither
+                // receive a decision nor block an otherwise unambiguous heal.
+                where: { cityId: task.cityId, ...TAKES_PLACE_WHERE, ...TAKES_DECISIONS_WHERE },
+                select: { id: true, dateTime: true, administrativeBodyId: true },
                 orderBy: { dateTime: 'asc' },
             })).map(m => ({
-                id: m.id, name: m.name, administrativeBodyId: m.administrativeBodyId,
+                id: m.id, administrativeBodyId: m.administrativeBodyId,
                 localDate: localCalendarDate(m.dateTime, polledMeeting.city.timezone),
             })) : [];
             for (const d of result.decisions) {
                 const stored = storedByAda.get(d.ada);
                 const freshRead = !d.fromKnown && d.readStatus !== 'unread';
+                const promoted = await tx.decision.findUnique({
+                    where: { ada: d.ada },
+                    select: { id: true },
+                });
                 // Resolve the declared session to one of our meetings (same body).
                 let councilMeetingId: string | null = null;
                 if (freshRead && d.meetingDate && polledMeeting?.administrativeBodyId) {
@@ -909,18 +1026,23 @@ export async function handlePollDecisionsResult(taskId: string, result: PollDeci
                     const declared = d.meetingDate?.slice(0, 10)
                         ?? (stored.meetingDate ? stored.meetingDate.toISOString().slice(0, 10) : null);
                     if (declared) {
-                        // Λογοδοσία sessions are excluded everywhere in the
-                        // pipeline; they must neither receive a heal nor block
-                        // an otherwise unambiguous one.
-                        const sameDay = cityMeetings.filter(m =>
-                            !isLogodosiaMeeting(m.name) && m.localDate === declared);
+                        const sameDay = cityMeetings.filter(m => m.localDate === declared);
                         if (sameDay.length === 1) healedMeetingId = sameDay[0].id;
                     }
                 }
-                const promoted = await tx.decision.findUnique({
-                    where: { ada: d.ada },
-                    select: { id: true },
-                });
+                // Never for a candidate a decision holds: that link already says
+                // where the document belongs.
+                const pinned = typedAdas.has(d.ada) && !promoted;
+                if (pinned) {
+                    councilMeetingId = task.councilMeetingId;
+                    healedMeetingId = null;
+                }
+
+                const placedOn = freshRead ? councilMeetingId : healedMeetingId;
+                if (placedOn && placedOn !== task.councilMeetingId && placedOn !== stored?.councilMeetingId
+                    && !promoted && !stored?.dismissedAt) {
+                    meetingsWithNewCandidates.add(placedOn);
+                }
 
                 await tx.decisionCandidate.upsert({
                     where: { cityId_ada: { cityId: task.cityId, ada: d.ada } },
@@ -949,7 +1071,9 @@ export async function handlePollDecisionsResult(taskId: string, result: PollDeci
                             decisionNumber: d.decisionNumber,
                             readStatus: d.readStatus,
                             councilMeetingId,
-                        } : (healedMeetingId ? { councilMeetingId: healedMeetingId } : {})),
+                        } : pinned ? { councilMeetingId } : (healedMeetingId ? { councilMeetingId: healedMeetingId } : {})),
+                        // Typing the ΑΔΑ again is the answer to an earlier dismissal.
+                        ...(pinned ? { dismissedAt: null } : {}),
                         // The suggestion is recorded once, as made; later polls
                         // never overwrite an accepted suggestion's record.
                         ...(d.subjectId && !promoted ? { subjectId: d.subjectId, confidence: d.confidence, reasoning: d.reasoning } : {}),
@@ -984,7 +1108,7 @@ export async function handlePollDecisionsResult(taskId: string, result: PollDeci
                     // match may have been wrong (ADA conflict), so this data is unreliable.
                     const existingDecision = await tx.decision.findFirst({
                         where: { subjectId: decision.subjectId },
-                        select: { subjectId: true, title: true, protocolNumber: true, publishDate: true },
+                        select: { id: true, subjectId: true, title: true, protocolNumber: true, publishDate: true, ada: true, decisionNumber: true },
                     });
                     if (!existingDecision) {
                         console.log(`Skipping extraction for subject ${decision.subjectId} — no linked Decision`);
@@ -1006,63 +1130,19 @@ export async function handlePollDecisionsResult(taskId: string, result: PollDeci
                         data: {
                             excerpt: decision.excerpt || null,
                             references: decision.references || null,
-                            ...(extractedDecisionNumber ? { decisionNumber: extractedDecisionNumber } : {}),
+                            summary: decision.summary || null,
+                            // A decision with no ΑΔΑ carries the number its clerk
+                            // typed from the document; the reading only fills a gap.
+                            ...(extractedDecisionNumber && (existingDecision.ada || !existingDecision.decisionNumber)
+                                ? { decisionNumber: extractedDecisionNumber } : {}),
                             ...(!existingDecision.title && decision.diavgeiaTitle ? { title: decision.diavgeiaTitle } : {}),
                             ...(!existingDecision.protocolNumber && decision.diavgeiaProtocolNumber ? { protocolNumber: decision.diavgeiaProtocolNumber } : {}),
                             ...(!existingDecision.publishDate && decision.diavgeiaPublishDate ? { publishDate: new Date(decision.diavgeiaPublishDate) } : {}),
                         },
                     });
 
-                    // 2. Create SubjectAttendance records (deduplicate by personId)
-                    const attendanceByPerson = new Map<string, AttendanceStatus>(
-                        [
-                            ...decision.presentMemberIds.map(id => [id, 'PRESENT' as const] as const),
-                            ...decision.absentMemberIds.map(id => [id, 'ABSENT' as const] as const),
-                        ]
-                    );
-
-                    // Include mayor attendance if extracted from decision narrative
-                    if (decision.mayorPresent != null && mayorId) {
-                        attendanceByPerson.set(mayorId, decision.mayorPresent ? 'PRESENT' : 'ABSENT');
-                    }
-
-                    if (attendanceByPerson.size > 0) {
-                        await tx.subjectAttendance.deleteMany({
-                            where: { subjectId: decision.subjectId, source: DataSource.decision },
-                        });
-                        await tx.subjectAttendance.createMany({
-                            data: [...attendanceByPerson].map(([personId, status]) => ({
-                                subjectId: decision.subjectId,
-                                personId,
-                                status,
-                                source: DataSource.decision,
-                                taskId,
-                            })),
-                        });
-                    }
-
-                    // 3. Create SubjectVote records (deduplicate by personId)
-                    // Vote inference (unanimous, majority) is handled by the backend —
-                    // voteDetails already includes inferred FOR votes.
-                    const voteByPerson = new Map<string, VoteType>();
-                    for (const d of decision.voteDetails) {
-                        voteByPerson.set(d.personId, d.vote);
-                    }
-
-                    if (voteByPerson.size > 0) {
-                        await tx.subjectVote.deleteMany({
-                            where: { subjectId: decision.subjectId, source: DataSource.decision },
-                        });
-                        await tx.subjectVote.createMany({
-                            data: [...voteByPerson].map(([personId, voteType]) => ({
-                                subjectId: decision.subjectId,
-                                personId,
-                                voteType,
-                                source: DataSource.decision,
-                                taskId,
-                            })),
-                        });
-                    }
+                    // 1b. Keep what the document states, as read, beside the derived rows.
+                    await storeDecisionFacts(tx, existingDecision.id, decision, { taskId, extractorVersion: task.version != null ? String(task.version) : null });
 
                     // TODO: Re-enable once the codebase stops using `agendaItemIndex !== null`
                     // as a proxy for "is a regular agenda item". Currently, most display
@@ -1106,82 +1186,15 @@ export async function handlePollDecisionsResult(taskId: string, result: PollDeci
             }
         }
 
-        // --- Store meeting-level initial attendance (roll call) ---
-        if (result.extractions.initialAttendance && result.extractions.initialAttendance.length > 0) {
-            try {
-                const cityId = task.cityId!;
-                const meetingId = task.councilMeetingId!;
-                await prisma.$transaction(async (tx) => {
-                    await tx.meetingAttendance.deleteMany({
-                        where: { cityId, councilMeetingId: meetingId, source: DataSource.decision },
-                    });
-                    await tx.meetingAttendance.createMany({
-                        data: result.extractions!.initialAttendance!.map(a => ({
-                            cityId,
-                            councilMeetingId: meetingId,
-                            personId: a.personId,
-                            status: a.status,
-                            source: DataSource.decision,
-                            taskId,
-                        })),
-                    });
-                });
-                console.log(`Stored ${result.extractions.initialAttendance.length} meeting-level attendance records`);
-            } catch (error) {
-                console.error('Failed to store meeting-level attendance:', error);
-            }
-        }
-
-        // --- Store SubjectAttendance for subjects without decisions ---
-        // These subjects have no PDF but their effective attendance was computed
-        // using the complete discussion order and aggregated attendance changes.
-        if (result.extractions.nonDecisionSubjectAttendance && result.extractions.nonDecisionSubjectAttendance.length > 0) {
-            let storedCount = 0;
-            for (const subjectAttendance of result.extractions.nonDecisionSubjectAttendance) {
-                if (!validSubjectIdSet.has(subjectAttendance.subjectId)) {
-                    console.warn(`Poll decisions: skipping invalid subjectId ${subjectAttendance.subjectId} in nonDecisionSubjectAttendance for task ${taskId}`);
-                    continue;
-                }
-                if (subjectAttendance.presentMemberIds.length === 0 && subjectAttendance.absentMemberIds.length === 0) continue;
-
-                try {
-                    await prisma.$transaction(async (tx) => {
-                        const attendanceByPerson = new Map<string, AttendanceStatus>(
-                            [
-                                ...subjectAttendance.presentMemberIds.map(id => [id, 'PRESENT' as const] as const),
-                                ...subjectAttendance.absentMemberIds.map(id => [id, 'ABSENT' as const] as const),
-                            ]
-                        );
-
-                        // Include mayor attendance if known
-                        if (mayorId && result.extractions!.initialAttendance) {
-                            const mayorInitial = result.extractions!.initialAttendance.find(a => a.personId === mayorId);
-                            if (mayorInitial && !attendanceByPerson.has(mayorId)) {
-                                attendanceByPerson.set(mayorId, mayorInitial.status);
-                            }
-                        }
-
-                        await tx.subjectAttendance.deleteMany({
-                            where: { subjectId: subjectAttendance.subjectId, source: DataSource.decision },
-                        });
-                        await tx.subjectAttendance.createMany({
-                            data: [...attendanceByPerson].map(([personId, status]) => ({
-                                subjectId: subjectAttendance.subjectId,
-                                personId,
-                                status,
-                                source: DataSource.decision,
-                                taskId,
-                            })),
-                        });
-                    });
-                    storedCount++;
-                } catch (error) {
-                    console.error(`Failed to store attendance for subject ${subjectAttendance.subjectId}:`, error);
-                }
-            }
-            if (storedCount > 0) {
-                console.log(`Stored effective attendance for ${storedCount} non-decision subjects`);
-            }
+        // One derivation over every stored page of the meeting: the roll
+        // call and the changes are resolved from all of them, so a poll that read one
+        // new page only adds that page. A page whose write failed keeps its previous
+        // reading, which is whole.
+        try {
+            const derived = await deriveAndPersist(task.cityId!, task.councilMeetingId!, taskId);
+            console.log(`Derived ${derived.attendance.length} attendance rows, ${derived.votes.length} vote rows, ${derived.rollCall.length} roll-call rows, ${derived.events.length} events, ${derived.issues.length} issues`);
+        } catch (error) {
+            console.error('Derivation after poll failed:', error);
         }
 
         if (result.extractions.warnings.length > 0) {
@@ -1224,4 +1237,43 @@ export async function handlePollDecisionsResult(taskId: string, result: PollDeci
     }
 
     console.log(`Poll decisions completed: ${processedCount} matched, ${extractedCount} extracted, ${reassignmentCount} reassigned, ${conflictCount} conflicts, ${result.unmatchedSubjects.length} unmatched, ${result.ambiguousSubjects.length} ambiguous`);
+
+    // Through after(): the task service waits on this callback with a
+    // timeout, and a poll that placed decisions on many meetings must not
+    // hold it open while their polls start.
+    const followUps = [...meetingsWithNewCandidates];
+    if (followUps.length > 0) after(() => pollMeetingsWithNewCandidates(task.cityId, followUps));
+}
+
+/**
+ * Poll the meetings a poll just placed new decisions on — a fresh reading
+ * that declares them, or an orphan the heal assigned. A poll matches only its
+ * own meeting's subjects, so without this those decisions sit unmatched until
+ * something polls their meeting — days, with the cron's backoff or paused.
+ * A decision already placed there triggers nothing, so a follow-up never
+ * bounces back; a chain continues only while polls keep placing new ones.
+ * Failures are logged, never raised: the triggering poll has already committed.
+ */
+async function pollMeetingsWithNewCandidates(cityId: string, meetingIds: string[]) {
+    try {
+        const meetings = await prisma.councilMeeting.findMany({
+            where: {
+                ...AWAITING_DECISIONS_MEETING_WHERE,
+                cityId,
+                id: { in: meetingIds },
+                taskStatuses: { none: { type: 'pollDecisions', status: { in: ['pending', 'processing'] } } },
+            },
+            select: { id: true },
+        });
+        for (const meeting of meetings) {
+            try {
+                await pollDecisionsForMeeting(cityId, meeting.id, { silent: true });
+                console.log(`Polling ${cityId}/${meeting.id}: an earlier poll placed new decisions on it`);
+            } catch (error) {
+                console.error(`Failed to start follow-up poll for ${cityId}/${meeting.id}:`, error);
+            }
+        }
+    } catch (error) {
+        console.error(`Failed to start follow-up polls for ${cityId}:`, error);
+    }
 }

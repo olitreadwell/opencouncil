@@ -8,12 +8,13 @@ import prisma from '@/lib/db/prisma';
 import { GenerateHighlightRequest, GenerateHighlightResult } from '@/lib/apiTypes';
 import { canViewHighlight } from '@/lib/db/highlights';
 import { sendHighlightCompleteEmail } from '@/lib/email/highlightComplete';
+import { webUrl } from '@/lib/zod-schemas/primitives';
 import { requestGenerateHighlightCore, type GenerateHighlightOptions } from './generateHighlight-core';
 
 export async function requestGenerateHighlight(highlightId: string, options?: GenerateHighlightOptions) {
     const highlight = await prisma.highlight.findUnique({
         where: { id: highlightId },
-        select: { cityId: true, createdById: true },
+        select: { cityId: true, meetingId: true, createdById: true },
     });
 
     if (!highlight) {
@@ -22,6 +23,7 @@ export async function requestGenerateHighlight(highlightId: string, options?: Ge
 
     const authorized = await canViewHighlight({
         cityId: highlight.cityId,
+        meetingId: highlight.meetingId,
         createdById: highlight.createdById
     });
 
@@ -37,7 +39,6 @@ export async function handleGenerateHighlightResult(taskId: string, result: Gene
     const task = await prisma.taskStatus.findUnique({
         where: { id: taskId },
         select: {
-            status: true,
             requestBody: true
         }
     });
@@ -62,29 +63,39 @@ export async function handleGenerateHighlightResult(taskId: string, result: Gene
         return;
     }
 
-    // Determine status based on task result
-    const status: 'success' | 'failure' = task.status === 'succeeded' && result.parts && result.parts.length > 0 
-        ? 'success' 
-        : 'failure';
+    // The handler runs on a success callback, or on a replay of one, so the
+    // result alone says whether a video came back. The task does not read as
+    // succeeded while its handler runs.
+    //
+    // Only the request says which highlight the task rendered. The result
+    // names one too, but a callback body is caller data: it must not be able
+    // to point the video of another highlight at a URL of its choice, and the
+    // URL it does bring must be a web URL.
+    const part = result.parts?.[0];
+    const renderedUrl = part && part.id === highlightId ? webUrl().safeParse(part.url) : undefined;
+    const status: 'success' | 'failure' = renderedUrl?.success ? 'success' : 'failure';
+    const failureReason = !part
+        ? 'The result has no rendered part'
+        : part.id !== highlightId
+            ? `The result names highlight ${part.id}, the task rendered ${highlightId}`
+            : renderedUrl?.success ? null : 'The result video URL is not a web URL';
 
     // Get createdById - either from update (success) or findUnique (failure)
     let createdById: string | null = null;
 
-    if (status === 'success' && result.parts && result.parts.length > 0) {
-        const part = result.parts[0];
-        
+    if (part && renderedUrl?.success) {
         // Update highlight and get createdById in a single query
         const highlight = await prisma.highlight.update({
-            where: { id: part.id },
+            where: { id: highlightId },
             data: {
-                videoUrl: part.url,
+                videoUrl: renderedUrl.data,
                 ...(part.muxPlaybackId ? { muxPlaybackId: part.muxPlaybackId } : {}),
             },
             select: {
                 createdById: true
             }
         });
-        
+
         createdById = highlight.createdById;
     } else {
         // Task failed - just get createdById
@@ -108,5 +119,11 @@ export async function handleGenerateHighlightResult(taskId: string, result: Gene
         }).catch(error => {
             console.error('Failed to send highlight completion email:', error);
         });
+    }
+
+    // A result that wrote no video is a failed task, not a succeeded one: the
+    // caller of this handler marks the task failed and alerts on a throw.
+    if (failureReason !== null) {
+        throw new Error(`Highlight ${highlightId}: ${failureReason}`);
     }
 } 

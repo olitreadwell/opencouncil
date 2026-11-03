@@ -54,6 +54,7 @@ model City {
   // Consultations relation
   consultations Consultation[]
   consultationComments ConsultationComment[]
+  pendingConsultationComments PendingConsultationComment[]
 
   @@index([status])
   @@index([realm])
@@ -69,6 +70,41 @@ enum CityLanguage {
   el
   fr
   sr
+  de
+  nl
+  it
+  pl
+  pt
+  es
+  fi
+  ca
+  sv
+  gl
+  bs
+  en
+  cy
+  ga
+  da
+  no
+  is
+  et
+  lv
+  lt
+  cs
+  sk
+  hu
+  sl
+  hr
+  ro
+  bg
+  mk
+  mt
+  lb
+  uk
+  ru
+  tr
+  sq
+  eu
 }
 
 // Tenant/grouping a city belongs to (e.g. the Greek vs. French deployment).
@@ -77,6 +113,45 @@ enum Realm {
   france
   cyprus
   serbia
+  austria
+  belgium
+  finland
+  germany
+  italy
+  netherlands
+  poland
+  portugal
+  spain
+  bosnia
+  andorra
+  albania
+  bulgaria
+  switzerland
+  czechia
+  denmark
+  estonia
+  united_kingdom
+  croatia
+  hungary
+  ireland
+  iceland
+  liechtenstein
+  lithuania
+  luxembourg
+  latvia
+  monaco
+  moldova
+  montenegro
+  north_macedonia
+  malta
+  norway
+  romania
+  sweden
+  slovenia
+  slovakia
+  san_marino
+  ukraine
+  kosovo
 }
 
 /// Where a city stands with us. Collapses the old (status, officialSupport) pair:
@@ -115,6 +190,35 @@ enum AdministrativeBodyType {
   community    // Κοινότητα (π.χ. 5η Δημοτική Κοινότητα)
 }
 
+/// Whether the announced meeting is still expected. Whether it was held stays
+/// derived from what the record holds (lib/meetingStage.ts).
+enum MeetingScheduleStatus {
+  scheduled
+  postponed
+  cancelled
+}
+
+/// The kind of meeting that the invitation names. A null kind means that the
+/// record states no single kind: its invitation is not read yet, or it holds
+/// several meetings (its legacy stored name says which). Urgency is not a kind:
+/// see `urgent`. See MEETING_KINDS.
+enum MeetingKind {
+  ordinary           // Τακτική
+  special            // Ειδική, for another purpose; council only
+  accountability     // Ειδική Συνεδρίαση Λογοδοσίας, council only
+  activityReport     // Ειδική Συνεδρίαση Απολογισμού Πεπραγμένων, council only
+  budget             // Ειδική Συνεδρίαση Προϋπολογισμού, council only
+  presidencyElection // Ειδική Συνεδρίαση Εκλογής Προεδρείου, council only
+  financialAccounts  // Οικονομικές Καταστάσεις (invitations print «Ειδική»), council only
+}
+
+enum MeetingFormat {
+  inPerson
+  remote
+  hybrid
+  byCirculation
+}
+
 enum NotificationBehavior {
   NOTIFICATIONS_DISABLED
   NOTIFICATIONS_AUTO
@@ -131,6 +235,12 @@ model AdministrativeBody {
   youtubeChannelUrl String?
   contactEmails String[] @default([]) // Emails for receiving transcripts
   diavgeiaUnitIds String[] @default([]) // Diavgeia scopes to poll, each `unit[:signer]` (e.g., ["81689"], ["84655:100010590"]). The signer separates bodies that share one unit.
+  /// What this body's decision documents state and how: roll-call layout, what the present
+  /// list means, what attendance changes are pinned to, whether per-vote absence is printed.
+  /// Shape: DecisionConventions in src/lib/decisionConventions.ts. Written by the import of
+  /// fixtures/body-conventions.json or by a person in admin; read by extraction and by the minutes.
+  decisionConventions Json?
+  place     String?  // the hall the body sits in as a rule; a meeting's own place overrides it
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -139,6 +249,7 @@ model AdministrativeBody {
   meetings  CouncilMeeting[]
 
   roles Role[]
+  administrators Administers[]
 
   @@index([cityId])
 }
@@ -185,6 +296,7 @@ model Person {
   voicePrintConsents VoicePrintConsent[]
 
   speakerTags SpeakerTag[]
+  speakerIdentifications SpeakerIdentification[]
   voicePrints VoicePrint[]
   city   City   @relation(fields: [cityId], references: [id], onDelete: Cascade)
   cityId String
@@ -196,14 +308,15 @@ model Person {
   subjectAttendance SubjectAttendance[]
   subjectVotes SubjectVote[]
   meetingAttendance MeetingAttendance[]
+  attendanceEvents AttendanceEvent[]
 
   @@index([cityId])
 }
 
 model CouncilMeeting {
   id        String   @default(cuid())
-  name      String
-  name_en   String
+  name      String?  // legacy, written by nothing; read only when kind is null (lib/meetingName.ts)
+  name_en   String?
   dateTime  DateTime
   youtubeUrl String?
   agendaUrl String?
@@ -218,6 +331,37 @@ model CouncilMeeting {
   updatedAt DateTime @updatedAt
   released  Boolean  @default(false)
 
+  scheduleStatus       MeetingScheduleStatus @default(scheduled)
+  scheduleStatusReason String?
+  kind                 MeetingKind?
+  // Convened urgently (έκτακτη; the law says κατεπείγουσα), for any body and
+  // any kind. The first part of a continued meeting holds it.
+  urgent               Boolean @default(false)
+  // The official number, as the municipality prints it. Not unique: a
+  // cancelled meeting keeps its number, and the new meeting after a
+  // postponement reuses it.
+  sessionNumber        Int?
+  // Null: nobody has stated the format, and nobody has read it from the
+  // invitation yet.
+  format               MeetingFormat?
+  closedToPublic       Boolean @default(false)
+  place                String? // overrides administrativeBody.place
+
+  // "A was postponed to B", "B was postponed from A". One new meeting for each
+  // postponed meeting. The composite key keeps both ends in one city.
+  postponedFromId String?
+  postponedFrom   CouncilMeeting? @relation("Postponement", fields: [cityId, postponedFromId], references: [cityId, id], onDelete: NoAction, onUpdate: NoAction)
+  postponedTo     CouncilMeeting? @relation("Postponement")
+  // The release of a later meeting of the chain unreleased this meeting. Only
+  // such a meeting becomes public again when the later meeting stops being
+  // public: a postponed draft stays a draft.
+  hiddenByPostponement Boolean @default(false)
+
+  // A later day of the same meeting points to its first part.
+  continuationOfId String?
+  continuationOf   CouncilMeeting?  @relation("Continuation", fields: [cityId, continuationOfId], references: [cityId, id], onDelete: NoAction, onUpdate: NoAction)
+  continuations    CouncilMeeting[] @relation("Continuation")
+
   city   City   @relation(fields: [cityId], references: [id], onDelete: Cascade)
   cityId String
 
@@ -229,6 +373,7 @@ model CouncilMeeting {
   highlights Highlight[]
   subjects Subject[]
   meetingAttendance MeetingAttendance[]
+  attendanceEvents AttendanceEvent[]
 
   notifications Notification[]
   meetingOperator MeetingOperator?
@@ -236,6 +381,8 @@ model CouncilMeeting {
   @@id([cityId, id])
   @@unique([cityId, id])
 
+  @@unique([cityId, postponedFromId])
+  @@index([cityId, continuationOfId])
   @@index([dateTime])
   @@index([released])
   @@index([administrativeBodyId])
@@ -267,6 +414,7 @@ model TaskStatus {
   type      String
   requestBody String
   responseBody String?
+  failureReason String?
 
   version Int?
 
@@ -278,6 +426,7 @@ model TaskStatus {
   subjectAttendance SubjectAttendance[]
   subjectVotes SubjectVote[]
   meetingAttendance MeetingAttendance[]
+  attendanceEvents AttendanceEvent[]
 
   @@index([councilMeetingId, cityId])
 }
@@ -348,10 +497,62 @@ model SpeakerTag {
 
   person Person? @relation(fields: [personId], references: [id], onDelete: SetNull)
   personId String?
+  // Who decided personId. Null on a tag nobody has assigned. An automatic pass
+  // never reassigns a reviewer's tag (see isReviewerAssignment in src/lib/speakerIdentifications.ts).
+  personSetBy SpeakerAssignmentSource?
+
+  // What each method says about who this speaker is. Kept off the tag: the tag
+  // is public, the opinions are for reviewers.
+  identifications SpeakerIdentification[]
 
   speakerSegments SpeakerSegment[]
 
   @@index([personId])
+}
+
+enum SpeakerAssignmentSource {
+  voiceprint // the voiceprint match alone
+  transcript // the transcript identification alone
+  both       // the two methods agreed
+  user       // a reviewer; automatic passes never overwrite it
+}
+
+/// One method's opinion on who a diarization speaker is. A row stays as the
+/// method gave it, whatever the tag's personId ends up holding, so a reviewer
+/// can see where the methods disagree.
+///
+/// Private. Nothing here reaches a reader: the one read that leaves the server
+/// is getSpeakerIdentificationsForMeeting, which requires edit rights.
+model SpeakerIdentification {
+  id String @id @default(cuid())
+
+  speakerTag   SpeakerTag @relation(fields: [speakerTagId], references: [id], onDelete: Cascade)
+  speakerTagId String
+  method       SpeakerIdentificationMethod
+  person       Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+  personId     String
+
+  /// Whether the method would act on this opinion by itself. The task server
+  /// decides, as it decides whether a voiceprint matched; nothing here
+  /// thresholds a number. False marks a suggestion for a reviewer.
+  actionable   Boolean
+  /// The kind of cue a transcript identification rests on, as the task names it.
+  evidenceKind String?
+  /// 0–100, the method's own score. For a reviewer to read.
+  confidence   Float?
+  /// The decisive transcript line(s) with their timestamp.
+  evidence     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([speakerTagId, method])
+  @@index([personId])
+}
+
+enum SpeakerIdentificationMethod {
+  voiceprint // the transcribe task matched the voice to a stored voiceprint
+  transcript // the fixTranscript task read who is speaking from the text alone
 }
 
 model SpeakerSegment {
@@ -505,6 +706,11 @@ model Subject {
   id        String   @id  @default(cuid())
   name      String
   description String
+  // What the body decided, in one or two plain sentences read off the transcript.
+  // summarize writes it on the day of the transcript, so the Πίνακας αποφάσεων has
+  // a summary before the decision document arrives. No reference links. Null when
+  // the transcript shows no outcome, or on subjects summarized before the field.
+  outcome   String?
 
   cityId String
   councilMeetingId String
@@ -513,6 +719,18 @@ model Subject {
   // The item as written on the official agenda. processAgenda sets it; summarize never touches
   // it. Null for non-agenda subjects, rows that predate the field, or an item with no printed text.
   agendaItemTitle String?
+  // The 1-based order of the agenda section the item sits under, and the section
+  // heading as printed. Null when the agenda is one numbered list. processAgenda
+  // sets both; summarize never touches them. (issue 366)
+  //
+  // A municipality sometimes publishes several invitations in one PDF — Sparta
+  // bundles a Δημοτική Επιτροπή sitting with one per κληροδότημα committee. Those
+  // are separate meetings sharing a document, and the section then stands in for
+  // one of them: the title is the body from the letterhead, not an agenda heading.
+  // Keeping them as sections is what makes agendaItemIndex unambiguous; splitting
+  // the meeting record itself is the real fix and is not done here.
+  agendaSectionIndex Int?
+  agendaSectionTitle String?
   nonAgendaReason NonAgendaReason?
   withdrawn       Boolean          @default(false)
   topicId String?
@@ -552,6 +770,7 @@ model Subject {
   decision Decision?
   attendance SubjectAttendance[]
   votes SubjectVote[]
+  anchoredEvents AttendanceEvent[]
 
   // Temporary field for ADA conflict resolution.
   // Set when a poll detects that an ADA already belongs to another subject's decision.
@@ -561,6 +780,10 @@ model Subject {
   @@index([discussedInId])
 }
 
+/// One decision document linked to a subject: where it lives on Diavgeia, the
+/// text as read, and what it states, verbatim, as the extractor read it — the
+/// facts behind the derived attendance and vote rows, kept so any later
+/// derivation change can rerun without reading the document again.
 model Decision {
   id             String    @id @default(cuid())
   subjectId      String    @unique
@@ -577,6 +800,22 @@ model Decision {
   // Fields extracted from the actual decision PDF content
   excerpt    String?   @db.Text  // Decision body text (markdown) — "ΑΠΟΦΑΣΙΖΕΙ…"
   references String?   @db.Text  // Legal bases from "αφού έλαβε υπόψη" section (markdown)
+  // One or two plain sentences of what the document decides, written by the extractor
+  // with the excerpt. The Πίνακας αποφάσεων prints it over Subject.outcome, because the
+  // document is the official record. Cleared with the extraction.
+  summary    String?   @db.Text
+
+  /// What this document states about its vote and the audit of one reading. The
+  /// phrase is the document's statement; the outcome is never stored, it is a count
+  /// over SubjectVote rows. `extraction` is the wire entry as received (task v4).
+  voteResultPhrase    String?
+  mayorPresent        Boolean?
+  declaredItemNumber  Int?
+  declaredOutOfAgenda Boolean?
+  incomplete          Boolean  @default(false)
+  unmatchedNames      String[] @default([])
+  extractorVersion    String?
+  extraction          Json?
 
   subject   Subject   @relation(fields: [subjectId], references: [id], onDelete: Cascade)
 
@@ -636,6 +875,9 @@ enum NonAgendaReason {
   outOfAgenda
 }
 
+/// Derived: who was present for each subject, rebuilt by src/lib/derivation from
+/// MeetingAttendance and AttendanceEvent along the transcript order (or taken from
+/// the document's own list where the body prints one). Never a source.
 model SubjectAttendance {
   id        String   @id @default(cuid())
   createdAt DateTime @default(now())
@@ -666,6 +908,76 @@ enum AttendanceStatus {
   ABSENT
 }
 
+/// One arrival or departure, pinned to what its source pins it to, with the sentence.
+/// Rows of source `decision` are derivation output: resolved over every stored page
+/// of the meeting (src/lib/derivation/resolveSession.ts) and written with the
+/// per-subject rows; the derivation never reads them back. Rows of any other source
+/// are stated facts and outrank the pages (SOURCE_PRECEDENCE).
+model AttendanceEvent {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+
+  councilMeeting   CouncilMeeting @relation(fields: [cityId, councilMeetingId], references: [cityId, id], onDelete: Cascade)
+  councilMeetingId String
+  cityId           String
+
+  person   Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+  personId String
+
+  kind       AttendanceEventKind
+  anchorKind AttendanceAnchorKind
+  anchorAgendaItemIndex Int?
+  anchorNonAgendaReason NonAgendaReason?
+  anchorDecisionNumber  String?
+  /// The document's own subject: per-vote absence and «during this item» changes.
+  anchorSubject   Subject? @relation(fields: [anchorSubjectId], references: [id], onDelete: SetNull)
+  anchorSubjectId String?
+  anchorPhase     AttendancePhase?
+  timing     AttendanceTiming?
+  rawText    String
+  // How many of the session's documents stated it, out of how many were read.
+  reportingDocuments Int @default(1)
+  totalDocuments     Int @default(1)
+  source DataSource
+
+  task      TaskStatus? @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  taskId    String?
+
+  @@index([councilMeetingId, cityId])
+  @@index([personId])
+  @@index([anchorSubjectId])
+}
+
+enum AttendanceEventKind {
+  ARRIVAL
+  DEPARTURE
+}
+
+/// What a source pins a change to. A phase resolves to the start of its block;
+/// SUBJECT is the document's own subject; SESSION_START/END carry no position.
+enum AttendanceAnchorKind {
+  AGENDA_ITEM
+  DECISION_NUMBER
+  SUBJECT
+  PHASE
+  SESSION_START
+  SESSION_END
+}
+
+enum AttendancePhase {
+  PRE_AGENDA
+  OUT_OF_AGENDA
+}
+
+enum AttendanceTiming {
+  BEFORE
+  DURING
+  AFTER
+}
+
+/// The opening roll call, one row per person (the mayor included), per source.
+/// Rows of source `decision` are derivation output (see AttendanceEvent); rows of
+/// any other source are stated facts.
 model MeetingAttendance {
   id        String   @id @default(cuid())
   createdAt DateTime @default(now())
@@ -692,6 +1004,9 @@ model MeetingAttendance {
   @@index([personId])
 }
 
+/// One row per person per subject: the full record of the vote. Named by the
+/// source, or FOR inferred from presence when the phrase permits. The outcome
+/// (ομόφωνα, κατά πλειοψηφία) is a count over these rows.
 model SubjectVote {
   id        String   @id @default(cuid())
   createdAt DateTime @default(now())
@@ -863,6 +1178,12 @@ model User {
   emailVerified DateTime?
   /// One account per mobile number: Νότης is one conversation per number.
   phone         String?         @unique
+  /// When the reader proved `phone` with a code; null on a number nobody
+  /// proved. Verification is optional: Νότης writes to the number either
+  /// way. A proved number cannot be claimed by another account.
+  phoneVerifiedAt DateTime?
+  phoneVerification PhoneVerification?
+  phoneCodeSends    PhoneCodeSend[]
   onboarded     Boolean         @default(false)
   allowProductUpdates  Boolean  @default(true)
   allowPetitionUpdates Boolean  @default(false)
@@ -872,6 +1193,11 @@ model User {
   /// the notis_fanout_targets view carries it on every row.
   notifyByPhone        Boolean  @default(true)
   isSuperAdmin  Boolean         @default(false)
+  /// A machine account: a service holds it, it never signs in, and its MCP
+  /// tokens carry its rights like a person's (#590). Its address is on the
+  /// reserved domain of src/lib/auth/machineAccounts.ts. The queries that
+  /// mean "people" (recipients, stats, the operator picker) exclude it.
+  isMachine     Boolean         @default(false)
   accounts      Account[]
   sessions      Session[]
   Authenticator Authenticator[]
@@ -885,6 +1211,8 @@ model User {
   // Add these relations for consultation comments
   consultationComments ConsultationComment[]
   consultationCommentUpvotes ConsultationCommentUpvote[]
+  consultationCommentResponses ConsultationCommentResponse[]
+  pendingConsultationComments PendingConsultationComment[]
   
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -895,7 +1223,6 @@ model User {
   subjectAttendance SubjectAttendance[]
   subjectVotes SubjectVote[]
   meetingAttendance MeetingAttendance[]
-  serviceApiKeys ServiceApiKey[]
   mcpTokens UserMcpToken[]
   searchQueries SearchQuery[]
 
@@ -939,6 +1266,40 @@ model VerificationToken {
  
   @@id([identifier, token])
 }
+
+/// The number a reader is proving, with the code we sent to it. One per
+/// reader: a new number replaces the old attempt. When the code matches,
+/// the number is the account's and User.phoneVerifiedAt is set.
+model PhoneVerification {
+  id        String   @id @default(cuid())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String   @unique
+  /// E.164, validated as a mobile number before it is stored.
+  phone     String
+  /// HMAC of the 6-digit code; null until the first code went out.
+  codeHash  String?
+  expiresAt DateTime?
+  /// Wrong codes typed against the current code.
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([phone])
+}
+
+/// One code that went out. The send limits count these rows, per account and
+/// per number, so neither switching numbers nor racing requests resets them.
+/// Rows older than the limit window are deleted as the limits are checked.
+model PhoneCodeSend {
+  id        String   @id @default(cuid())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  phone     String
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([phone, createdAt])
+}
  
 // Optional for WebAuthn support
 model Authenticator {
@@ -964,10 +1325,20 @@ model Administers {
   cityId    String?
   partyId   String?
   personId  String?
+  /// An admin of one administrative body: its meetings, its members and its
+  /// own contact settings, and nothing else in the city (#828).
+  /// The migration adds two rules that this schema cannot state: a check
+  /// constraint keeps exactly one of cityId, partyId, personId and
+  /// administrativeBodyId set, and the partial unique index
+  /// Administers_user_body_key allows one row per user and body. The
+  /// @@unique below never rejects a row, because its other columns are NULL
+  /// and Postgres treats NULLs as distinct.
+  administrativeBodyId String?
   
   city      City?    @relation(fields: [cityId], references: [id], onDelete: Cascade)
   party     Party?   @relation(fields: [partyId], references: [id], onDelete: Cascade)
   person    Person?  @relation(fields: [personId], references: [id], onDelete: Cascade)
+  administrativeBody AdministrativeBody? @relation(fields: [administrativeBodyId], references: [id], onDelete: Cascade)
 
   /// Set only by claimPerson, when the person scans their own QR code. It
   /// says "this account is this person", where a row without it says only
@@ -979,25 +1350,12 @@ model Administers {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@unique([userId, cityId, partyId, personId])
+  @@unique([userId, cityId, partyId, personId, administrativeBodyId])
 }
 
-model ServiceApiKey {
-  id          String    @id @default(cuid())
-  name        String    // Display name (e.g. "Sentinel")
-  hashedKey   String    @unique // SHA-256 hash of the API key
-  keyPrefix   String    // First 10 chars for display (e.g. "sk_a1b2c3d")
-  createdAt   DateTime  @default(now())
-  lastUsedAt  DateTime?
-  revokedAt   DateTime?
-
-  createdBy   User      @relation(fields: [createdById], references: [id])
-  createdById String
-}
-
-// Personal access token for the MCP server. Unlike ServiceApiKey (superadmin,
-// service-level), an MCP token acts as the owning user: highlight creation is
-// attributed to them and limited by their per-city permissions.
+// Personal access token for the MCP server. An MCP token acts as the owning
+// user: highlight creation is attributed to them and limited by their
+// per-city permissions.
 model UserMcpToken {
   id         String    @id @default(cuid())
   name       String    @default("MCP token")
@@ -1144,6 +1502,7 @@ model Consultation {
   cityId    String
 
   comments  ConsultationComment[]
+  pendingComments PendingConsultationComment[]
 
   @@index([cityId, isActive])
   @@index([isActive, endDate])
@@ -1174,9 +1533,34 @@ model ConsultationComment {
   cityId        String
 
   upvotes       ConsultationCommentUpvote[]
+  response      ConsultationCommentResponse?
 
   @@index([consultationId, entityType, entityId])
   @@index([cityId])
+  @@index([userId])
+}
+
+/// A comment written by a reader who was not signed in. It stays hidden until the reader opens the
+/// magic link sent to their email; the sign-in then publishes it as a ConsultationComment. Kept apart
+/// from ConsultationComment so no query or count of published comments ever sees it.
+model PendingConsultationComment {
+  id            String   @id @default(cuid())
+  body          String   @db.Text
+  entityType    ConsultationCommentEntityType
+  entityId      String
+  /// The name the reader typed; set on the account at publication when it has none.
+  authorName    String?
+  createdAt     DateTime @default(now())
+
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId        String
+
+  consultation  Consultation @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+  consultationId String
+
+  city          City     @relation(fields: [cityId], references: [id], onDelete: Cascade)
+  cityId        String
+
   @@index([userId])
 }
 
@@ -1193,6 +1577,26 @@ model ConsultationCommentUpvote {
   @@unique([userId, commentId])
   @@index([commentId])
   @@index([userId])
+}
+
+/// The municipality's one public response under a citizen's consultation comment. It shows in
+/// the municipality's name, never the administrator's. `emailSentAt` is when the email that
+/// joins the author and the municipality went out: once, on the first publication that sends.
+model ConsultationCommentResponse {
+  id           String    @id @default(cuid())
+  body         String    @db.Text
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  emailSentAt  DateTime?
+
+  comment      ConsultationComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  commentId    String    @unique
+
+  /// The administrator who last wrote it: the email's CC and an audit trail. Never shown.
+  author       User?     @relation(fields: [authorUserId], references: [id], onDelete: SetNull)
+  authorUserId String?
+
+  @@index([authorUserId])
 }
 
 // Connects a user to a meeting (via a cityId and meetingId). Has a medium (email or message) and a type (beforeMeeting or afterMeeting).

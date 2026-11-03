@@ -10,6 +10,9 @@ export const meetingSummarySelect = {
     cityId: true,
     name: true,
     name_en: true,
+    kind: true,
+    sessionNumber: true,
+    urgent: true,
     dateTime: true,
     administrativeBody: { select: { name: true, name_en: true } },
     subjects: {
@@ -18,6 +21,7 @@ export const meetingSummarySelect = {
             name: true,
             description: true,
             agendaItemIndex: true,
+            agendaSectionIndex: true,
             nonAgendaReason: true,
             topic: { select: { name: true, name_en: true, colorHex: true, icon: true } },
             _count: { select: { contributions: true } },

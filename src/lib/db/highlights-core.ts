@@ -1,9 +1,9 @@
-// Server-only: upsertHighlightCore/canUserEditCity take an explicit identity
+// Server-only: upsertHighlightCore/canUserEditMeeting take an explicit identity
 // (see the note below), so they must never be exposed to a client bundle or as
 // a Server Action. Only highlights.ts (session wrapper) and the MCP server may
 // import them.
 import "server-only";
-import { City, CouncilMeeting, Highlight, Subject, Utterance, Prisma, HighlightCreationPermission } from '@prisma/client';
+import { AdministrativeBody, City, CouncilMeeting, Highlight, Subject, User, Utterance, Prisma, HighlightCreationPermission } from '@prisma/client';
 import prisma from "./prisma";
 import { ForbiddenError, NotFoundError, BadRequestError } from "../api/errors";
 import { HIGHLIGHT_NAME_MAX_LENGTH, MY_HIGHLIGHTS_LIMIT } from "../highlights/constants";
@@ -13,8 +13,8 @@ export { HIGHLIGHT_NAME_MAX_LENGTH, MY_HIGHLIGHTS_LIMIT };
 // NOT a "use server" module: upsertHighlightCore takes an explicit identity,
 // so exposing it as a server action would let clients act as anyone. Only
 // trusted server-side callers (the session wrapper in highlights.ts and the
-// MCP server) may import it. Same pattern as getAllCitiesAsServiceKey — see
-// the warning in src/app/api/cities/route.ts.
+// MCP server) may import it. Same pattern as createCityDirect in
+// src/lib/db/citiesAdmin.ts.
 
 // Define the include structure for highlights with utterances
 // This includes the highlightedUtterances relation with nested utterance data
@@ -56,6 +56,9 @@ export const highlightWithMeetingInclude = {
             cityId: true,
             name: true,
             name_en: true,
+            kind: true,
+            sessionNumber: true,
+            urgent: true,
             dateTime: true,
             released: true,
             administrativeBody: { select: { name: true, name_en: true } },
@@ -118,45 +121,110 @@ export async function getHighlightStatistics(
 }
 
 /**
- * Who is performing a highlight write. Mirrors the shape returned by
- * withServiceOrUserAuth in src/lib/auth.ts: a user acts under their own
- * per-city permissions, a service key acts as a superadmin.
+ * What a user may edit without a session. `all` is true for a superadmin.
+ * `cityIds` are the cities the user administers. `bodies` maps each
+ * administrative body the user administers to its city (#828): a body admin
+ * edits the meetings of that body, and nothing else in the city.
  */
-export type HighlightActor =
-    | { type: 'user'; userId: string }
-    | { type: 'service'; keyName: string };
+export type UserCityRights = {
+    all: boolean;
+    cityIds: Set<City["id"]>;
+    bodies: Map<AdministrativeBody["id"], City["id"]>;
+};
+
+const userRightsSelect = {
+    isSuperAdmin: true,
+    administers: {
+        select: {
+            cityId: true,
+            administrativeBodyId: true,
+            administrativeBody: { select: { cityId: true } },
+        },
+    },
+} satisfies Prisma.UserSelect;
+
+type UserRightsRow = Prisma.UserGetPayload<{ select: typeof userRightsSelect }>;
 
 /**
- * Session-free check of whether a user may edit a city: superadmins may edit
- * everything, otherwise the user must directly administer the city. Same
- * semantics as the cityId branch of checkUserAuthorization in src/lib/auth.ts.
+ * Session-free read of what a user may edit: a superadmin may edit every
+ * city, any other user the cities and the bodies they directly administer.
+ * Same semantics as the cityId branches of checkUserAuthorization in
+ * src/lib/auth.ts.
  */
-export async function canUserEditCity(userId: string, cityId: City["id"]): Promise<boolean> {
+export async function getUserCityRights(userId: string): Promise<UserCityRights> {
     const user = await prisma.user.findUnique({
         where: { id: userId },
-        select: {
-            isSuperAdmin: true,
-            administers: { select: { cityId: true } }
-        }
+        select: userRightsSelect,
     });
 
-    if (!user) return false;
-    if (user.isSuperAdmin) return true;
-    return user.administers.some(a => a.cityId === cityId);
+    if (!user) return { all: false, cityIds: new Set(), bodies: new Map() };
+    return cityRightsOf(user);
+}
+
+/** The rule itself, for a caller that already holds the user row. */
+export function cityRightsOf(user: UserRightsRow): UserCityRights {
+    if (user.isSuperAdmin) return { all: true, cityIds: new Set(), bodies: new Map() };
+    const bodies = new Map<string, string>();
+    for (const a of user.administers) {
+        if (a.administrativeBodyId && a.administrativeBody) {
+            bodies.set(a.administrativeBodyId, a.administrativeBody.cityId);
+        }
+    }
+    return {
+        all: false,
+        cityIds: new Set(user.administers.map(a => a.cityId).filter((id): id is string => !!id)),
+        bodies,
+    };
+}
+
+/** Session-free check of whether a user may edit one city. */
+export async function canUserEditCity(userId: string, cityId: City["id"]): Promise<boolean> {
+    const rights = await getUserCityRights(userId);
+    return rights.all || rights.cityIds.has(cityId);
 }
 
 /**
- * Whether an actor may manage (view status of / render) a highlight: service
- * actors always may, users may when they own it or can edit its city. Mirrors
- * canViewHighlight in highlights.ts, without the session.
+ * Whether a meeting belongs to one of the given bodies. The MCP admin guards
+ * ask this with the bodies they already resolved for the request.
+ */
+export async function meetingHasBodyIn(
+    cityId: City["id"],
+    meetingId: CouncilMeeting["id"],
+    bodyIds: ReadonlySet<AdministrativeBody["id"]>
+): Promise<boolean> {
+    if (bodyIds.size === 0) return false;
+    const meeting = await prisma.councilMeeting.findUnique({
+        where: { cityId_id: { cityId, id: meetingId } },
+        select: { administrativeBodyId: true },
+    });
+    return !!meeting?.administrativeBodyId && bodyIds.has(meeting.administrativeBodyId);
+}
+
+/**
+ * Session-free check of whether a user may edit one meeting: a superadmin, an
+ * admin of the city, or an admin of the body that holds the meeting.
+ */
+export async function canUserEditMeeting(
+    userId: string,
+    cityId: City["id"],
+    meetingId: CouncilMeeting["id"]
+): Promise<boolean> {
+    const rights = await getUserCityRights(userId);
+    if (rights.all || rights.cityIds.has(cityId)) return true;
+    return meetingHasBodyIn(cityId, meetingId, new Set(rights.bodies.keys()));
+}
+
+/**
+ * Whether a user may manage (view status of / render) a highlight: when they
+ * own it or may edit its meeting. Mirrors canViewHighlight in highlights.ts,
+ * without the session.
  */
 export async function canActorManageHighlight(
-    actor: HighlightActor,
-    highlight: { cityId: City["id"]; createdById: string | null }
+    userId: User["id"],
+    highlight: { cityId: City["id"]; meetingId: CouncilMeeting["id"]; createdById: string | null }
 ): Promise<boolean> {
-    if (actor.type === 'service') return true;
-    if (highlight.createdById === actor.userId) return true;
-    return canUserEditCity(actor.userId, highlight.cityId);
+    if (highlight.createdById === userId) return true;
+    return canUserEditMeeting(userId, highlight.cityId, highlight.meetingId);
 }
 
 async function getCityHighlightPermission(cityId: City["id"]) {
@@ -173,13 +241,13 @@ async function getCityHighlightPermission(cityId: City["id"]) {
 }
 
 /**
- * Create or update a highlight as the given actor. Service actors bypass
- * per-city permission checks and create unattributed highlights; user actors
- * are constrained by the city's highlightCreationPermission and own only
- * their highlights.
+ * Create or update a highlight as the given user, who is constrained by the
+ * city's highlightCreationPermission and owns only their highlights. The
+ * caller has authenticated the user: the session wrapper in highlights.ts,
+ * or the MCP verifier.
  */
 export async function upsertHighlightCore(
-    actor: HighlightActor,
+    userId: User["id"],
     highlightData: {
         id?: Highlight["id"];
         name?: string;
@@ -191,13 +259,24 @@ export async function upsertHighlightCore(
 ): Promise<HighlightWithUtterances> {
     const { id, name, meetingId, cityId, utteranceIds, subjectId } = highlightData;
 
-    const [highlightPermission, canEditCity, existingHighlight] = await Promise.all([
+    const [highlightPermission, canEdit, existingHighlight, utterances, subject] = await Promise.all([
         getCityHighlightPermission(cityId),
-        actor.type === 'service' ? Promise.resolve(true) : canUserEditCity(actor.userId, cityId),
+        canUserEditMeeting(userId, cityId, meetingId),
         id ? prisma.highlight.findUnique({
             where: { id },
-            select: { cityId: true, createdById: true }
-        }) : Promise.resolve(null)
+            select: {
+                cityId: true, meetingId: true, createdById: true,
+                subject: { select: { cityId: true, councilMeetingId: true } },
+            }
+        }) : Promise.resolve(null),
+        prisma.utterance.findMany({
+            where: { id: { in: utteranceIds } },
+            select: { id: true, speakerSegment: { select: { cityId: true, meetingId: true } } },
+        }),
+        subjectId ? prisma.subject.findUnique({
+            where: { id: subjectId },
+            select: { cityId: true, councilMeetingId: true },
+        }) : Promise.resolve(null),
     ]);
 
     // Validate existing highlight
@@ -207,22 +286,52 @@ export async function upsertHighlightCore(
     if (existingHighlight && existingHighlight.cityId !== cityId) {
         throw new BadRequestError('Highlight does not belong to the specified city');
     }
+    // The rights above are on the meeting the caller named, so the highlight
+    // must be in it: an admin of one body could otherwise rewrite a highlight
+    // of another body's meeting by naming their own.
+    if (existingHighlight && existingHighlight.meetingId !== meetingId) {
+        throw new BadRequestError('Highlight does not belong to the specified meeting');
+    }
 
     // Authorization checks
     if (highlightPermission === HighlightCreationPermission.ADMINS_ONLY) {
-        // ADMINS_ONLY: must be city editor
-        if (!canEditCity) {
-            throw new ForbiddenError('Not authorized - only city administrators can manage highlights');
+        // ADMINS_ONLY: must be an editor of the meeting
+        if (!canEdit) {
+            throw new ForbiddenError('Not authorized - only administrators can manage highlights');
         }
     } else {
-        // EVERYONE: city editors can edit anything, regular users can only edit their own
-        if (!canEditCity) {
-            if (existingHighlight && (actor.type !== 'user' || existingHighlight.createdById !== actor.userId)) {
+        // EVERYONE: editors can edit anything, regular users can only edit their own
+        if (!canEdit) {
+            if (existingHighlight && existingHighlight.createdById !== userId) {
                 throw new ForbiddenError('Not authorized to edit this highlight');
             }
             // For new highlights when EVERYONE is allowed, no additional check needed
             // User is authenticated and city allows everyone to create
         }
+    }
+
+    // The rights above are on the meeting the caller named, so every utterance
+    // and the subject must be in it. A highlight could otherwise carry, and
+    // later render or display, content of a meeting the caller may not read.
+    if (utterances.length !== new Set(utteranceIds).size) {
+        throw new BadRequestError('Unknown utterance id');
+    }
+    if (utterances.some(u => u.speakerSegment.cityId !== cityId || u.speakerSegment.meetingId !== meetingId)) {
+        throw new BadRequestError('All utterances must belong to the specified meeting');
+    }
+    if (subjectId) {
+        if (!subject) {
+            throw new BadRequestError('Unknown subject id');
+        }
+        if (subject.cityId !== cityId || subject.councilMeetingId !== meetingId) {
+            throw new BadRequestError('The subject must belong to the specified meeting');
+        }
+    }
+    // An update that leaves the subject as it is keeps a subject linked before
+    // this check existed. Such a subject must not survive the edit either.
+    const keptSubject = subjectId === undefined ? existingHighlight?.subject : null;
+    if (keptSubject && (keptSubject.cityId !== cityId || keptSubject.councilMeetingId !== meetingId)) {
+        throw new BadRequestError('The subject of this highlight belongs to another meeting. Clear it (subjectId: null) to edit the highlight.');
     }
 
     // Generate auto name if no name provided
@@ -238,11 +347,7 @@ export async function upsertHighlightCore(
         ? (subjectId ? { connect: { id: subjectId } } : { disconnect: true })
         : undefined;
 
-    // Service-created highlights have no owning user (createdById stays null);
-    // city editors can see and manage them via canViewHighlight.
-    const createdByConnect = actor.type === 'user'
-        ? { createdBy: { connect: { id: actor.userId } } }
-        : {};
+    const createdByConnect = { createdBy: { connect: { id: userId } } };
 
     const highlight = await prisma.highlight.upsert({
         where: { id: id || 'new' }, // Use 'new' as placeholder for new records

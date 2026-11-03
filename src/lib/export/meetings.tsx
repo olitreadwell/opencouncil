@@ -1,7 +1,6 @@
 "use client";
-import { pdf } from '@react-pdf/renderer';
-import { renderDocx } from '@/components/meetings/docx/CouncilMeetingDocx';
 import { MeetingData } from '@/lib/getMeetingData';
+import type { CouncilMeetingWithAdminBody } from '@/lib/db/meetings';
 
 /** Why an audio export failed, for callers that need to say so in the reader's
  *  language. Anything not covered here is a genuine surprise and surfaces as-is. */
@@ -14,20 +13,9 @@ export class AudioExportError extends Error {
     }
 }
 
-export type MeetingDataForExport = Omit<MeetingData, 'parties' | 'highlights' | 'subjects' | 'speakerTags' | 'taskStatus' | 'transcriptHiddenForReview'>;
-
-export async function exportMeetingToDocx(data: MeetingDataForExport): Promise<Blob> {
-  const { city, meeting, transcript, people } = data;
-
-  const doc = await renderDocx({
-    city,
-    meeting,
-    transcript,
-    people
-  });
-
-  return await doc.save();
-}
+export type MeetingDataForExport = Omit<MeetingData, 'meeting' | 'parties' | 'highlights' | 'subjects' | 'speakerTags' | 'taskStatus' | 'transcriptHiddenForReview'> & {
+    meeting: CouncilMeetingWithAdminBody;
+};
 
 export async function exportMeetingAudioWithProgress(
   data: MeetingDataForExport,
@@ -73,12 +61,3 @@ export async function exportMeetingAudioWithProgress(
     xhr.send();
   });
 }
-
-export function generateMeetingFileName(cityId: string, meetingId: string, format: 'pdf' | 'docx' | 'mp3'): string {
-  return `${cityId}_council_meeting_${meetingId}.${format}`;
-}
-
-// Re-exported for callers that already import it from here. New callers should
-// import from ./download directly, to stay clear of this module's renderers.
-export { downloadFile } from './download';
-

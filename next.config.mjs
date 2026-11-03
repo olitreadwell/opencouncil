@@ -2,6 +2,7 @@ import './src/env.mjs';
 import createNextIntlPlugin from 'next-intl/plugin';
 import { withPostHogConfig } from "@posthog/nextjs-config";
 import { lanIPv4Addresses } from './src/lib/dev/lan-ips.mjs';
+import { videoLinkRewrites } from './src/lib/utils/videoLinkRewrites.mjs';
 
 // Log which DB the build will use (host + db name only, no credentials)
 try {
@@ -39,6 +40,18 @@ const nextConfig = {
         domains: ['townhalls-gr.fra1.digitaloceanspaces.com', 'data.opencouncil.gr', 'fra1.digitaloceanspaces.com'],
     },
     transpilePackages: ['@opencouncil/ui', '@opencouncil/subject-images'],
+    turbopack: {
+        resolveAlias: {
+            // swagger-ui-react reaches apidom through swagger-client's ESM
+            // build. Turbopack follows apidom's re-exports past
+            // refractor/registration.mjs, the side-effect module that adds
+            // `.refract` to the element classes, so /docs fails on an OAS 3.1
+            // spec with "refract is not a function"
+            // (vercel/next.js#86507). The CommonJS build loads the
+            // registration with require(), which Turbopack keeps.
+            'swagger-client/es/*': 'swagger-client/lib/*',
+        },
+    },
     // Next 16 answers /_next/* and /__nextjs* requests that carry an Origin
     // outside this list with 403 (Next 15 only warned). The mobile preview
     // opens the app through the LAN IP, so the phone's HMR socket and
@@ -70,6 +83,15 @@ const nextConfig = {
                 headers: [
                     { key: 'Content-Security-Policy', value: 'frame-ancestors *' },
                     { key: 'Cache-Control', value: 'private, no-store' },
+                ],
+            },
+            {
+                // The browser checks this script for updates on every
+                // navigation; an intermediary cache must not answer for it,
+                // or a deploy's new worker waits out the cached copy.
+                source: '/sw.js',
+                headers: [
+                    { key: 'Cache-Control', value: 'no-cache, max-age=0' },
                 ],
             },
             {
@@ -151,6 +173,7 @@ const nextConfig = {
     },
     async rewrites() {
         return [
+            ...videoLinkRewrites(),
             {
                 source: "/ingest/static/:path*",
                 destination: "https://eu-assets.i.posthog.com/static/:path*",

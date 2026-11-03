@@ -5,14 +5,16 @@ This document describes how OpenCouncil uses Elasticsearch to provide powerful s
 
 ### Table of Contents
 
-1. [Overview](#overview)
+1. [Overview](#architecture-overview)
 2. [Codebase Structure](#codebase-structure)
 3. [Set up Elasticsearch](#set-up-elasticsearch)
 4. [Configure PostgreSQL Views](#configure-postgresql-views)
 5. [Configure the Ingest Pipeline](#configure-the-ingest-pipeline)
+6. [Set up PGSync](#pgsync-setup-and-data-synchronization)
 6. [Set up PGSync](#set-up-pgsync)
+   - [What syncs live](#what-syncs-live)
    - [Deploying a Schema Change](#deploying-a-schema-change)
-7. [Sync Data](#sync-data)
+7. [Sync Data](#deployment-and-sync-operations)
 8. [Search Examples](#search-examples)
 9. [Best Practices & FAQ](#best-practices--faq)
 
@@ -120,39 +122,73 @@ We use Elastic Cloud's serverless project for our Elasticsearch instance.
 
 ### 2. Configure Inference Endpoints
 
-Before creating our index, we need to set up the inference endpoints for semantic search. Elasticsearch automatically creates a preconfigured `.multilingual-e5-small-elasticsearch` endpoint that can be used with the `semantic_text` field type. However, this endpoint comes with `adaptive_allocations` preconfigured with a maximum of 32 allocations, which can lead to unexpected costs during scaling when using the connector.
+The `semantic_text` fields in `schema.json` use `.jina-embeddings-v5-text-small`. This is a preconfigured endpoint of the
+Elastic Inference Service (EIS). Elastic runs the model outside the project and bills per million input
+tokens. The endpoint uses no ML VCUs, so it has no hourly cost.
 
-You can verify the existing inference endpoints using:
+You can list the endpoints of the project with:
 
 ```json
-GET _inference/
+GET _inference/_all
 ```
 
-While Elasticsearch provides a default `.multilingual-e5-small-elasticsearch` endpoint, we create our own custom endpoint to have better control over resource allocation and costs. If you need to make changes to our custom endpoint, you must first delete it using:
+Do not use an endpoint with `"service": "elasticsearch"` in the mapping. Such an endpoint deploys the model
+on ML VCUs inside the project. A started allocation bills 4 VCUs per hour, and the allocation scales to zero
+only after 24 hours without a request. A public site never gives it 24 quiet hours. The index used
+`opencouncil-multilingual-e5-small-elasticsearch` until October 2026. That one allocation was 60% of the
+Elastic bill.
+
+The inference endpoint of a `semantic_text` field cannot change on an existing index. A change of model is a
+rebuild. See [Deploying a Schema Change](#deploying-a-schema-change). The app reads the endpoint off the live
+index and picks the matching score thresholds (`src/lib/search/profile.ts`), so from this version on the deploy
+and the alias swap can happen in either order. The first swap away from e5 is the exception: an app built before this
+version carries the e5 thresholds as constants, so deploy the app before that swap, or semantic matches go
+empty until the deploy lands. A new model needs a new entry in the profile table, measured before the swap.
+
+#### The app's API key
+
+The app reads the mapping of the alias, and it searches the concrete index behind the alias. The `read`
+privilege does not grant the mapping read, and a grant on the alias name does not cover the concrete index
+names. Every app key (production, staging, preview) therefore needs this role, created with
+`POST /_security/api_key` or added to an existing key with `PUT /_security/api_key/<id>`:
 
 ```json
-DELETE /_inference/text_embedding/opencouncil-multilingual-e5-small-elasticsearch?force=true
-```
-
-Then create our custom inference endpoint with controlled allocation settings:
-
-```json
-PUT _inference/text_embedding/opencouncil-multilingual-e5-small-elasticsearch
-{
-  "service": "elasticsearch",
-  "service_settings": {
-    "num_threads": 1,
-    "model_id": ".multilingual-e5-small_linux-x86_64",
-    "adaptive_allocations": {
-      "enabled": true,
-      "min_number_of_allocations": 0,
-      "max_number_of_allocations": 1
-    }
+"role_descriptors": {
+  "opencouncil_app_search": {
+    "cluster": [],
+    "indices": [
+      { "names": ["subjects", "subjects-*"], "privileges": ["read", "view_index_metadata"] }
+    ]
   }
 }
 ```
 
-This custom endpoint will be used in our index mapping to ensure predictable resource allocation and cost management.
+`subjects-*` does not match the scratch indices (`subjects_test`, `subjects_test_eis`), so the app cannot
+search them. A key without `view_index_metadata` gives no error in the search results: the mapping read
+fails, the log shows `could not read the mapping`, and a process that has never read the mapping applies the
+schema's thresholds to whatever index the alias serves. Check a key with:
+
+```json
+GET /_security/user/_has_privileges
+{ "index": [ { "names": ["subjects", "subjects-*"], "privileges": ["read", "view_index_metadata"] } ] }
+```
+
+Send that request authenticated with the key itself. `has_all_requested` must be `true`.
+
+#### Removing the in-project model
+
+After the alias swap, the e5 endpoint still holds its ML allocation and bills until it is deleted. Delete
+the old index first (the endpoint refuses to go while a mapping references it), then the endpoint. Wait at
+least five minutes after the swap: the app searches the concrete index it last resolved behind the alias
+and re-reads the alias every five minutes. An earlier deletion is not an outage, since a request that hits
+the deleted index re-reads the alias and runs again, but it costs that request a round trip.
+
+```json
+DELETE /subjects-2026-08
+DELETE /_inference/text_embedding/opencouncil-multilingual-e5-small-elasticsearch
+```
+
+Confirm with `GET _ml/trained_models/_stats` that no deployment keeps an allocation.
 
 ### 3. Schema Configuration
 
@@ -162,7 +198,7 @@ The index mapping and sync configuration are defined in `elasticsearch/schema.js
 
 The schema is version-controlled, so any changes to the index structure are tracked in git.
 
-To create the index with the mappings from `elasticsearch/schema.json`, PGSync will handle this automatically during bootstrap (see [Sync Data](#sync-data) section).
+To create the index with the mappings from `elasticsearch/schema.json`, PGSync will handle this automatically during bootstrap (see [Sync Data](#deployment-and-sync-operations) section).
 
 You can view the current mapping configuration in `elasticsearch/schema.json`.
 
@@ -175,25 +211,15 @@ PGSync requires helper views to denormalize complex relationships and handle Pos
 ### Required Views
 
 1. **LocationSearchView** - Converts PostGIS geometry to GeoJSON format
-2. **IntroducedByPartyView** - Resolves party affiliation through the `Role` table
-3. **SpeakerContributionSearchView** - Denormalizes speaker contributions
+2. **IntroducedByPartyView** - Resolves the introducer's party through the `Role` table, at the meeting's date
+3. **SpeakerContributionSearchView** - Denormalizes speaker contributions, with each speaker's party at the meeting's date
 4. **SubjectMetricsView** - Precomputes the per-subject discussion metrics
 5. **MeetingAdministrativeBodyView** - Flattens the Subject → CouncilMeeting → AdministrativeBody join and casts the type enum to text. Exposes only the id and the type, because search results hydrate the full body from PostgreSQL
 6. **CitySearchView** - Casts the `Realm` enum to text. Every other `City` column reaches the index as a direct column
 
 ### Realm, Not Country
 
-The index stores `city_realm` (`greece`, `france`, `cyprus`, `serbia`), not an ISO country code.
-
-PostgreSQL holds no country column. `REALMS` in `src/lib/realm.ts` maps a realm to its country, and
-`getRealmCountry()` reads that map. A `CASE` expression in SQL would copy the map into a second place
-that no test covers, so a new realm would sync an empty or wrong country. A caller that needs the
-country resolves it from `city_realm` in application code.
-6. **CitySearchView** - Casts the `Realm` enum to text. Every other `City` column reaches the index as a direct column
-
-### Realm, Not Country
-
-The index stores `city_realm` (`greece`, `france`, `cyprus`, `serbia`), not an ISO country code.
+The index stores `city_realm` (a `Realm` enum value such as `greece` or `france`), not an ISO country code.
 
 PostgreSQL holds no country column. `REALMS` in `src/lib/realm.ts` maps a realm to its country, and
 `getRealmCountry()` reads that map. A `CASE` expression in SQL would copy the map into a second place
@@ -229,7 +255,7 @@ because `calculateMeetingDurationMs()` uses it for a wall-clock span.
 > it is tempting to declare `base_tables: ["Subject"]`. That is what `SubjectSearchView` did, and it
 > made PGSync route `Subject` DELETE events as child re-syncs, so deleted subjects stayed in the
 > index. Declare only the tables the view actually reads.
-4. **SpeakerContributionSearchView** - Denormalizes speaker contributions with party resolution
+4. **SpeakerContributionSearchView** - Denormalizes speaker contributions, with each speaker's party resolved through the `Role` table at the meeting's date
 
 ### Create the Views
 
@@ -345,6 +371,44 @@ The `elasticsearch/schema.json` file defines:
 - [PGSync Schema Documentation](https://pgsync.com/schema/) - Official guide to schema configuration
 - [PGSync Examples](https://github.com/toluaina/pgsync/tree/main/examples) - Example schemas for various use cases
 
+### What syncs live
+
+PGSync writes a document again when it sees a change that it can resolve to the subject. Some changes it cannot resolve. Those reach the index the next time the subject is synced: a write to the `Subject` row, a re-summarize, or a rebuild. After that sync, no field stays wrong.
+
+The tables below are measured on the image that production runs. To measure them again after a change to `schema.json` or `views.sql`, run `scripts/pgsync-matrix.sh` in [opencouncil-tasks](https://github.com/schemalabz/opencouncil-tasks). It changes every source of every field in a local database and reports how each field followed.
+
+**Live, within seconds:**
+
+| Change | Fields that follow |
+|--------|--------------------|
+| Any write to the `Subject` row, including a delete and a change of its topic, introducer or location | The whole document |
+| `CouncilMeeting`: release, name, date, administrative body | `meeting_released`, `meeting_name`, `meeting_date`, `administrative_body_id`, `administrative_body_type` |
+| `City`: `name`, `name_en` | `city_name`, `city_name_en` |
+| `Topic`: `name`, `name_en` | `topic_name`, `topic_name_en` |
+| `Person`: `name`, `name_en` of the introducer | `introduced_by_person_name`, `introduced_by_person_name_en` |
+| `SpeakerContribution`: insert or delete | `speaker_contributions`, `contributor_count` |
+
+**At the next sync of the subject:**
+
+| Change | Why |
+|--------|-----|
+| A role or a party of the introducer or of a speaker, a party rename | The party fields come from views keyed by subject and by contribution. A Role or Party event names no row of them. A change of party from a date onwards needs no sync: the subjects before that date keep the party they had at their meeting. |
+| The name of a speaker | `speaker_person_name` comes from `SpeakerContributionSearchView` |
+| The text of a contribution, edited in place | `SpeakerContribution` is only a base table, so PGSync watches its key columns only. The app replaces a subject's contributions with the subject; it never edits one in place. |
+| The text or coordinates of a `Location` row, the realm of a `City` | Same as above: base tables of `LocationSearchView` and `CitySearchView` |
+| The type of an `AdministrativeBody` | No node reads the table |
+| Discussion tags on utterances | See [When do the discussion metrics refresh?](#faq) |
+
+#### Rules for `schema.json` and `views.sql`
+
+These rules follow from how PGSync handles live events. `src/lib/search/__tests__/schema-invariants.test.ts` checks rules 1 to 3.
+
+1. **Key and join every view on base table columns with their own names.** A WAL event carries the base table's column names, and PGSync looks up a view's `primary_key` and `foreign_key.child` by name. An aliased column is never found: a view keyed on aliased columns exits the daemon on every write to its base tables, and an aliased join column resolves nothing. Rename a field for the index with `transform.rename`.
+2. **A table's events go to the last node that lists it in `base_tables`**, also when the table has a node of its own. List a table there only in a view that resolves its events: a view built on that table and joined like it, or a view that cannot use the events at all.
+3. **Never list the root table `Subject` in `base_tables`.** PGSync then routes a `Subject` delete as a child re-sync, and the deleted document stays in the index.
+4. **PGSync watches a column for updates only if a node of that table reads it.** For a table that only appears in `base_tables`, that is its key columns: an insert or a delete reaches the index, an update of another column does not. Upstream PGSync also keeps the columns of only the last node of a table. The image in opencouncil-tasks carries a fix for that, see `docker/pgsync/` there.
+5. **Resolve a value that depends on time at the meeting's date, not at `NOW()`.** A view that reads the clock changes its output with no write, and no event follows.
+
 ### Deploying a Schema Change
 
 PGSync sends the `mapping` block from `schema.json` **only when it creates the index**
@@ -355,8 +419,9 @@ index creation.
 
 **Every schema change therefore deploys as a rebuild**: bump the versioned index name in `schema.json`
 and follow the rebuild procedure above. A full rebuild of the corpus takes minutes, search stays
-available throughout (the alias serves the old index until the swap), and re-writing unchanged text is
-absorbed by the inference cache. There is no cheaper deploy path worth maintaining.
+available throughout (the alias serves the old index until the swap), and a full re-embedding of the
+corpus costs under a dollar on the Elastic Inference Service. There is no cheaper deploy path worth
+maintaining.
 
 #### Verify (after the bootstrap, before the alias swap)
 
@@ -376,16 +441,29 @@ usual results.
 
 `_cat/indices` reports `docs.count` including nested documents. Use `_count` for the number of subjects.
 
+#### Choosing a model
+
+Measure a candidate model before a rebuild, on a copy of the index embedded with it, with the same cases:
+
+```bash
+ELASTICSEARCH_INDEX=<copy> npx tsx scripts/search-eval.ts --bands        # the cutoff window
+ELASTICSEARCH_INDEX=<copy> npx tsx scripts/search-eval.ts --min-score <x> # the suite at a cutoff
+ELASTICSEARCH_INDEX=<copy> npx tsx scripts/search-eval.ts --related <id>  # the neighbours of a subject
+```
+
+Compare the models on the tolerance of the cutoff (the range of cutoffs that costs at most one more miss, as
+a share of the band), on which typos and paraphrases clear the cutoff, on the neighbours of ten specific
+titles, and on the `took` of a semantic query. The October 2026 comparison of `.jina-embeddings-v3`,
+`.jina-embeddings-v5-text-small` and `.jina-embeddings-v5-text-nano` is in the docblock of `PROFILES` in
+`src/lib/search/profile.ts`.
+
 #### Measuring inference
 
-When sizing or verifying a re-index, measure real embedding work, not cache hits:
-
-- `inference_count` from `GET _ml/trained_models/<inference_id>/_stats` **includes cache hits**. Compute
-  Δ`inference_count` − Δ`cache_hits`.
-- The cache is per-allocation and resets when the allocation recycles, so a repeat write of unchanged
-  text that looks free in a measurement still costs inference in a real migration.
-- Record `node.start_time` on both sides of a measurement and discard the delta if it changed — the
-  counters are scoped to the current allocation and restart at zero.
+The Elastic Inference Service bills per million input tokens. The usage page of the Elastic Cloud console
+reports the tokens under "Elastic Inference Service". A full rebuild of the corpus (14k subjects, name
+and description) is an estimated 1.5 to 2 million tokens, from the character count of the fields at about 2
+to 3 characters per token; read the actual figure off the usage page after a rebuild. The
+`_ml/trained_models/_stats` counters do not apply: no model runs inside the project.
 
 ### Deployment and Sync Operations
 
@@ -411,7 +489,7 @@ When making changes to `elasticsearch/schema.json` or `elasticsearch/views.sql`,
 │                                                             │
 │  elasticsearch/schema.json  ─┐                              │
 │  elasticsearch/views.sql    ─┼── Defines ES index structure │
-│  prisma/seed_data.json      ─┘   and data transformations   │
+│  seed artifact              ─┘   and data transformations   │
 │                                                             │
 │  ELASTICSEARCH_INDEX=subjects_test nix run .#dev            │
 │    ├── Local PostgreSQL (wal_level=logical)                 │
@@ -495,37 +573,7 @@ Always test both:
 1. **Bootstrap test**: Initial indexing when PGSync starts (uses view data directly)
 2. **Live sync test**: Insert/update records after PGSync is running (uses WAL events)
 
-**Testing live sync for nested/child relationships:**
-
-When adding new nested fields (like `speaker_contributions`), the bootstrap may succeed even with an empty table. You must also test live sync by inserting data while PGSync is running.
-
-Key behaviors to understand:
-
-- **Child table changes may not auto-trigger parent re-sync**: When you insert into a child table (e.g., `SpeakerContribution`), PGSync detects the change but may not automatically re-index the parent document (`Subject`). You may need to update the parent record to trigger the full document re-sync.
-
-- **WAL events use base table column names**: If your view aliases `id` to `contribution_id`, the WAL event still sends `id`. The schema's `primary_key` must match what WAL sends, then use `transform.rename` to map to the desired Elasticsearch field name.
-
-**Example live sync test:**
-
-```bash
-# 1. Find a subject without contributions
-psql "$PSQL_URL" -c "SELECT s.id, s.name, p.id as person_id, p.name 
-  FROM \"Subject\" s 
-  JOIN \"Person\" p ON p.\"cityId\" = s.\"cityId\" 
-  WHERE NOT EXISTS (SELECT 1 FROM \"SpeakerContribution\" sc WHERE sc.\"subjectId\" = s.id) 
-  LIMIT 3;"
-
-# 2. Insert a contribution (replace IDs with actual values)
-psql "$PSQL_URL" -c "INSERT INTO \"SpeakerContribution\" (id, text, \"subjectId\", \"speakerId\", \"createdAt\", \"updatedAt\") 
-  VALUES ('test-contrib-1', 'Test contribution text.', '<SUBJECT_ID>', '<PERSON_ID>', NOW(), NOW());"
-
-# 3. Watch PGSync logs - if stuck at Db: [N] but Elasticsearch: [0], trigger parent update:
-psql "$PSQL_URL" -c "UPDATE \"Subject\" SET \"updatedAt\" = NOW() WHERE id = '<SUBJECT_ID>';"
-
-# 4. Verify in Elasticsearch
-curl -s "$ELASTICSEARCH_URL/subjects_test/_doc/<SUBJECT_ID>" \
-  -H "Authorization: ApiKey $ELASTICSEARCH_API_KEY" | jq '._source.speaker_contributions'
-```
+A bootstrap can succeed while live sync of the same field does nothing, for example with an empty child table. `scripts/pgsync-matrix.sh` in opencouncil-tasks runs the live sync test for every field: it changes each source in a local database and checks the document. Compare its report with [What syncs live](#what-syncs-live) after every change to `schema.json` or `views.sql`. The daemon's status line tells the two failure modes apart: `Db` counts the events PGSync received, `Elasticsearch` the documents it wrote. `Db` that does not move means the trigger skipped the change (rule 4); `Db` that moves while `Elasticsearch` does not means PGSync could not resolve the event to a subject (rules 1 and 2).
 
 #### Testing WAL Monitoring
 
@@ -639,7 +687,7 @@ Staging has **read-only search against the production `subjects` index** — the
 
 Configuration on the staging app:
 - `ELASTICSEARCH_URL`: the production Elastic Cloud endpoint
-- `ELASTICSEARCH_API_KEY`: a dedicated key restricted to `read` on `subjects` (staging structurally cannot mutate the index)
+- `ELASTICSEARCH_API_KEY`: a dedicated key restricted to `read` and `view_index_metadata` on `subjects` and `subjects-*` (see [The app's API key](#the-apps-api-key); staging structurally cannot mutate the index)
 - `ELASTICSEARCH_INDEX`: unset (defaults to `subjects`)
 - `DEPLOYMENT_ENV=staging`
 
@@ -935,22 +983,12 @@ A: PGSync's live sync receives WAL events with the base table's original column 
 This ensures bootstrap (reads from view) and live sync (reads from WAL) both work correctly.
 
 **Q: When do the discussion metrics refresh?**  
-A: PGSync rebuilds the whole document when it re-syncs a `Subject`, and it re-syncs a `Subject` only when
-the `Subject` row itself changes. A change to a child table does not trigger it, whatever `base_tables`
-declares (see [Testing Live Sync](#testing-live-sync-important)) — the aggregate source rows carry their
-own primary keys, which cannot match a subject id.
+A: PGSync rebuilds the whole document when it re-syncs a `Subject`: after a write to the `Subject` row, or after an event that it can resolve to the subject (see [What syncs live](#what-syncs-live)). The source rows of `discussion_speaking_seconds` (`Utterance`, `SpeakerSegment`, `Summary`) resolve to no subject, because `SubjectMetricsView` is keyed by subject id and their events carry their own ids.
 
-Both metrics therefore depend on their data committing together with a `Subject` write:
+- `contributor_count` — current. A contribution insert or delete re-syncs the subject, and `saveSubjectsForMeeting` writes the subjects and their contributions in one transaction.
+- `discussion_speaking_seconds` — current only because the summarize task applies the utterance discussion tags inside the subject transaction. Written afterwards, they would not reach the index until the next sync of the subject, and every newly summarized subject would report 0.
 
-- `contributor_count` — `saveSubjectsForMeeting` writes the subjects and their contributions in one
-  transaction, so the count is always current.
-- `discussion_speaking_seconds` — the summarize task's utterance discussion tags are applied inside that
-  same transaction for this reason. Written afterwards, they would never reach the index and every newly
-  summarized subject would report 0.
-
-So a writer that changes an utterance's discussion tag must do it alongside the subject write. Test both
-bootstrap and live sync after you change the aggregates in `SubjectMetricsView`. Touch the parent `Subject`
-row if the numbers look stale.
+So a writer that changes an utterance's discussion tag must do it alongside the subject write.
 
 **Q: Why does an edit to an administrative body not appear in search?**  
 A: `MeetingAdministrativeBodyView` has the primary key `(id, cityId)` of `CouncilMeeting`, so only
@@ -973,7 +1011,7 @@ A: PGSync automatically detects changes to related tables (Utterance, SpeakerSeg
 A: Yes, you can use the nested query on `speaker_contributions` to find the contributions within a subject that matched semantically. The search implementation supports both approaches.
 
 **Q: How do I optimize semantic search performance?**  
-A: Use dedicated inference endpoints for ingestion and search, and configure appropriate chunking settings for your text. The current implementation uses the `opencouncil-multilingual-e5-small-elasticsearch` model.
+A: Use dedicated inference endpoints for ingestion and search, and configure appropriate chunking settings for your text. The current implementation uses the `.jina-embeddings-v5-text-small` endpoint of the Elastic Inference Service.
 
 **Q: How does PGSync know when data changes?**  
 A: PGSync uses PostgreSQL's logical decoding feature (Write-Ahead Log - WAL) to capture all data changes in real-time. It creates triggers on your tables and listens to the replication stream.

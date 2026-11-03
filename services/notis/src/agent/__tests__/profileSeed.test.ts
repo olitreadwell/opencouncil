@@ -2,7 +2,7 @@ import { seedProfileFromPreferences } from "../profileSeed";
 
 describe("seedProfileFromPreferences", () => {
   test("no preferences", () => {
-    expect(seedProfileFromPreferences([])).toBe("Δεν έχει δηλώσει προτιμήσεις ειδοποιήσεων.");
+    expect(seedProfileFromPreferences([])).toBe("Δεν έχει δηλώσει προτιμήσεις ενημερώσεων.");
   });
 
   test("city with topics and locations", () => {
@@ -15,7 +15,7 @@ describe("seedProfileFromPreferences", () => {
       },
     ]);
     expect(profile).toBe(
-      "Έχει ενεργοποιήσει ειδοποιήσεις για Αθήνα. " +
+      "Έχει ενεργοποιήσει ενημερώσεις για Αθήνα. " +
         "Θέματα που έχει επιλέξει: Πολεοδομία, Συγκοινωνίες. " +
         "Περιοχές που τον αφορούν: Πετράλωνα.",
     );
@@ -25,7 +25,8 @@ describe("seedProfileFromPreferences", () => {
     const profile = seedProfileFromPreferences([
       { cityId: "patras", cityName: "Πάτρα", topics: [], locations: [] },
     ]);
-    expect(profile).toContain("Χωρίς συγκεκριμένα θέματα ή περιοχές.");
+    expect(profile).toContain("Δεν περιόρισε θέματα: όλα τα θέματα του δήμου τον αφορούν.");
+    expect(profile).toContain("Χωρίς συγκεκριμένες περιοχές.");
   });
 
   test("multiple cities produce one line each", () => {

@@ -1,7 +1,7 @@
 "use client";
 import SpeakerSegment from "./SpeakerSegment";
 import { useEffect, useRef, useMemo, useState } from 'react';
-import { useVideo } from "../VideoProvider";
+import { useVideoActions } from "../VideoProvider";
 import { debounce, joinTranscriptSegments } from '@/lib/utils';
 import { useCouncilMeetingData } from "../CouncilMeetingDataContext";
 import { Clock, ScrollText } from "lucide-react";
@@ -14,6 +14,8 @@ import { UtteranceContextMenu } from "./UtteranceContextMenu";
 import { getScrollContainer } from "@/lib/utils/scrollAnchor";
 import { ExcerptSelectionToolbar, useExcerptSources } from '@/components/sharing/ExcerptSelectionToolbar';
 import { ExcerptRangeHighlight } from '@/components/sharing/ExcerptRangeHighlight';
+import { parseExcerptSelector } from '@/lib/sharing/excerptSelector';
+import { hasPublicRecording } from "@/lib/meetingLifecycleRules";
 
 // Helper functions for speaker segment identification and parsing
 const SPEAKER_SEGMENT_PREFIX = 'speaker-segment-';
@@ -35,13 +37,18 @@ export default function Transcript() {
     const { options } = useTranscriptOptions();
     const tTranscript = useTranslations('transcript');
     const t = useTranslations('Common');
-    const { setCurrentScrollInterval } = useVideo();
+    // The actions context, not the reactive one: this component must not
+    // re-render on every playback tick just to hold the setter.
+    const { setCurrentScrollInterval } = useVideoActions();
     const { enterEditMode, editingHighlight } = useHighlight();
     const containerRef = useRef<HTMLDivElement>(null);
     const [bannerHeight, setBannerHeight] = useState(BANNER_HEIGHT_FULL);
     const [isScrolled, setIsScrolled] = useState(false);
     const searchParams = useSearchParams();
-    const excerptSources = useExcerptSources();
+    // A shared excerpt is checked in the locale it was shared in: a reader on
+    // the other Serbian script sees other words, but the same passage.
+    const excerptLocale = useMemo(() => parseExcerptSelector(new URLSearchParams(searchParams.toString()))?.textLocale, [searchParams]);
+    const excerptSources = useExcerptSources(excerptLocale);
     const canShareExcerpt = meeting.released && !editingHighlight && !transcriptHiddenForReview;
 
     // Check if transcript is unverified (humanReview not completed)
@@ -168,7 +175,7 @@ export default function Transcript() {
         return <div className="container py-8">
             <ScrollText className="w-12 h-12 mx-auto text-muted-foreground" />
             <div className="text-center text-base text-muted-foreground py-8">
-                {tTranscript('notAvailable')}
+                {tTranscript(hasPublicRecording(meeting) ? 'notAvailable' : 'byCirculation')}
             </div>
         </div>
     }
@@ -187,7 +194,7 @@ export default function Transcript() {
                 <div ref={containerRef} data-excerpt-root role="list" aria-label={t('transcript')}>
                 {displayedSegments.map((segment, index: number) => (
                     <div
-                        key={index}
+                        key={segment.id}
                         id={createSegmentId(index)}
                         className="content-visibility-auto"
                         role="listitem"

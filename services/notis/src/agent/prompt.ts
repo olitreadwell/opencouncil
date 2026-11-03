@@ -1,4 +1,6 @@
-import { distanceLine, locationPoints, locationText } from "./geo";
+import { asMeetingKind, meetingTitle } from "@opencouncil/ui/lib/meeting-title";
+import { athensNumericDate, describeDay, describeMeetingDate, describeNow } from "./dates";
+import { distanceLine, locationLabel, locationPoints } from "./geo";
 import {
   CONVERSATION_WINDOW,
   ConversationMessage,
@@ -37,9 +39,16 @@ function readerPlaces(state: WakeState, cityId: string): ReaderPlace[] {
 
 export function assembleSystem(
   prompts: Prompts,
+  model: string,
 ): Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral"; ttl?: "5m" | "1h" } }> {
   return [
-    { type: "text", text: prompts.system },
+    // The model id is a deployment constant, so the block stays byte-identical
+    // across users and wakes. Without it the model guesses when an MCP tool
+    // asks for llm_model, and the analytics read four different models.
+    {
+      type: "text",
+      text: `${prompts.system}\n\nYour model identifier is ${model}. When a tool asks for llm_model, pass exactly that.`,
+    },
     { type: "text", text: prompts.contextPack, cache_control: { type: "ephemeral", ttl: "1h" } },
   ];
 }
@@ -80,7 +89,7 @@ function renderBrief(brief: EditorialBrief, places: ReaderPlace[]): string {
  */
 export function neutralizeFences(text: string): string {
   return text.replaceAll(
-    /<(\/?)(reader_message|conversation|decisions|commitments|memory)>/gi,
+    /<(\/?)(reader_message|conversation|decisions|commitments|support_request|memory)>/gi,
     "[$1$2]",
   );
 }
@@ -130,7 +139,7 @@ export function toDecisionEntry(row: {
   outcome?: unknown;
   truncated?: boolean | null;
 }): DecisionEntry {
-  const o = row.outcome as { profileRewrite?: string; unsubscribe?: unknown } | null;
+  const o = row.outcome as { profileRewrite?: string; unsubscribe?: unknown; holdingOnly?: boolean } | null;
   return {
     at: row.eventAt.toISOString(),
     event: row.eventType as DecisionEntry["event"],
@@ -139,6 +148,7 @@ export function toDecisionEntry(row: {
     ...(o?.profileRewrite !== undefined ? { profileRewritten: true } : {}),
     ...(o?.unsubscribe ? { unsubscribed: true } : {}),
     ...(row.truncated ? { truncated: true } : {}),
+    ...(o?.holdingOnly ? { holdingOnly: true } : {}),
   };
 }
 
@@ -151,33 +161,73 @@ export function toDecisionEntry(row: {
  */
 export function decisionLine(
   d: Pick<DecisionEntry, "at" | "event" | "decision" | "rationale"> &
-    Partial<Pick<DecisionEntry, "truncated" | "profileRewritten" | "unsubscribed">>,
+    Partial<Pick<DecisionEntry, "truncated" | "profileRewritten" | "unsubscribed" | "holdingOnly">>,
 ): string {
   return (
     `[${d.at}] ${d.event}${d.truncated ? " (cut at the token ceiling — not a decision)" : ""}` +
     ` → ${decisionOutcome(d)}` +
     `${d.profileRewritten ? "\n  (rewrote the taste profile this wake)" : ""}` +
     `${d.unsubscribed ? "\n  (unsubscribed them this wake)" : ""}` +
+    // The shell's own line, in the register DECISIONS_CAVEAT vouches for:
+    // the model's «why» below it claims an answer that never went out.
+    `${d.holdingOnly ? "\n  (σύστημα) only the holding line reached the reader — the researched answer was never sent; the «why» below claims otherwise" : ""}` +
     `\n  why: ${d.rationale}`
   );
 }
 
-export function renderEvent(event: WakeEvent, state: WakeState): string {
+export type MeetingWakeEvent = Extract<WakeEvent, { type: "agenda_processed" | "meeting_summarized" }>;
+
+/**
+ * The Meeting line of a meeting event: the label that the shared rule of the
+ * app gives (the body and the title), the raw facts, and the date. A meeting
+ * without a kind falls back to its legacy stored name, which is the whole
+ * label; without a kind and a stored name the title is «Συνεδρίαση» and the
+ * date. Notis is Greek-only, so the label is in Greek.
+ * An event queued before the view carried the facts has no kind, urgency or
+ * number, only the stored name; it renders as it did then.
+ */
+export function meetingLine(event: MeetingWakeEvent, now: Date): string {
+  const where = `, city ${event.cityId}, id ${event.meetingId}.\n`;
+  const when = describeMeetingDate(event.meetingDate, now);
+  if (event.meetingKind === undefined && event.sessionNumber === undefined && event.urgent === undefined) {
+    return `Meeting: ${event.meetingName ?? "(no name)"} (${when})${
+      event.adminBody ? ` — ${event.adminBody}` : ""
+    }${where}`;
+  }
+  const title = meetingTitle(
+    {
+      storedName: event.meetingName,
+      kind: asMeetingKind(event.meetingKind),
+      sessionNumber: event.sessionNumber,
+      urgent: event.urgent ?? false,
+    },
+    "el",
+    () => {
+      const date = new Date(event.meetingDate);
+      return Number.isNaN(date.getTime()) ? event.meetingDate : athensNumericDate(date);
+    },
+  );
+  const label = title.wholeLabel ? title.text : [event.adminBody, title.text].filter(Boolean).join(", ");
+  const facts = [
+    event.meetingKind ? `kind: ${event.meetingKind}` : "kind not stated",
+    `urgent: ${event.urgent ? "yes" : "no"}`,
+    event.sessionNumber ? `session number ${event.sessionNumber}` : "no session number",
+  ].join(", ");
+  return `Meeting: ${label} (${facts}) — ${when}${where}`;
+}
+
+export function renderEvent(event: WakeEvent, state: WakeState, now: Date): string {
   switch (event.type) {
     case "agenda_processed":
       return (
         `The agenda for an upcoming meeting has been processed.\n` +
-        `Meeting: ${event.meetingName} (${event.meetingDate})${
-          event.adminBody ? ` — ${event.adminBody}` : ""
-        }, city ${event.cityId}, id ${event.meetingId}.\n` +
+        meetingLine(event, now) +
         `Editorial brief (a map, not a source — read the record before quoting):\n${renderBrief(event.brief, readerPlaces(state, event.cityId))}`
       );
     case "meeting_summarized":
       return (
         `A meeting has concluded and its record is published.\n` +
-        `Meeting: ${event.meetingName} (${event.meetingDate})${
-          event.adminBody ? ` — ${event.adminBody}` : ""
-        }, city ${event.cityId}, id ${event.meetingId}.\n` +
+        meetingLine(event, now) +
         `Editorial brief (a map, not a source — read the record before quoting):\n${renderBrief(event.brief, readerPlaces(state, event.cityId))}`
       );
     case "user_message":
@@ -196,11 +246,34 @@ export function renderEvent(event: WakeEvent, state: WakeState): string {
   }
 }
 
+/**
+ * How this wake's sends will leave. The shell decides it at send time from the
+ * 24h window; the model used to learn it only from the system prompt's
+ * description and sent 2–4 messages into 63% of cold pushes, each wrapped in
+ * its own template card.
+ */
+function renderDeliveryMode(mode: NonNullable<WakeState["deliveryMode"]>): string {
+  if (mode === "template") {
+    return (
+      `Delivery for this wake: TEMPLATE. The reader has not written in the last 24 hours, so ` +
+      `each send_message goes out as its own pre-approved WhatsApp card, wrapped in the shell's ` +
+      `opening line, closing line, footer and buttons. Send one message per story, and keep a ` +
+      `story to one card: its https://opencouncil.gr link at the end, no line breaks. One story — ` +
+      `the usual case — is one message; only a wake that carries distinct stories from different ` +
+      `meetings sends one card for each. Never write the shell's lines yourself.`
+    );
+  }
+  return (
+    `Delivery for this wake: FREEFORM. The reader wrote within the last 24 hours; your words ` +
+    `reach them exactly as written.`
+  );
+}
+
 export function assembleUserTurn(state: WakeState, events: WakeEvent[], now: Date): string {
   const cities = state.user.cities
     .map(
       (c) =>
-        `- ${c.cityName} (${c.cityId}): topics [${c.topics.join(", ") || "—"}], places [${c.locations.map(locationText).join("; ") || "—"}]`,
+        `- ${c.cityName} (${c.cityId}): topics [${c.topics.join(", ") || "—"}], places [${c.locations.map(locationLabel).join("; ") || "—"}]`,
     )
     .join("\n");
 
@@ -247,9 +320,30 @@ export function assembleUserTurn(state: WakeState, events: WakeEvent[], now: Dat
   const commitments = (state.commitments ?? [])
     .map(
       (c) =>
-        `[${neutralizeFences(c.slug)}] since ${c.since} — ${neutralizeFences(c.what)}`,
+        `[${neutralizeFences(c.slug)}] since ${describeDay(c.since, now)} — ` +
+        neutralizeFences(c.what),
     )
     .join("\n");
+
+  // The reader's latest support request: the agent must not file an open one
+  // twice, and «το προώθησες;» is answered from here, also after the request
+  // ended. The summary is model-written, so it is neutralized like every
+  // other stored text inside a fence.
+  const request = state.supportRequest;
+  const supportRequest = !request
+    ? "(none)"
+    : request.status === "open"
+      ? `OPEN since ${describeDay(request.since, now)} (${request.kind}): ` +
+        `${neutralizeFences(request.summary)}\n` +
+        "The team will contact them. Do not file it again; if they decline contact, call " +
+        "withdraw_support_request."
+      : `${request.status === "closed" ? "CLOSED" : "WITHDRAWN"} on ` +
+        `${request.endedAt ? describeDay(request.endedAt, now) : "?"} ` +
+        `(${request.kind}, filed ${describeDay(request.since, now)}): ` +
+        `${neutralizeFences(request.summary)}\n` +
+        (request.status === "closed"
+          ? "The team handled it. File a new request only for something new."
+          : "They declined contact.");
 
   return [
     `<user_profile>`,
@@ -266,6 +360,10 @@ export function assembleUserTurn(state: WakeState, events: WakeEvent[], now: Dat
     commitments || "(none open)",
     `</commitments>`,
     ``,
+    `<support_request>`,
+    supportRequest,
+    `</support_request>`,
+    ``,
     ...(state.memory
       ? [`<memory>`, neutralizeFences(state.memory), `</memory>`, ``]
       : []),
@@ -278,14 +376,18 @@ export function assembleUserTurn(state: WakeState, events: WakeEvent[], now: Dat
     decisionsHeader + (decisions || "(empty — no decisions recorded yet)"),
     `</decisions>`,
     ``,
-    `<current_time>${now.toISOString()}</current_time>`,
+    `<current_time>${describeNow(now)}</current_time>`,
+    `Every date above and below is already written the Athens way — weekday, date, and how far ` +
+      `from now («χθες», «πριν 3 ημέρες»). Reuse those words; never work out a weekday or a ` +
+      `relative day yourself.`,
     ``,
+    ...(state.deliveryMode ? [renderDeliveryMode(state.deliveryMode), ``] : []),
     // A coalesced wake carries several events (e.g. three cities' meetings
     // landing together): each renders in its own block, oldest first, with
     // one factual preamble line.
     ...(events.length > 1
       ? [`${events.length} events arrived together — process them as one wake, oldest first.`, ``]
       : []),
-    ...events.flatMap((event) => [`<event>`, renderEvent(event, state), `</event>`]),
+    ...events.flatMap((event) => [`<event>`, renderEvent(event, state, now), `</event>`]),
   ].join("\n");
 }

@@ -1,7 +1,7 @@
 "use server";
 
 import prisma from '@/lib/db/prisma';
-import { NotificationBehavior, TaskStatus } from '@prisma/client';
+import { TaskStatus } from '@prisma/client';
 import { withUserAuthorizedToEdit } from '@/lib/auth';
 import { checkTaskIdempotency, type TaskIdempotencyResult } from './tasks';
 import { revalidateMeeting } from '@/lib/cache';
@@ -10,6 +10,8 @@ import { sendHumanReviewCompletedAdminAlert } from '@/lib/discord';
 import { sendTranscriptToMunicipality } from './sendTranscript';
 import { requestSummarize } from './summarize';
 import { autoTriggerTask, type AutoTriggerOutcome } from './autoTrigger';
+import { meetingLabelInCity, type MeetingNameFields } from '@/lib/meetingName';
+import { notificationOutcome, type NotificationOutcome } from '@/lib/notifications/freshness';
 
 /**
  * Whether the summarize task can start for a meeting.
@@ -35,11 +37,9 @@ export interface ReviewCompletionState {
     /** Contact emails of the administrative body. Empty when the body configures none. */
     contactEmails: string[];
     administrativeBodyName: string | null;
-    /** Notification behavior of the administrative body. null when the meeting has no body. */
-    notificationBehavior: NotificationBehavior | null;
     summarizeAvailability: SummarizeAvailability;
-    /** Whether the meeting is public. Notifications link to a page that only edit users can open when it is false. */
-    released: boolean;
+    /** What a summarize that succeeds now does with email notifications: the rule the task callback acts on. */
+    summarizeNotifications: NotificationOutcome;
 }
 
 /**
@@ -71,13 +71,15 @@ export interface MarkHumanReviewCompleteOptions {
  * body, and whether summarize can still run for the meeting.
  */
 export async function getReviewCompletionState(cityId: string, meetingId: string): Promise<ReviewCompletionState> {
-    await withUserAuthorizedToEdit({ councilMeetingId: meetingId, cityId });
+    await withUserAuthorizedToEdit({ cityId });
 
     const [meeting, summarizeIdempotency] = await Promise.all([
         prisma.councilMeeting.findUnique({
             where: { cityId_id: { cityId, id: meetingId } },
             select: {
                 released: true,
+                dateTime: true,
+                scheduleStatus: true,
                 administrativeBody: {
                     select: {
                         contactEmails: true,
@@ -101,9 +103,13 @@ export async function getReviewCompletionState(cityId: string, meetingId: string
     return {
         contactEmails: meeting.administrativeBody?.contactEmails || [],
         administrativeBodyName: meeting.administrativeBody?.name || null,
-        notificationBehavior: meeting.administrativeBody?.notificationBehavior || null,
         summarizeAvailability: blockedReason ? SUMMARIZE_AVAILABILITY[blockedReason] : 'available',
-        released: meeting.released,
+        summarizeNotifications: notificationOutcome({
+            released: meeting.released,
+            dateTime: meeting.dateTime,
+            scheduleStatus: meeting.scheduleStatus,
+            notificationBehavior: meeting.administrativeBody?.notificationBehavior,
+        }, 'summarize', new Date(), new Date()),
     };
 }
 
@@ -121,7 +127,7 @@ export async function markHumanReviewComplete(
     meetingId: string,
     { manualReviewTime, sendTranscript = false, runSummarize = false }: MarkHumanReviewCompleteOptions = {}
 ): Promise<MarkHumanReviewCompleteResult> {
-    await withUserAuthorizedToEdit({ councilMeetingId: meetingId, cityId });
+    await withUserAuthorizedToEdit({ cityId });
 
     const idempotency = await checkTaskIdempotency('humanReview', cityId, meetingId);
     const existingReview = idempotency.proceed ? null : idempotency.existingTask;
@@ -130,7 +136,8 @@ export async function markHumanReviewComplete(
     const meeting = await prisma.councilMeeting.findUnique({
         where: { cityId_id: { cityId, id: meetingId } },
         include: {
-            city: true
+            city: true,
+            administrativeBody: true,
         }
     });
 
@@ -157,7 +164,7 @@ export async function markHumanReviewComplete(
 async function createHumanReviewRecord(
     cityId: string,
     meetingId: string,
-    meeting: { name: string; city: { name_en: string } },
+    meeting: MeetingNameFields & { city: { name_en: string; timezone: string } },
     manualReviewTime?: string
 ) {
     // Get actual reviewer stats from the meeting's edit history
@@ -195,7 +202,7 @@ async function createHumanReviewRecord(
             cityId,
             cityName: meeting.city.name_en,
             meetingId,
-            meetingName: meeting.name,
+            meetingName: meetingLabelInCity(meeting, 'el'),
             primaryReviewer: stats.primaryReviewer,
             secondaryReviewers: stats.secondaryReviewers,
             editCount: stats.editCount,
@@ -222,7 +229,7 @@ async function createHumanReviewRecord(
 async function runReviewFollowUps(
     cityId: string,
     meetingId: string,
-    meeting: { name_en: string; city: { name_en: string } },
+    meeting: MeetingNameFields & { city: { name_en: string; timezone: string } },
     reviewTaskId: string,
     { sendTranscript, runSummarize }: Required<Omit<MarkHumanReviewCompleteOptions, 'manualReviewTime'>>
 ): Promise<ReviewFollowUpOutcomes> {
@@ -235,7 +242,7 @@ async function runReviewFollowUps(
                     cityId,
                     meetingId,
                     cityName: meeting.city.name_en,
-                    meetingName: meeting.name_en,
+                    meetingName: meetingLabelInCity(meeting, 'en'),
                     source: { taskType: 'humanReview', taskId: reviewTaskId },
                 },
                 () => requestSummarize(cityId, meetingId)

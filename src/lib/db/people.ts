@@ -1,9 +1,11 @@
 "use server";
-import { Person, Role, VoicePrint } from '@prisma/client';
+import { Person, VoicePrint } from '@prisma/client';
+import type { PersonRoleOutput } from '@/lib/zod-schemas/person';
 import prisma from "./prisma";
-import { withUserAuthorizedToEdit } from "../auth";
+import { withUserAuthorizedToEdit, getRoleLimitForCity, personIsOwnedByBodyAdmin } from "@/lib/auth";
 import { getActiveRoleCondition, hasCityLevelRole, getRoleTypePriority } from "../utils";
-import { RoleWithRelations, roleWithRelationsInclude } from "./types";
+import { validateRolesForBodyAdmin } from "@/lib/utils/roles";
+import { RoleWithRelations, peopleOnly, roleWithRelationsInclude } from "./types";
 
 export type PersonWithRelations = Person & {
     roles: RoleWithRelations[];
@@ -18,7 +20,7 @@ export type PersonWithVoicePrints = PersonWithRelations & {
 };
 
 export async function deletePerson(id: string): Promise<void> {
-    await withUserAuthorizedToEdit({ personId: id });
+    await withUserAuthorizedToEdit({});
     try {
         await prisma.person.delete({
             where: { id },
@@ -37,9 +39,9 @@ export async function createPerson(data: {
     name_short_en: string;
     image: string | null;
     profileUrl: string | null;
-    roles: Role[];
+    roles: PersonRoleOutput[];
 }): Promise<Person> {
-    await withUserAuthorizedToEdit({ cityId: data.cityId });
+    await withRolesAuthorized(data.cityId, data.roles);
     try {
         const newPerson = await prisma.person.create({
             data: {
@@ -75,6 +77,30 @@ export async function createPerson(data: {
     }
 }
 
+/**
+ * The gate on a person's roles. A city admin or a superadmin gives any role.
+ * A body admin gives roles on their bodies only, and at least one, with no
+ * party and no other city on any of them: the rules of the people routes
+ * (validateRolesForBodyAdmin), applied here too, so a direct call of these
+ * functions cannot pass what the routes refuse. On an update, the person must
+ * also be theirs: every current role on a body they hold. Without that, an
+ * account with a body row and a person row could replace the roles of a
+ * councillor through the person row. Anyone else, a person who claimed their
+ * own page among them, changes no roles.
+ */
+async function withRolesAuthorized(
+    cityId: string,
+    roles: PersonRoleOutput[],
+    currentRoles?: { administrativeBodyId: string | null }[],
+): Promise<void> {
+    const limit = await getRoleLimitForCity(cityId);
+    if (!limit) return;
+    const refused = validateRolesForBodyAdmin(roles, limit)
+        ?? (roles.some(role => role.cityId && role.cityId !== cityId) ? { error: 'Every role must be in this city.' } : null)
+        ?? (currentRoles && !personIsOwnedByBodyAdmin(currentRoles, limit) ? { error: 'This person has a role outside the bodies you administer.' } : null);
+    if (refused) throw new Error(`Not authorized: ${refused.error}`);
+}
+
 export async function editPerson(id: string, data: {
     name: string;
     name_en: string;
@@ -82,17 +108,28 @@ export async function editPerson(id: string, data: {
     name_short_en: string;
     image?: string | null;
     profileUrl: string | null;
-    roles: Role[];
+    /** Replaces every role of the person. Absent, the roles stay as they are. */
+    roles?: PersonRoleOutput[];
 }): Promise<Person> {
     await withUserAuthorizedToEdit({ personId: id });
+    if (data.roles) {
+        const person = await prisma.person.findUnique({
+            where: { id },
+            select: { cityId: true, roles: { select: { administrativeBodyId: true } } },
+        });
+        if (!person) throw new Error('Person not found');
+        await withRolesAuthorized(person.cityId, data.roles, person.roles);
+    }
+    const roles = data.roles;
     try {
         const updatedPerson = await prisma.$transaction(async (tx) => {
-            // First delete all existing roles
-            await tx.role.deleteMany({
-                where: { personId: id }
-            });
+            // The roles are replaced as a set: delete them all, then create the new ones.
+            if (roles) {
+                await tx.role.deleteMany({
+                    where: { personId: id }
+                });
+            }
 
-            // Then update the person and create new roles
             return await tx.person.update({
                 where: { id },
                 data: {
@@ -102,19 +139,21 @@ export async function editPerson(id: string, data: {
                     name_short_en: data.name_short_en,
                     ...(data.image !== undefined && { image: data.image }),
                     profileUrl: data.profileUrl,
-                    roles: {
-                        create: data.roles.map(role => ({
-                            cityId: role.cityId,
-                            partyId: role.partyId,
-                            administrativeBodyId: role.administrativeBodyId,
-                            name: role.name,
-                            name_en: role.name_en,
-                            isHead: role.isHead,
-                            startDate: role.startDate,
-                            endDate: role.endDate,
-                            electedOrder: role.electedOrder
-                        }))
-                    }
+                    ...(roles && {
+                        roles: {
+                            create: roles.map(role => ({
+                                cityId: role.cityId,
+                                partyId: role.partyId,
+                                administrativeBodyId: role.administrativeBodyId,
+                                name: role.name,
+                                name_en: role.name_en,
+                                isHead: role.isHead,
+                                startDate: role.startDate,
+                                endDate: role.endDate,
+                                electedOrder: role.electedOrder
+                            }))
+                        }
+                    }),
                 },
                 include: {
                     roles: roleWithRelationsInclude
@@ -177,7 +216,7 @@ export async function getPeopleWithVoicePrintsForCity(cityId: string): Promise<P
                     },
                     take: 1 // Only get the most recent voiceprint
                 },
-                _count: { select: { administrators: true } }
+                _count: { select: { administrators: { where: { user: peopleOnly } } } }
             }
         });
         return people;
@@ -188,16 +227,65 @@ export async function getPeopleWithVoicePrintsForCity(cityId: string): Promise<P
 }
 
 /**
+ * Whether a person may speak at a meeting of the given administrative body.
+ * One rule for every kind of body:
+ * - the members of the body that is meeting;
+ * - the municipal council;
+ * - the holders of a city-level role (mayor, deputy mayors, general secretary);
+ * - the heads of the communities;
+ * - people with no administrative body.
+ *
+ * Officials and councillors from outside the body attend and speak, at a
+ * committee as much as at the council. The rest of the city does not: most of
+ * it is ordinary members of community councils.
+ *
+ * Only city-level roles are read on the meeting date. Membership counts
+ * whenever it was held: people go on speaking after the role's recorded end,
+ * and on 53 reviewed meetings a date check would have dropped about one person
+ * from a list and left out two who spoke.
+ */
+function maySpeakAtMeeting(person: PersonWithRelations, administrativeBodyId: string, date: Date): boolean {
+    if (hasCityLevelRole(person.roles, date)) {
+        return true;
+    }
+    const isInMeetingBody = person.roles.some(role => role.administrativeBodyId === administrativeBodyId);
+    const isInCouncil = person.roles.some(role => role.administrativeBody?.type === 'council');
+    const isCommunityHead = person.roles.some(role => role.administrativeBody?.type === 'community' && role.isHead);
+    const hasNoAdminBody = !person.roles.some(role => role.administrativeBody);
+
+    return isInMeetingBody || isInCouncil || isCommunityHead || hasNoAdminBody;
+}
+
+/**
+ * The people who may speak at a meeting (see maySpeakAtMeeting): whose
+ * voiceprints transcribe matches against, and who the transcript tasks are told
+ * about. A meeting with no administrative body gets all people in the city.
+ *
+ * `date` is the meeting date: city-level roles are read on it.
+ */
+export async function getPeopleWhoMaySpeak(cityId: string, administrativeBodyId: string | null, date: Date): Promise<PersonWithRelations[]> {
+    const allPeople = await getPeopleForCity(cityId);
+    if (!administrativeBodyId) {
+        return allPeople;
+    }
+    return allPeople.filter(person => maySpeakAtMeeting(person, administrativeBodyId, date));
+}
+
+/**
  * Get relevant people for a meeting based on its administrative body type.
  * This filters people to avoid AI confusion by only including relevant members.
+ * It serves the tasks that read documents (the agenda, the decisions). The tasks
+ * that hear the meeting use getPeopleWhoMaySpeak.
  *
  * Rules:
- * - Council meetings (type=council): All council members + people with no admin body + community heads + mayors
+ * - Council meetings (type=council): everyone who may speak there (see maySpeakAtMeeting)
  * - Committee meetings (type=committee): Only members of that specific committee
  * - Community meetings (type=community): Only members of that specific community
  * - No admin body: All people in the city
+ *
+ * `date` is the meeting date: city-level roles are read on it, as in getPeopleWhoMaySpeak.
  */
-export async function getPeopleForMeeting(cityId: string, administrativeBodyId: string | null): Promise<PersonWithRelations[]> {
+export async function getPeopleForMeeting(cityId: string, administrativeBodyId: string | null, date: Date): Promise<PersonWithRelations[]> {
     const allPeople = await getPeopleForCity(cityId);
 
     // If no administrative body, return all people
@@ -219,25 +307,8 @@ export async function getPeopleForMeeting(cityId: string, administrativeBodyId: 
     // Filter based on administrative body type
     if (adminBody.type === 'council') {
         // Council meetings: Include council members, people with no admin body, community heads, and mayors
-        // Sort by role priority so the most important members come first (used for voiceprint prioritization)
-        const filtered = allPeople.filter(person => {
-            // Always include mayors (people with city-level roles)
-            if (hasCityLevelRole(person.roles)) {
-                return true;
-            }
-
-            const hasCouncilRole = person.roles.some(
-                role => role.administrativeBodyId === administrativeBodyId
-            );
-            const hasNoAdminBody = !person.roles.some(
-                role => role.administrativeBody
-            );
-            const isCommunityHead = person.roles.some(
-                role => role.administrativeBody?.type === 'community' && role.isHead
-            );
-
-            return hasCouncilRole || hasNoAdminBody || isCommunityHead;
-        });
+        // Sort by role priority so the most important members come first
+        const filtered = allPeople.filter(person => maySpeakAtMeeting(person, administrativeBodyId, date));
 
         return filtered.sort((a, b) => {
             const bestRoleA = Math.min(...a.roles.map(getRoleTypePriority));

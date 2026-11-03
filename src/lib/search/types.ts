@@ -1,7 +1,19 @@
-import { AdministrativeBody, AdministrativeBodyType, City, CouncilMeeting } from "@prisma/client";
+import type { estypes } from '@elastic/elasticsearch';
+import { AdministrativeBodyType, City, CouncilMeeting } from "@prisma/client";
+import type { PublicAdministrativeBody } from "@/lib/db/types";
 import { MATCH_FIELDS } from "./constants";
 import { SubjectWithRelations } from "@/lib/db/subject";
 import { SegmentWithRelations } from "@/lib/db/speakerSegments";
+
+/**
+ * One Elasticsearch query clause.
+ *
+ * From @elastic/elasticsearch 9.5, `estypes.QueryDslQueryContainer` is an
+ * `ExactlyOne<...>` union over optional keys, so the type also includes
+ * `undefined`. A clause that we build or read from a clause list is never
+ * undefined. Use this type for those clauses.
+ */
+export type QueryContainer = NonNullable<estypes.QueryDslQueryContainer>;
 
 // Search configuration
 export type SearchConfig = {
@@ -28,12 +40,12 @@ export type SearchConfig = {
 export type Location = {
     point: {
         lat: number;
-        lon: number;
+        lng: number;
     };
-    /** Proximity-boost radius in METRES. The name carries the unit because the
-     *  only producer (resolveLocationCoordinates) and the only consumer
-     *  (buildLocationClauses) sit in different files; an unlabelled
-     *  `radius` let the consumer read metres as kilometres. */
+    /** Radius in METRES. The name carries the unit because the producers
+     *  (the API, resolveLocationCoordinates) and the consumer
+     *  (buildLocationClause) sit in different files; an unlabelled `radius`
+     *  once let the consumer read metres as kilometres. */
     radiusMeters: number;
 };
 
@@ -55,15 +67,27 @@ export type SearchRequest = {
     personIds?: string[];
     partyIds?: string[];
     /** Named administrative bodies of the meeting a subject belongs to. */
-    adminBodyIds?: string[];
+    administrativeBodyIds?: string[];
     /** Every administrative body of these types (every committee, for example). */
-    adminBodyTypes?: AdministrativeBodyType[];
+    administrativeBodyTypes?: AdministrativeBodyType[];
     topicIds?: string[];
     dateRange?: {
         start: string;
         end: string;
     };
-    locations?: Location[];
+    /** The window to search when neither the caller nor the query text names a
+     *  period: the map's quick-range pill. Unlike `dateRange` it yields to a
+     *  period read out of the text, which the caller then shows as a derived
+     *  filter, so the pill never hides a period the reader typed. */
+    fallbackDateRange?: {
+        start: string;
+        end: string;
+    };
+    /** A hard geographic filter: only subjects pinned within the radius match,
+     *  and a subject without a location pin never matches. Places read out of
+     *  the query text are not set here: the search keeps those to itself and
+     *  uses them only as a proximity boost. */
+    location?: Location;
     config?: SearchConfig;
 };
 
@@ -81,7 +105,7 @@ export type SearchResultLight = SubjectWithRelations & {
     matches?: SearchMatches;
     councilMeeting: CouncilMeeting & {
         city: City;
-        administrativeBody: AdministrativeBody | null;
+        administrativeBody: PublicAdministrativeBody | null;
     };
 };
 

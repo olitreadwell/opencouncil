@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useLocale, useTranslations } from "next-intl";
 import { format, subMonths } from "date-fns";
-import { AdministrativeBody, AdministrativeBodyType, City, Party } from "@prisma/client";
+import { AdministrativeBodyType, City, Party } from "@prisma/client";
+import type { PublicAdministrativeBody } from "@/lib/db/types";
 import { DateRange } from "react-day-picker";
 
 import { getCitiesForRequestRealm } from "@/lib/db/cities";
 import { getPartiesForCity } from "@/lib/db/parties";
-import { getAdministrativeBodiesWithPublicMeetings } from "@/lib/db/administrativeBodies";
+import { getAdministrativeBodiesWithPublicMeetings } from "@/lib/actions/administrativeBodies";
 import { getPeopleForCity, getPerson, PersonWithRelations } from "@/lib/db/people";
 import { getLocalizedName, getLocalizedShortName } from "@/lib/formatters/name";
 import { getDateFnsLocale, getIntlLocale } from "@/lib/formatters/time";
@@ -49,7 +50,7 @@ export function useSearchFilterData(filters: SearchFilterParams, setFilters: (pa
 
     const [cities, setCities] = useState<City[]>([]);
     const [parties, setParties] = useState<Party[]>([]);
-    const [adminBodies, setAdminBodies] = useState<AdministrativeBody[]>([]);
+    const [adminBodies, setAdminBodies] = useState<PublicAdministrativeBody[]>([]);
     const [people, setPeople] = useState<PersonWithRelations[]>([]);
     const [person, setPerson] = useState<PersonWithRelations | null>(null);
     const { topics, isLoading: topicsLoading, error: topicsError } = useTopics();

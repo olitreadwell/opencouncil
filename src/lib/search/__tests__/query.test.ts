@@ -1,11 +1,11 @@
 import type { estypes } from '@elastic/elasticsearch';
-import type { SearchRequest } from '../types';
+import type { QueryContainer, SearchRequest } from '../types';
 
 // Avoid pulling the full env validation (createEnv) at import time; buildFilters
 // itself does not read env, only the module-level import does.
 jest.mock('@/env.mjs', () => ({ env: { ELASTICSEARCH_INDEX: 'test-index' } }));
 
-import { buildFilters, buildSearchQuery, MAX_RANKING_MULTIPLIER_RATIO } from '../query';
+import { buildFilters, buildSearchQuery, MAX_RANKING_MULTIPLIER_RATIO, subjectVisibilityFilters } from '../query';
 import { MATCH_START, MATCH_END, MATCH_FIELDS } from '../constants';
 import { ADMIN_BODY_TIER } from '@/lib/ranking/subjects';
 import schema from '../../../../elasticsearch/schema.json';
@@ -20,10 +20,12 @@ const NO_EXTRACTED_FILTERS: ExtractedFilters = {
 type BoolQuery = estypes.QueryDslBoolQuery;
 
 // `match` accepts a shorthand value as well as the full object form, so narrow
-// to the object form before reading minimum_should_match off it.
+// to the object form before reading minimum_should_match off it. A multi_match
+// carries it directly.
 function minimumShouldMatchOf(
-    clause: estypes.QueryDslQueryContainer | undefined
+    clause: QueryContainer | undefined
 ): string | number | undefined {
+    if (clause?.multi_match) return clause.multi_match.minimum_should_match;
     const match = Object.values(clause?.match ?? {})[0];
     return typeof match === 'object' ? match.minimum_should_match : undefined;
 }
@@ -31,16 +33,16 @@ function minimumShouldMatchOf(
 // Every scoring query is wrapped in applyRanking's function_score. Unwrap it to
 // reach the underlying query the rest of the tests assert against.
 function unwrapRanking(
-    query: estypes.QueryDslQueryContainer | undefined
-): { inner: estypes.QueryDslQueryContainer; functionScore: estypes.QueryDslFunctionScoreQuery } {
+    query: QueryContainer | undefined
+): { inner: QueryContainer; functionScore: estypes.QueryDslFunctionScoreQuery } {
     const functionScore = query?.function_score as estypes.QueryDslFunctionScoreQuery;
-    return { inner: functionScore?.query as estypes.QueryDslQueryContainer, functionScore };
+    return { inner: functionScore?.query as QueryContainer, functionScore };
 }
 
 // Every lexical clause is wrapped in a flattenToTier function_score (see
 // FIELD_TIER in query.ts). Unwrap one to its inner query and tier params.
-function unflatten(clause: estypes.QueryDslQueryContainer | undefined): {
-    inner: estypes.QueryDslQueryContainer | undefined;
+function unflatten(clause: QueryContainer | undefined): {
+    inner: QueryContainer | undefined;
     base: number | undefined;
     k: number | undefined;
 } {
@@ -48,15 +50,15 @@ function unflatten(clause: estypes.QueryDslQueryContainer | undefined): {
     const fn = fs?.functions?.[0] as estypes.QueryDslFunctionScoreContainer | undefined;
     const script = fn?.script_score?.script as estypes.Script | undefined;
     const params = (script?.params ?? {}) as Record<string, number>;
-    return { inner: fs?.query as estypes.QueryDslQueryContainer | undefined, base: params.base, k: params.k };
+    return { inner: fs?.query as QueryContainer | undefined, base: params.base, k: params.k };
 }
 
 // Tier-wrapped clause whose inner query matches `field` (via match, match_phrase
 // or fuzziness presence), returned unflattened.
 function tierClauseOn(
-    should: estypes.QueryDslQueryContainer[],
-    predicate: (inner: estypes.QueryDslQueryContainer) => boolean
-): { inner: estypes.QueryDslQueryContainer | undefined; base: number | undefined; k: number | undefined } | undefined {
+    should: QueryContainer[],
+    predicate: (inner: QueryContainer) => boolean
+): { inner: QueryContainer | undefined; base: number | undefined; k: number | undefined } | undefined {
     for (const c of should) {
         const u = unflatten(c);
         if (u.inner && predicate(u.inner)) return u;
@@ -70,21 +72,28 @@ function tierClauseOn(
 // clause and still pass. Clauses arrive tier-wrapped; this returns the inner
 // nested query with its tier.
 function nestedClauseOn(
-    should: estypes.QueryDslQueryContainer[],
+    should: QueryContainer[],
     field: string
-): { inner: estypes.QueryDslQueryContainer | undefined; base: number | undefined; k: number | undefined } | undefined {
+): { inner: QueryContainer | undefined; base: number | undefined; k: number | undefined } | undefined {
     return tierClauseOn(
         should,
         (inner) =>
             inner.nested?.path === 'speaker_contributions' &&
-            inner.nested.query?.match?.[field] !== undefined
+            matchedFields(inner.nested.query).includes(field)
     );
+}
+
+// The fields a match or multi_match clause searches. The speaker-name clauses
+// are a multi_match over SPEAKER_NAME_FIELDS, the transcript clause a match.
+function matchedFields(query: QueryContainer | undefined): string[] {
+    if (query?.multi_match) return (query.multi_match.fields as string[] | undefined) ?? [];
+    return Object.keys(query?.match ?? {});
 }
 
 // Total tier base each field contributes to a document that matches it. A field
 // emits more than one clause (the strict/partial coverage pair), and they share
 // one bool.should, so a document collects the SUM of both — see FIELD_TIER.
-function tierBaseByField(should: estypes.QueryDslQueryContainer[]): Record<string, number> {
+function tierBaseByField(should: QueryContainer[]): Record<string, number> {
     const totals: Record<string, number> = {};
     const add = (label: string, base: number | undefined) => {
         totals[label] = (totals[label] ?? 0) + (base ?? 0);
@@ -94,8 +103,8 @@ function tierBaseByField(should: estypes.QueryDslQueryContainer[]): Record<strin
         const { inner, base } = unflatten(clause);
         if (!inner) continue;
         if (inner.nested) {
-            const field = Object.keys(inner.nested.query?.match ?? {})[0] ?? '';
-            add(field.endsWith('speaker_person_name') ? 'speakerName' : 'transcript', base);
+            const fields = matchedFields(inner.nested.query);
+            add(fields.some(f => f.endsWith('speaker_person_name')) ? 'speakerName' : 'transcript', base);
             continue;
         }
         if (inner.match_phrase) {
@@ -118,16 +127,17 @@ function tierBaseByField(should: estypes.QueryDslQueryContainer[]): Record<strin
 // builders emit: a dis_max over spellings, a nested wrapper, a bool.should, and
 // the match / match_phrase / combined_fields leaves. Used to assert that a
 // clause reaches every spelling of the query, whichever family it belongs to.
-function queryTextsOf(clause: estypes.QueryDslQueryContainer | undefined): string[] {
+function queryTextsOf(clause: QueryContainer | undefined): string[] {
     if (!clause) return [];
     if (clause.dis_max) {
-        return (clause.dis_max.queries as estypes.QueryDslQueryContainer[]).flatMap(queryTextsOf);
+        return (clause.dis_max.queries as QueryContainer[]).flatMap(queryTextsOf);
     }
     if (clause.nested) return queryTextsOf(clause.nested.query);
     if (clause.bool?.should) {
-        return (clause.bool.should as estypes.QueryDslQueryContainer[]).flatMap(queryTextsOf);
+        return (clause.bool.should as QueryContainer[]).flatMap(queryTextsOf);
     }
     if (clause.combined_fields) return [clause.combined_fields.query];
+    if (clause.multi_match) return [String(clause.multi_match.query)];
     const leaf = clause.match ?? clause.match_phrase;
     if (!leaf) return [];
     return Object.values(leaf).map((options) =>
@@ -135,19 +145,27 @@ function queryTextsOf(clause: estypes.QueryDslQueryContainer | undefined): strin
     );
 }
 
-function findPersonFilter(
-    filters: estypes.QueryDslQueryContainer[]
-): estypes.QueryDslQueryContainer | undefined {
-    // The person filter is the bool/should clause referencing introduced_by_person_id.
+function findIntroducedOrSpokeFilter(
+    filters: QueryContainer[],
+    introducedByField: string
+): QueryContainer | undefined {
     // Use a structural lookup (not a JSON substring match) so the tests can't pass
     // vacuously if key ordering or the serialised shape changes.
     return filters.find(
         (f) =>
             Array.isArray(f.bool?.should) &&
-            (f.bool!.should as estypes.QueryDslQueryContainer[]).some(
-                (c) => c.terms?.['introduced_by_person_id'] !== undefined
+            (f.bool!.should as QueryContainer[]).some(
+                (c) => c.terms?.[introducedByField] !== undefined
             )
     );
+}
+
+function findPersonFilter(filters: QueryContainer[]): QueryContainer | undefined {
+    return findIntroducedOrSpokeFilter(filters, 'introduced_by_person_id');
+}
+
+function findPartyFilter(filters: QueryContainer[]): QueryContainer | undefined {
+    return findIntroducedOrSpokeFilter(filters, 'introduced_by_party_id');
 }
 
 describe('buildFilters person filter', () => {
@@ -160,7 +178,7 @@ describe('buildFilters person filter', () => {
         expect(personFilter).toBeDefined();
 
         const bool = personFilter!.bool as BoolQuery;
-        const should = (bool.should ?? []) as estypes.QueryDslQueryContainer[];
+        const should = (bool.should ?? []) as QueryContainer[];
 
         // Single bool.should with both clauses, OR-combined.
         expect(bool.minimum_should_match).toBe(1);
@@ -174,7 +192,7 @@ describe('buildFilters person filter', () => {
         const spokeIn = should.find((c) => c.nested);
         expect(spokeIn?.nested?.path).toBe('speaker_contributions');
         expect(
-            (spokeIn?.nested?.query as estypes.QueryDslQueryContainer).terms?.[
+            (spokeIn?.nested?.query as QueryContainer).terms?.[
                 'speaker_contributions.speaker_person_id'
             ]
         ).toEqual(['p1']);
@@ -208,9 +226,11 @@ describe('buildFilters person filter', () => {
 
         const filters = buildFilters(request);
 
-        expect(findPersonFilter(filters)).toBeDefined();
-        const partyFilter = filters.find((f) => f.terms?.['introduced_by_party_id']);
-        expect(partyFilter?.terms?.['introduced_by_party_id']).toEqual(['party1']);
+        const personFilter = findPersonFilter(filters);
+        const partyFilter = findPartyFilter(filters);
+        expect(personFilter).toBeDefined();
+        expect(partyFilter).toBeDefined();
+        expect(partyFilter).not.toBe(personFilter);
     });
 
     it('omits the person filter entirely when no personIds are given', () => {
@@ -230,6 +250,51 @@ describe('buildFilters person filter', () => {
     });
 });
 
+describe('buildFilters party filter', () => {
+    // The search page adds the person's party to every person filter, so an
+    // introducer-only party clause cut a person's results to the subjects their
+    // party introduced.
+    it('OR-combines introduced-by-party and a speaker of the party', () => {
+        const request: SearchRequest = { query: 'roads', partyIds: ['party1'] };
+
+        const filters = buildFilters(request);
+        const partyFilter = findPartyFilter(filters);
+
+        expect(partyFilter).toBeDefined();
+
+        const bool = partyFilter!.bool as BoolQuery;
+        const should = (bool.should ?? []) as QueryContainer[];
+
+        expect(bool.minimum_should_match).toBe(1);
+        expect(should).toHaveLength(2);
+
+        const introducedBy = should.find((c) => c.terms?.['introduced_by_party_id']);
+        expect(introducedBy?.terms?.['introduced_by_party_id']).toEqual(['party1']);
+
+        const spokeIn = should.find((c) => c.nested);
+        expect(spokeIn?.nested?.path).toBe('speaker_contributions');
+        expect(
+            (spokeIn?.nested?.query as QueryContainer).terms?.[
+                'speaker_contributions.speaker_party_id'
+            ]
+        ).toEqual(['party1']);
+    });
+
+    it('does not leave an introducer-only party clause at the top level', () => {
+        const request: SearchRequest = { query: 'roads', partyIds: ['party1'] };
+
+        const filters = buildFilters(request);
+
+        expect(filters.filter((f) => f.terms?.['introduced_by_party_id'])).toHaveLength(0);
+    });
+
+    it('omits the party filter when partyIds is empty or absent', () => {
+        expect(findPartyFilter(buildFilters({ query: 'roads' }))).toBeUndefined();
+        expect(findPartyFilter(buildFilters({ query: 'roads', partyIds: [] }))).toBeUndefined();
+    });
+});
+
+
 // The scored query is a single bool (no rank fusion) — see the RRF regression
 // note on the semantic describe block. Unwraps the ranking function_score and
 // splits the text clause under `must` into its arms: with semantic search on,
@@ -239,9 +304,9 @@ function textArms(query: string, config?: SearchRequest['config']) {
     const q = buildSearchQuery({ query, config }, NO_EXTRACTED_FILTERS);
     const { inner } = unwrapRanking(q.query);
     const outer = inner?.bool as BoolQuery;
-    const textClause = ((outer.must ?? []) as estypes.QueryDslQueryContainer[])[0];
+    const textClause = ((outer.must ?? []) as QueryContainer[])[0];
     const disMax = textClause?.dis_max;
-    const queries = (disMax?.queries ?? []) as estypes.QueryDslQueryContainer[];
+    const queries = (disMax?.queries ?? []) as QueryContainer[];
     return {
         disMax,
         lexical: (disMax ? queries[0] : textClause)?.bool as BoolQuery | undefined,
@@ -254,8 +319,8 @@ function textArms(query: string, config?: SearchRequest['config']) {
 function scoredShouldClauses(
     query: string,
     config?: SearchRequest['config']
-): estypes.QueryDslQueryContainer[] {
-    return (textArms(query, config).lexical?.should ?? []) as estypes.QueryDslQueryContainer[];
+): QueryContainer[] {
+    return (textArms(query, config).lexical?.should ?? []) as QueryContainer[];
 }
 
 // One field's term clauses, as [strict, partial] — the coverage pair emits them
@@ -461,8 +526,8 @@ describe('buildSearchQuery lexical ranking', () => {
             { ...NO_EXTRACTED_FILTERS, locationName: 'Άργος' }
         );
         const locationText = tierBaseByField(
-            (unwrapRanking(located.query).inner?.bool?.must as estypes.QueryDslQueryContainer[])[0]
-                .bool?.should as estypes.QueryDslQueryContainer[]
+            (unwrapRanking(located.query).inner?.bool?.must as QueryContainer[])[0]
+                .bool?.should as QueryContainer[]
         ).locationText;
 
         expect(locationText).toBeGreaterThan(0);
@@ -493,11 +558,12 @@ describe('buildSearchQuery speaker-name clause', () => {
     it('matches the speakers of a subject, in the weakest tier of the query', () => {
         const clause = speakerNameClause('Χάρης Δούκας');
 
-        expect(clause?.inner?.nested?.query?.match?.['speaker_contributions.speaker_person_name'])
-            .toEqual({
-                query: 'Χάρης Δούκας',
-                minimum_should_match: '2<75%',
-            });
+        expect(clause?.inner?.nested?.query?.multi_match).toEqual({
+            query: 'Χάρης Δούκας',
+            fields: ['speaker_contributions.speaker_person_name', 'speaker_contributions.speaker_name'],
+            type: 'best_fields',
+            minimum_should_match: '2<75%',
+        });
 
         // Weakest tier in the query, under the transcript's: a person-name
         // query leads with the subjects the person introduced, and the ones
@@ -527,6 +593,18 @@ describe('buildSearchQuery speaker-name clause', () => {
 
         expect(speaker?.inner).not.toBe(transcript?.inner);
         expect(speaker!.base!).not.toBe(transcript!.base!);
+    });
+
+    // A speaker with no Person record is known only by the contribution's
+    // speaker_name. The same clause and tier serve both names, so an unlinked
+    // speaker ranks where a linked one does.
+    it('matches the name of a speaker with no person record in the same clause', () => {
+        const should = scoredShouldClauses('Γεώργιος Παπαδόπουλος');
+        const linked = nestedClauseOn(should, 'speaker_contributions.speaker_person_name');
+        const unlinked = nestedClauseOn(should, 'speaker_contributions.speaker_name');
+
+        expect(unlinked).toBeDefined();
+        expect(unlinked?.inner).toBe(linked?.inner);
     });
 });
 
@@ -576,16 +654,16 @@ describe('buildSearchQuery semantic fallback (dis_max)', () => {
         const params = script.params as Record<string, number>;
         // A raw similarity, not a normalized one: minmax maps the best hit of
         // every query to 1.0, so a cutoff on it could never empty the results.
-        // 0.934 sits mid-way between the measured off-topic ceiling (0.9319, a
-        // keyboard mash) and the measured paraphrase floor ([0.936, 0.940)) —
-        // see DEFAULT_SEMANTIC_MIN_SCORE.
-        expect(params.cutoff).toBe(0.934);
+        // 0.78 admits no junk query and loses one paraphrase on the measured
+        // bands of jina-embeddings-v5-text-small — see DEFAULT_SCORE_PROFILE
+        // in profile.ts.
+        expect(params.cutoff).toBe(0.78);
         // base sits inside the flattened description band (~24-30, where weak
         // stem-coincidence matches like bar licenses matching "ζώα χωρίς
         // ιδιοκτήτη" via ζω/ιδιοκτητ land) and the mapped ceiling (~34) stays
         // below the flattened name band (~58+) — see SEMANTIC_MAPPED_BASE.
         expect(params.base).toBe(26);
-        expect(params.scale).toBe(320);
+        expect(params.scale).toBe(66);
         expect(clause.boost_mode).toBe('replace');
         // min_score sees the mapped score: raw below the cutoff maps below
         // base and is dropped, keeping zero results for off-topic queries.
@@ -604,11 +682,11 @@ describe('buildSearchQuery semantic fallback (dis_max)', () => {
         expect(clause.query?.bool).toBeUndefined();
         expect(disMax).toBeDefined();
         expect(disMax.tie_breaker).toBe(0);
-        expect(disMax.queries.map((c) => c.semantic?.field)).toEqual([
+        expect(disMax.queries.map((c) => c?.semantic?.field)).toEqual([
             'name.semantic',
             'description.semantic',
         ]);
-        expect(disMax.queries.map((c) => c.semantic?.boost)).toEqual([undefined, undefined]);
+        expect(disMax.queries.map((c) => c?.semantic?.boost)).toEqual([undefined, undefined]);
     });
 
     // Regression for the measured case: "ηλεκτρικά πατίνια" had the highest
@@ -638,7 +716,7 @@ describe('buildSearchQuery semantic fallback (dis_max)', () => {
 describe('buildSearchQuery ranking function', () => {
     // Pulls the script_score params off whichever query the ranking function_score
     // wraps, regardless of which branch (filter-only, lexical, semantic) built it.
-    function rankingScriptParams(query: estypes.QueryDslQueryContainer | undefined) {
+    function rankingScriptParams(query: QueryContainer | undefined) {
         const functionScore = query?.function_score as estypes.QueryDslFunctionScoreQuery;
         const fn = functionScore?.functions?.[0] as estypes.QueryDslFunctionScoreContainer;
         const script = fn?.script_score?.script as estypes.Script;
@@ -667,7 +745,7 @@ describe('buildSearchQuery ranking function', () => {
 
         expect(q.query?.function_score).toBeUndefined();
 
-        const filter = (q.query?.bool?.filter ?? []) as estypes.QueryDslQueryContainer[];
+        const filter = (q.query?.bool?.filter ?? []) as QueryContainer[];
         expect(findPersonFilter(filter)).toBeDefined();
     });
 
@@ -741,27 +819,27 @@ describe('buildSearchQuery location handling', () => {
     // actually produces. The earlier fixture used `radius: 40` and asserted
     // "40km", which agreed with the consumer's `km` suffix but not with any
     // value the app ever passes, so it hid the unit bug.
-    const LOCATIONS = [{ point: { lat: 38.0, lon: 23.7 }, radiusMeters: 2000 }];
+    const LOCATIONS = [{ point: { lat: 38.0, lng: 23.7 }, radiusMeters: 2000 }];
     // What one extracted place name actually resolves to: processFilters
     // geocodes it in every municipality, and adjacent Attica cities bias Google
     // Places towards the same landmark, so about ten near-identical points for
     // one place is the normal case, not an edge case.
     const SAME_PLACE_GEOCODED_TWICE = [
-        { point: { lat: 38.0, lon: 23.7 }, radiusMeters: 2000 },
-        { point: { lat: 38.0001, lon: 23.7001 }, radiusMeters: 2000 },
+        { point: { lat: 38.0, lng: 23.7 }, radiusMeters: 2000 },
+        { point: { lat: 38.0001, lng: 23.7001 }, radiusMeters: 2000 },
     ];
 
     // The proximity clause on the scored path: one constant_score whose filter
     // holds the geo clauses.
     function proximityClauseOf(q: ReturnType<typeof buildSearchQuery>) {
-        const should = (lexicalQueryOf(q)?.bool?.should ?? []) as estypes.QueryDslQueryContainer[];
+        const should = (lexicalQueryOf(q)?.bool?.should ?? []) as QueryContainer[];
         expect(should).toHaveLength(1);
         return should[0].constant_score;
     }
 
     function geoClausesOf(q: ReturnType<typeof buildSearchQuery>) {
-        const filter = proximityClauseOf(q)?.filter as estypes.QueryDslQueryContainer;
-        return (filter?.bool?.should ?? []) as estypes.QueryDslQueryContainer[];
+        const filter = proximityClauseOf(q)?.filter as QueryContainer;
+        return (filter?.bool?.should ?? []) as QueryContainer[];
     }
 
     function lexicalQueryOf(q: ReturnType<typeof buildSearchQuery>) {
@@ -773,12 +851,12 @@ describe('buildSearchQuery location handling', () => {
     // the wrapper carries no `filter` of its own — so reading `filter` off the
     // outer bool yields [] and asserts nothing. The `meeting_released` check
     // fails the test if this walk ever stops finding the real array again.
-    function hardFiltersOf(q: ReturnType<typeof buildSearchQuery>): estypes.QueryDslQueryContainer[] {
+    function hardFiltersOf(q: ReturnType<typeof buildSearchQuery>): QueryContainer[] {
         const outer = lexicalQueryOf(q)?.bool as BoolQuery;
         const core = outer.filter
             ? outer
-            : ((outer.must as estypes.QueryDslQueryContainer[])[0].bool as BoolQuery);
-        const filters = (core.filter ?? []) as estypes.QueryDslQueryContainer[];
+            : ((outer.must as QueryContainer[])[0].bool as BoolQuery);
+        const filters = (core.filter ?? []) as QueryContainer[];
         expect(filters.some((f) => f.term?.['meeting_released'] !== undefined)).toBe(true);
         return filters;
     }
@@ -789,8 +867,9 @@ describe('buildSearchQuery location handling', () => {
     // though subjects carry it in the title.
     it('keeps AI-extracted locations out of the hard filters', () => {
         const q = buildSearchQuery(
-            { query: 'παλαιστίνη', locations: LOCATIONS },
-            NO_EXTRACTED_FILTERS
+            { query: 'παλαιστίνη' },
+            NO_EXTRACTED_FILTERS,
+            LOCATIONS
         );
 
         expect(JSON.stringify(hardFiltersOf(q))).not.toContain('geo_distance');
@@ -798,14 +877,15 @@ describe('buildSearchQuery location handling', () => {
 
     it('applies locations as a proximity boost that cannot match on its own', () => {
         const q = buildSearchQuery(
-            { query: 'παλαιστίνη', locations: LOCATIONS },
-            NO_EXTRACTED_FILTERS
+            { query: 'παλαιστίνη' },
+            NO_EXTRACTED_FILTERS,
+            LOCATIONS
         );
         const lexical = lexicalQueryOf(q);
 
         // Text clauses sit inside `must`; geo boosts are `should`-only, so a
         // subject near the location but matching no text cannot surface.
-        const must = (lexical?.bool?.must ?? []) as estypes.QueryDslQueryContainer[];
+        const must = (lexical?.bool?.must ?? []) as QueryContainer[];
         expect(must).toHaveLength(1);
         expect(geoClausesOf(q)[0]?.geo_distance).toMatchObject({ distance: '2000m' });
         expect(lexical?.bool?.minimum_should_match).toBeUndefined();
@@ -819,12 +899,14 @@ describe('buildSearchQuery location handling', () => {
     // among text matches; it must not outrank a better text match.
     it('awards the proximity boost once, however many points one place geocoded to', () => {
         const one = buildSearchQuery(
-            { query: 'πάρκα', locations: LOCATIONS },
-            NO_EXTRACTED_FILTERS
+            { query: 'πάρκα' },
+            NO_EXTRACTED_FILTERS,
+            LOCATIONS
         );
         const many = buildSearchQuery(
-            { query: 'πάρκα', locations: SAME_PLACE_GEOCODED_TWICE },
-            NO_EXTRACTED_FILTERS
+            { query: 'πάρκα' },
+            NO_EXTRACTED_FILTERS,
+            SAME_PLACE_GEOCODED_TWICE
         );
 
         // Both points are searched...
@@ -843,8 +925,9 @@ describe('buildSearchQuery location handling', () => {
     // school maintenance for "σχολεία Άργους".
     it('keeps the proximity boost below the weakest content tier', () => {
         const q = buildSearchQuery(
-            { query: 'πάρκα', locations: LOCATIONS },
-            NO_EXTRACTED_FILTERS
+            { query: 'πάρκα' },
+            NO_EXTRACTED_FILTERS,
+            LOCATIONS
         );
         const bases = tierBaseByField(scoredShouldClauses('πάρκα'));
 
@@ -857,10 +940,22 @@ describe('buildSearchQuery location handling', () => {
     // furthest two points on Earth can be apart, so every pinned subject
     // matched and the boost stopped expressing proximity at all. It became a
     // flat bonus for carrying a pin. Assert the unit, not just the number.
+    // The app spells longitude `lng`, Elasticsearch's geo_point object `lon`.
+    // A clause that passed the point through would name a key the geo query
+    // rejects.
+    it('names the point the way Elasticsearch reads it', () => {
+        const q = buildSearchQuery({ query: 'πάρκα' }, NO_EXTRACTED_FILTERS, LOCATIONS);
+
+        expect(geoClausesOf(q)[0]?.geo_distance).toMatchObject({
+            location_geojson: { lat: 38.0, lon: 23.7 },
+        });
+    });
+
     it('emits the radius in metres, not kilometres', () => {
         const q = buildSearchQuery(
-            { query: 'παλαιστίνη', locations: LOCATIONS },
-            NO_EXTRACTED_FILTERS
+            { query: 'παλαιστίνη' },
+            NO_EXTRACTED_FILTERS,
+            LOCATIONS
         );
         const distance = geoClausesOf(q)[0]?.geo_distance?.distance as string;
 
@@ -876,9 +971,39 @@ describe('buildSearchQuery location handling', () => {
         expect(JSON.stringify(lexical)).not.toContain('geo_distance');
     });
 
-    it('keeps locations as a hard filter in the filter-only browse path', () => {
-        const q = buildSearchQuery({ locations: LOCATIONS }, NO_EXTRACTED_FILTERS);
-        const filter = (q.query?.bool?.filter ?? []) as estypes.QueryDslQueryContainer[];
+    // The public API's `location` is a place the caller asked for, so unlike an
+    // extracted location it narrows a text search.
+    it('applies an explicit location filter as a hard filter on a text search', () => {
+        const q = buildSearchQuery(
+            { query: 'πάρκα', location: LOCATIONS[0] },
+            NO_EXTRACTED_FILTERS
+        );
+        const geo = hardFiltersOf(q).filter((f) => JSON.stringify(f).includes('geo_distance'));
+
+        expect(geo).toHaveLength(1);
+        expect(JSON.stringify(geo[0])).toContain('"distance":"2000m"');
+    });
+
+    // The two inputs stay apart: the caller's place filters, the place read
+    // out of the text only boosts. Neither may turn into the other.
+    it('filters by the caller location and boosts by the extracted one', () => {
+        const extracted = [{ point: { lat: 37.0, lng: 22.0 }, radiusMeters: 2000 }];
+        const q = buildSearchQuery(
+            { query: 'πάρκα', location: LOCATIONS[0] },
+            NO_EXTRACTED_FILTERS,
+            extracted
+        );
+        const hardGeo = hardFiltersOf(q).filter((f) => JSON.stringify(f).includes('geo_distance'));
+
+        expect(hardGeo).toHaveLength(1);
+        expect(JSON.stringify(hardGeo[0])).toContain('"lat":38');
+        expect(geoClausesOf(q)).toHaveLength(1);
+        expect(JSON.stringify(geoClausesOf(q)[0])).toContain('"lat":37');
+    });
+
+    it('applies an explicit location filter on the filter-only browse path', () => {
+        const q = buildSearchQuery({ location: LOCATIONS[0] }, NO_EXTRACTED_FILTERS);
+        const filter = (q.query?.bool?.filter ?? []) as QueryContainer[];
 
         expect(JSON.stringify(filter)).toContain('geo_distance');
     });
@@ -907,12 +1032,12 @@ describe('buildSearchQuery punctuation variants', () => {
     // spelling included. Each spelling set emits a strict/partial pair, so this
     // reads the strict half only and the assertions stay about spellings — the
     // pairing itself is covered by its own describe block below.
-    function exactTermQueries(clauses: estypes.QueryDslQueryContainer[], field: string): string[] {
+    function exactTermQueries(clauses: QueryContainer[], field: string): string[] {
         const queries: string[] = [];
         for (const c of clauses) {
             const inner = unflatten(c).inner;
             const branches = (inner?.dis_max?.queries ?? (inner ? [inner] : [])) as
-                estypes.QueryDslQueryContainer[];
+                QueryContainer[];
             for (const branch of branches) {
                 const m = branch.match?.[field];
                 if (typeof m === 'object' && m !== null && !('fuzziness' in m)
@@ -941,7 +1066,7 @@ describe('buildSearchQuery punctuation variants', () => {
             .map(unflatten)
             .filter(({ inner }) =>
                 (inner?.dis_max?.queries ?? []).some((b) => {
-                    const m = b.match?.['name'];
+                    const m = b?.match?.['name'];
                     // The fuzzy clause spells its query out too, and carries its
                     // own tier; the pair asserted below is the exact one.
                     return typeof m === 'object' && m !== null && !('fuzziness' in m);
@@ -1049,7 +1174,7 @@ describe('buildSearchQuery filter-only mode', () => {
             const sort = q.sort as estypes.SortCombinations[];
             expect(sort[0]).toEqual({ 'meeting_date': { order: 'desc' } });
 
-            const filter = (q.query?.bool?.filter ?? []) as estypes.QueryDslQueryContainer[];
+            const filter = (q.query?.bool?.filter ?? []) as QueryContainer[];
             expect(filter.some((f) => f.term?.['meeting_released'] !== undefined)).toBe(true);
             expect(findPersonFilter(filter)).toBeDefined();
             expect(filter.some((f) => f.range?.['meeting_date'] !== undefined)).toBe(true);
@@ -1100,12 +1225,12 @@ describe('buildSearchQuery cross-field coverage', () => {
     // The gate lives in filter context on the lexical bool, so it decides
     // eligibility without contributing score.
     function coverageGate(query: string): BoolQuery {
-        const filter = (textArms(query).lexical?.filter ?? []) as estypes.QueryDslQueryContainer[];
+        const filter = (textArms(query).lexical?.filter ?? []) as QueryContainer[];
         expect(filter).toHaveLength(1);
         return filter[0].bool as BoolQuery;
     }
     const gateAlternatives = (query: string) =>
-        (coverageGate(query).should ?? []) as estypes.QueryDslQueryContainer[];
+        (coverageGate(query).should ?? []) as QueryContainer[];
 
     it('gates on the document, not on any single field', () => {
         const combined = gateAlternatives('Ιωάννης Μαλτέζος υδρονομείς')
@@ -1130,16 +1255,17 @@ describe('buildSearchQuery cross-field coverage', () => {
     it('makes a speaker name cover the whole query before it admits a document', () => {
         const speakerGate = (query: string) => {
             const nested = gateAlternatives(query)
-                .map(c => c.nested?.query?.bool?.should as estypes.QueryDslQueryContainer[])
+                .map(c => c.nested?.query?.bool?.should as QueryContainer[])
                 .find(Boolean);
-            return nested?.find(c => c.match?.['speaker_contributions.speaker_person_name']);
+            return nested?.find(c => matchedFields(c).includes('speaker_contributions.speaker_person_name'));
         };
 
         expect(minimumShouldMatchOf(speakerGate('Ιωάννης Μαλτέζος υδρονομείς'))).toBe('100%');
+        expect(matchedFields(speakerGate('Ιωάννης Μαλτέζος υδρονομείς'))).toContain('speaker_contributions.speaker_name');
         // The transcript alternative keeps the ordinary threshold: a contribution
         // covering 2 of 3 terms is a real coverage claim, a name is not.
         const transcript = gateAlternatives('Ιωάννης Μαλτέζος υδρονομείς')
-            .map(c => c.nested?.query?.bool?.should as estypes.QueryDslQueryContainer[])
+            .map(c => c.nested?.query?.bool?.should as QueryContainer[])
             .find(Boolean)
             ?.find(c => c.match?.['speaker_contributions.text']);
         expect(minimumShouldMatchOf(transcript)).toBe('2<75%');
@@ -1153,21 +1279,20 @@ describe('buildSearchQuery cross-field coverage', () => {
     it('still admits the subjects a person spoke in for a bare name query', () => {
         const clauses = gateAlternatives('Χάρης Δούκας');
         const speaker = clauses
-            .map(c => c.nested?.query?.bool?.should as estypes.QueryDslQueryContainer[])
+            .map(c => c.nested?.query?.bool?.should as QueryContainer[])
             .find(Boolean)
-            ?.find(c => c.match?.['speaker_contributions.speaker_person_name']);
+            ?.find(c => matchedFields(c).includes('speaker_contributions.speaker_person_name'));
 
-        expect(speaker?.match?.['speaker_contributions.speaker_person_name'])
-            .toMatchObject({ query: 'Χάρης Δούκας', minimum_should_match: '100%' });
+        expect(speaker?.multi_match).toMatchObject({ query: 'Χάρης Δούκας', minimum_should_match: '100%' });
     });
 
     it('keeps the gate out of the scoring path', () => {
         const lexical = textArms('πάρκα Κυψέλης').lexical!;
         // filter context contributes no score; every point comes from the
         // tiered should-clauses, and msm 1 keeps a gate-only match out.
-        expect((lexical.filter as estypes.QueryDslQueryContainer[])).toHaveLength(1);
+        expect((lexical.filter as QueryContainer[])).toHaveLength(1);
         expect(lexical.minimum_should_match).toBe(1);
-        expect((lexical.should as estypes.QueryDslQueryContainer[]).length).toBeGreaterThan(0);
+        expect((lexical.should as QueryContainer[]).length).toBeGreaterThan(0);
     });
 
     it('lets the gate admit everything the scoring clauses can match', () => {
@@ -1230,9 +1355,9 @@ describe('buildSearchQuery cross-field coverage', () => {
         const { inner } = unwrapRanking(q.query);
         // Semantic search is off by default here, so the lexical bool stands
         // alone under `must` rather than inside a dis_max.
-        const textClause = ((inner?.bool as BoolQuery).must as estypes.QueryDslQueryContainer[])[0];
+        const textClause = ((inner?.bool as BoolQuery).must as QueryContainer[])[0];
         const lexical = textClause.bool as BoolQuery;
-        const loc = (lexical.should as estypes.QueryDslQueryContainer[])
+        const loc = (lexical.should as QueryContainer[])
             .map(unflatten)
             .filter(({ inner: i }) => i?.match?.['location_text']);
 
@@ -1260,12 +1385,12 @@ describe('buildSearchQuery cross-field coverage', () => {
             { ...NO_EXTRACTED_FILTERS, locationName: 'ΔΙ΄ΕΥΧΩΝ' }
         );
         const { inner } = unwrapRanking(q.query);
-        const textClause = ((inner?.bool as BoolQuery).must as estypes.QueryDslQueryContainer[])[0];
-        const should = ((textClause.bool as BoolQuery).should ?? []) as estypes.QueryDslQueryContainer[];
+        const textClause = ((inner?.bool as BoolQuery).must as QueryContainer[])[0];
+        const should = ((textClause.bool as BoolQuery).should ?? []) as QueryContainer[];
 
         const branches = should
             .map(unflatten)
-            .flatMap(({ inner: i }) => (i?.dis_max?.queries ?? []) as estypes.QueryDslQueryContainer[])
+            .flatMap(({ inner: i }) => (i?.dis_max?.queries ?? []) as QueryContainer[])
             .filter((b) => b.match?.['location_text'] !== undefined);
 
         const spellings = branches.map((b) => {
@@ -1356,10 +1481,11 @@ describe('buildSearchQuery agreement with the index mapping', () => {
             partyIds: ['party1'],
             topicIds: ['t1'],
             dateRange: { start: '2026-01-01', end: '2026-02-01' },
-            locations: [{ point: { lat: 38.0, lon: 23.7 }, radiusMeters: 2000 }],
+            location: { point: { lat: 38.0, lng: 23.7 }, radiusMeters: 2000 },
             config: { enableSemanticSearch: true },
         },
-        { ...NO_EXTRACTED_FILTERS, locationName: 'Άργος' }
+        { ...NO_EXTRACTED_FILTERS, locationName: 'Άργος' },
+        [{ point: { lat: 38.0, lng: 23.7 }, radiusMeters: 2000 }]
     );
 
     it('names only fields the index mapping defines', () => {
@@ -1389,8 +1515,8 @@ describe('buildSearchQuery agreement with the index mapping', () => {
     // combined_fields treats its fields as one combined field, so Elasticsearch
     // rejects the query outright unless they share an analyzer.
     it('gates on fields that share one analyzer', () => {
-        const filter = (textArms('πάρκα Κυψέλης').lexical?.filter ?? []) as estypes.QueryDslQueryContainer[];
-        const combined = ((filter[0].bool?.should ?? []) as estypes.QueryDslQueryContainer[])
+        const filter = (textArms('πάρκα Κυψέλης').lexical?.filter ?? []) as QueryContainer[];
+        const combined = ((filter[0].bool?.should ?? []) as QueryContainer[])
             .map(c => c.combined_fields)
             .find(Boolean)!;
 
@@ -1441,7 +1567,7 @@ describe('buildSearchQuery city filter', () => {
     // of another realm back into the filter, past that cap.
     function cityIdsOf(q: ReturnType<typeof buildSearchQuery>): string[] | undefined {
         const { inner } = unwrapRanking(q.query);
-        const filters = (inner.bool?.filter ?? []) as estypes.QueryDslQueryContainer[];
+        const filters = (inner.bool?.filter ?? []) as QueryContainer[];
         return filters.find((f) => f.terms?.['city_id'])?.terms?.['city_id'] as string[] | undefined;
     }
 
@@ -1461,34 +1587,61 @@ describe('buildSearchQuery city filter', () => {
     });
 });
 
+describe('buildFilters visibility', () => {
+    it('applies every visibility filter, whatever the request', () => {
+        const filters = buildFilters({ query: 'roads' });
+        for (const visibility of subjectVisibilityFilters()) {
+            expect(filters).toContainEqual(visibility);
+        }
+    });
+});
+
 describe('buildFilters administrative body filter', () => {
     // The two fields reached the URL and the filter bar before buildFilters had
     // a clause for either, so every administrative body selection returned the
     // unfiltered results.
     function termsOf(
-        filters: estypes.QueryDslQueryContainer[],
+        filters: QueryContainer[],
         field: string
     ): string[] | undefined {
         return filters.find((f) => f.terms?.[field])?.terms?.[field] as string[] | undefined;
     }
 
     it('filters on the ids of named administrative bodies', () => {
-        const filters = buildFilters({ query: 'roads', adminBodyIds: ['body1'] });
+        const filters = buildFilters({ query: 'roads', administrativeBodyIds: ['body1'] });
 
         expect(termsOf(filters, 'administrative_body_id')).toEqual(['body1']);
     });
 
     it('filters on the administrative body type', () => {
-        const filters = buildFilters({ query: 'roads', adminBodyTypes: ['committee'] });
+        const filters = buildFilters({ query: 'roads', administrativeBodyTypes: ['committee'] });
 
         expect(termsOf(filters, 'administrative_body_type')).toEqual(['committee']);
+    });
+
+    // A meeting with no body is indexed with no type, and the rest of the app
+    // reads it as the council's (list_meetings, the timeline). A plain terms
+    // filter on 'council' dropped its subjects.
+    it('admits subjects of a meeting with no body when the types include the council', () => {
+        const [clause] = buildFilters({ query: 'roads', administrativeBodyTypes: ['council'] })
+            .filter((f) => JSON.stringify(f).includes('administrative_body_type'));
+
+        expect(clause).toEqual({
+            bool: {
+                should: [
+                    { terms: { administrative_body_type: ['council'] } },
+                    { bool: { must_not: { exists: { field: 'administrative_body_type' } } } },
+                ],
+                minimum_should_match: 1,
+            },
+        });
     });
 
     it('keeps the id and the type as independent top-level (AND) clauses', () => {
         const filters = buildFilters({
             query: 'roads',
-            adminBodyIds: ['body1'],
-            adminBodyTypes: ['committee'],
+            administrativeBodyIds: ['body1'],
+            administrativeBodyTypes: ['committee'],
         });
 
         expect(termsOf(filters, 'administrative_body_id')).toEqual(['body1']);
@@ -1503,7 +1656,7 @@ describe('buildFilters administrative body filter', () => {
     });
 
     it('omits both clauses for empty arrays', () => {
-        const filters = buildFilters({ query: 'roads', adminBodyIds: [], adminBodyTypes: [] });
+        const filters = buildFilters({ query: 'roads', administrativeBodyIds: [], administrativeBodyTypes: [] });
 
         expect(termsOf(filters, 'administrative_body_id')).toBeUndefined();
         expect(termsOf(filters, 'administrative_body_type')).toBeUndefined();

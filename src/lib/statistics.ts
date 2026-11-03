@@ -3,6 +3,8 @@ import { City, CouncilMeeting, Party, Person, SpeakerSegment, Subject, Topic, To
 import prisma from "./db/prisma";
 import { PersonWithRelations } from "./db/people";
 import { getPartyFromRoles } from "./utils";
+import { unreleasedMeetingWhere, type UnreleasedScope } from "./unreleased";
+import { roleWithRelationsInclude } from "@/lib/db/types";
 
 export interface Stat<T> {
     item: T;
@@ -34,14 +36,16 @@ type SpeakerSegmentInfo = SpeakerSegment & {
 }
 
 export async function getStatisticsFor(
-    { personId, partyId, meetingId, cityId, subjectId, administrativeBodyId, includeUnreleased }: {
+    { personId, partyId, meetingId, cityId, subjectId, administrativeBodyId, includeUnreleased, unreleased }: {
         personId?: Person["id"],
         partyId?: Party["id"],
         meetingId?: CouncilMeeting["id"],
         cityId?: City["id"],
         subjectId?: Subject["id"],
         administrativeBodyId?: string | null,
-        includeUnreleased?: boolean
+        includeUnreleased?: boolean,
+        /** The unreleased meetings the viewer may see, when not all of them. */
+        unreleased?: UnreleasedScope,
     },
     groupBy: ("person" | "topic" | "party")[]
 ): Promise<Statistics> {
@@ -99,7 +103,7 @@ export async function getStatisticsFor(
         cityId: cityId,
         speakerTag: { personId: personId },
         meeting: {
-            ...(includeUnreleased ? {} : { released: true }),
+            ...(includeUnreleased ? {} : unreleasedMeetingWhere(unreleased)),
             ...(administrativeBodyId ? { administrativeBodyId } : {})
         },
         NOT: { summary: { type: "procedural" as const } }
@@ -109,13 +113,7 @@ export async function getStatisticsFor(
         include: {
             person: {
                 include: {
-                    roles: {
-                        include: {
-                            party: true,
-                            administrativeBody: true,
-                            city: true
-                        }
-                    }
+                    roles: roleWithRelationsInclude
                 }
             }
         }
@@ -216,13 +214,7 @@ export async function getBatchStatisticsForSubjects(
         include: {
             person: {
                 include: {
-                    roles: {
-                        include: {
-                            party: true,
-                            administrativeBody: true,
-                            city: true
-                        }
-                    }
+                    roles: roleWithRelationsInclude
                 }
             }
         }

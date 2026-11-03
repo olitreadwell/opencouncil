@@ -10,13 +10,21 @@ jest.mock('@/lib/notis/reader', () => ({ readerSubscribedToCity: (...args: unkno
 import { generatePersonClaimToken } from '@/lib/auth/personClaim';
 import { getJoinStage } from '../stage';
 
-const row = (administrators: { userId: string }[], supportsNotifications = true) => ({
+// The real catalog of the locale the code asks for.
+jest.mock('next-intl/server', () => ({
+    getTranslations: (o: { locale: string; namespace: string }) =>
+        jest.requireActual('../../../../tests/helpers/catalog').getTranslationsFromCatalog(o),
+}));
+
+type JoinRole = { name: string | null; isHead: boolean; cityId: string | null; partyId: null; administrativeBodyId: string | null; administrativeBody: { type: 'council' | 'community'; name: string } | null };
+const deputyMayor: JoinRole = { name: 'Αντιδήμαρχος Πολιτισμού', isHead: false, cityId: 'chania', partyId: null, administrativeBodyId: null, administrativeBody: null };
+const row = (administrators: { userId: string }[], supportsNotifications = true, roles: JoinRole[] = [deputyMayor]) => ({
     id: 'person-1',
     name: 'Αδάμ Μπούτζουκας',
     image: null,
     cityId: 'chania',
-    city: { name: 'Χανιά', supportsNotifications },
-    roles: [{ name: 'Αντιδήμαρχος Πολιτισμού', cityId: 'chania', partyId: null, administrativeBodyId: null, administrativeBody: null }],
+    city: { name: 'Χανιά', language: 'el', supportsNotifications },
+    roles,
     administrators,
 });
 const token = () => generatePersonClaimToken('person-1');
@@ -47,6 +55,22 @@ describe('getJoinStage', () => {
             person: { id: 'person-1', name: 'Αδάμ Μπούτζουκας', image: null, title: 'Αντιδήμαρχος Πολιτισμού', cityId: 'chania', cityName: 'Χανιά' },
         });
         expect(await getJoinStage(token(), 'user-1')).toMatchObject({ kind: 'confirm', signedIn: true });
+    });
+
+    it('titles a mayor without a stored role name in the city language', async () => {
+        mockGetJoinPerson.mockResolvedValue({
+            ...row([]),
+            city: { name: 'Rouen', language: 'fr', supportsNotifications: true },
+            roles: [{ name: null, isHead: true, cityId: 'rouen', partyId: null, administrativeBodyId: null, administrativeBody: null }],
+        });
+        expect(await getJoinStage(token(), null)).toMatchObject({ person: { title: 'Maire' } });
+    });
+
+    it('titles a community councillor with their community', async () => {
+        const president: JoinRole = { name: null, isHead: true, cityId: null, partyId: null, administrativeBodyId: 'k3', administrativeBody: { type: 'community', name: '3η Δημοτική Κοινότητα' } };
+        mockGetJoinPerson.mockResolvedValue(row([], true, [president]));
+        const stage = await getJoinStage(token(), null);
+        expect(stage).toMatchObject({ kind: 'confirm', person: { title: 'Πρόεδρος - 3η Δημοτική Κοινότητα' } });
     });
 
     it('offers the city\'s notifications to a reader who does not get them, and asks nothing without an account', async () => {

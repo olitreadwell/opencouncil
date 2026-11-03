@@ -3,6 +3,9 @@ import { revalidatePath, revalidateTag } from 'next/cache'
 import { uploadFile } from '@/lib/s3'
 import { getParty, editParty, deleteParty } from '@/lib/db/parties'
 import { withUserAuthorizedToEdit } from '@/lib/auth'
+import { parseFormData, readFormData } from '@/lib/api/form-data-parser'
+import { partyFormDataSchema } from '@/lib/zod-schemas/party'
+import { handleApiError } from '@/lib/api/errors'
 
 export async function GET(
     request: Request,
@@ -28,19 +31,12 @@ export async function PUT(
     const params = await props.params;
     try {
         await withUserAuthorizedToEdit({ partyId: params.partyId });
-        const formData = await request.formData()
-
-        const name = formData.get('name') as string
-        const name_en = formData.get('name_en') as string
-        const name_short = formData.get('name_short') as string
-        const name_short_en = formData.get('name_short_en') as string
-        const colorHex = formData.get('colorHex') as string
-        const logo = formData.get('logo') as File | null
-        const removeLogo = formData.get('removeLogo') === 'true'
+        const { name, name_en, name_short, name_short_en, colorHex, logo, removeLogo } =
+            parseFormData(await readFormData(request), partyFormDataSchema)
 
         let logoUrl: string | undefined = undefined
 
-        if (logo && logo instanceof File) {
+        if (logo) {
             try {
                 const result = await uploadFile(logo, { prefix: 'party-logos' })
                 logoUrl = result.url
@@ -68,8 +64,7 @@ export async function PUT(
 
         return NextResponse.json(party)
     } catch (error) {
-        console.error('Error editing party:', error)
-        return NextResponse.json({ error: 'Failed to edit party' }, { status: 500 })
+        return handleApiError(error, 'Failed to edit party');
     }
 }
 
@@ -79,7 +74,7 @@ export async function DELETE(
 ) {
     const params = await props.params;
     try {
-        await withUserAuthorizedToEdit({ partyId: params.partyId });
+        await withUserAuthorizedToEdit({});
         await deleteParty(params.partyId)
         revalidateTag(`city:${params.cityId}:parties`, 'max');
         // The city row carries the roster counts the overview reads to decide
@@ -89,7 +84,6 @@ export async function DELETE(
         revalidatePath(`/${params.cityId}/parties`);
         return NextResponse.json({ message: 'Party deleted successfully' })
     } catch (error) {
-        console.error('Error deleting party:', error)
-        return NextResponse.json({ error: 'Failed to delete party' }, { status: 500 })
+        return handleApiError(error, 'Failed to delete party');
     }
 }

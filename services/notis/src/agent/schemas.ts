@@ -1,4 +1,4 @@
-import { z } from "zod";
+import * as z from "zod";
 
 /**
  * Canonical wire schemas for the agent's data shapes. The TypeScript types in
@@ -32,6 +32,8 @@ export const decisionEntrySchema = z.object({
   unsubscribed: z.boolean().optional(),
   /** The wake was cut at the token ceiling — this entry is not a decision. */
   truncated: z.boolean().optional(),
+  /** Only a holding line reached the reader; the researched answer never did. */
+  holdingOnly: z.boolean().optional(),
 });
 
 /**
@@ -62,7 +64,31 @@ export const cityPreferenceSchema = z.object({
 export const commitmentSchema = z.object({
   slug: z.string(),
   what: z.string(),
+  /** When it was recorded: an ISO instant. The prompt renders the Athens day. */
   since: z.string(),
+});
+
+/**
+ * Why a reader wants a person on the OpenCouncil team: they are unhappy with
+ * Notis or OpenCouncil, they ask for a person, they need help with
+ * OpenCouncil itself, or they say the record is wrong. The tool schema and
+ * the panel labels follow this list. The database enums must match both
+ * lists: the shell assigns the Prisma values to these types, so a drift
+ * fails to compile.
+ */
+export const SUPPORT_REQUEST_KINDS = ["dissatisfaction", "contact", "help", "data_error"] as const;
+export const SUPPORT_REQUEST_STATUSES = ["open", "withdrawn", "closed"] as const;
+export const supportRequestKindSchema = z.enum(SUPPORT_REQUEST_KINDS);
+
+/** The reader's latest support request, as the prompt sees it. */
+export const supportRequestSchema = z.object({
+  kind: supportRequestKindSchema,
+  status: z.enum(SUPPORT_REQUEST_STATUSES),
+  summary: z.string(),
+  /** When it was filed: an ISO instant. The prompt renders the Athens day. */
+  since: z.string(),
+  /** When it was withdrawn or closed: an ISO instant. Absent while it is open. */
+  endedAt: z.string().optional(),
 });
 
 /** One turn of the real WhatsApp thread — what actually reached the reader
@@ -115,11 +141,25 @@ export const wakeStateSchema = z.object({
    */
   commitments: z.array(commitmentSchema).optional(),
   /**
+   * The reader's open support request, or else the one that ended in the
+   * last 30 days, so that the agent knows what happened to it. An open
+   * request never ages out. Optional, not defaulted, for the same reason as
+   * commitments.
+   */
+  supportRequest: supportRequestSchema.optional(),
+  /**
    * Everything that has aged out of both windows, folded into one running
    * narrative by the compaction pass. Absent until a reader has enough history
    * to compact.
    */
   memory: z.string().optional(),
+  /**
+   * How this wake's sends will leave, judged by the shell from the 24h reply
+   * window at assembly time: inside it the words go out as written, outside
+   * it each send_message becomes its own template card. The model is told,
+   * so a cold push is written as one message. Absent on simulation surfaces.
+   */
+  deliveryMode: z.enum(["freeform", "template"]).optional(),
 });
 
 export const editorialSubjectSchema = z.object({
@@ -170,7 +210,18 @@ const meetingEventFields = {
   at: z.string(),
   cityId: z.string(),
   meetingId: z.string(),
-  meetingName: z.string(),
+  /**
+   * The legacy stored name of the meeting, or null. A meeting without a kind
+   * falls back to it; otherwise its title is derived from meetingKind,
+   * urgent and sessionNumber. An event queued before the view carried the
+   * facts holds the stored name here and has none of the facts.
+   */
+  meetingName: z.string().nullish(),
+  /** The MeetingKind value, e.g. "ordinary"; null when the kind is not stated. */
+  meetingKind: z.string().nullish(),
+  /** The invitation convenes the meeting urgently («Έκτακτη»). */
+  urgent: z.boolean().nullish(),
+  sessionNumber: z.number().int().nullish(),
   meetingDate: z.string(),
   /** Which body is meeting (Δημοτικό Συμβούλιο, Επιτροπή, Κοινότητα...). */
   adminBody: z.string().nullable().optional(),

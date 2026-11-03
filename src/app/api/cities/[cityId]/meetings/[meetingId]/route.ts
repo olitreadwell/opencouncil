@@ -1,11 +1,12 @@
 import { NextResponse } from 'next/server';
-import { revalidatePath, revalidateTag } from 'next/cache';
 import { getMeetingDataCore } from '@/lib/getMeetingData';
-import { editCouncilMeeting } from '@/lib/db/meetings';
-import { z } from 'zod';
+import { toPublicApiMeeting } from '@/lib/meetingPublic';
+import { pickRecordInput } from '@/lib/meetingLifecycleRules';
+import { handleApiError } from '@/lib/api/errors';
 import { withUserAuthorizedToEdit } from '@/lib/auth';
 import { meetingSchema } from '@/lib/zod-schemas/meeting';
-import { syncMeetingToCalendar } from '@/lib/google-calendar';
+import { updateMeetingWithEffects } from '@/lib/meetingWrites';
+import { getCouncilMeetingDirect } from '@/lib/db/meetings';
 
 export async function GET(
     request: Request,
@@ -14,11 +15,17 @@ export async function GET(
     const params = await props.params;
     try {
         const data = await getMeetingDataCore(params.cityId, params.meetingId);
-        // Strip transcript data when hidden for review (no auth on this endpoint)
+        // No auth on this endpoint: the meeting carries its display names and
+        // never the id of the meeting that it replaced.
+        const meeting = toPublicApiMeeting(data.meeting, {
+            timezone: data.city.timezone,
+            postponedFromDate: data.meeting.postponedFromDate,
+        });
+        // Strip transcript data when hidden for review
         if (data.transcriptHiddenForReview) {
-            return NextResponse.json({ ...data, transcript: [], speakerTags: [] });
+            return NextResponse.json({ ...data, meeting, transcript: [], speakerTags: [] });
         }
-        return NextResponse.json({ ...data });
+        return NextResponse.json({ ...data, meeting });
     } catch (error) {
         // TODO: Brittle string match — refactor getMeetingData to return null instead of throwing
         if (error instanceof Error && error.message === 'Required data not found') {
@@ -41,36 +48,41 @@ export async function PUT(
 ) {
     const params = await props.params;
     try {
-        await withUserAuthorizedToEdit({ cityId: params.cityId });
+        await withUserAuthorizedToEdit({ cityId: params.cityId, councilMeetingId: params.meetingId });
         const body = await request.json();
-        const { name, name_en, date, youtubeUrl, agendaUrl, meetingId, administrativeBodyId } = meetingSchema.parse(body);
+        // The URL names the meeting, and an edit queues no agenda task. The
+        // facts of the record come from MEETING_RECORD_INPUT_KEYS, as on create.
+        const input = meetingSchema.parse(body);
+        const { date, youtubeUrl, agendaUrl, administrativeBodyId, postponedFromId, continuationOfId } = input;
 
-        const meeting = await editCouncilMeeting(params.cityId, params.meetingId, {
-            name,
-            name_en,
+        const current = await getCouncilMeetingDirect(params.cityId, params.meetingId);
+        if (!current) {
+            return NextResponse.json({ error: 'Meeting not found' }, { status: 404 });
+        }
+
+        // An absent body leaves the meeting where it is. Moving it to another
+        // body, or to no body, needs rights on the destination too: a body
+        // admin may not hand their meeting over or take one of another body.
+        const nextBodyId = administrativeBodyId === undefined ? undefined : administrativeBodyId || null;
+        if (nextBodyId !== undefined && nextBodyId !== current.administrativeBodyId) {
+            await withUserAuthorizedToEdit(nextBodyId
+                ? { cityId: params.cityId, administrativeBodyId: nextBodyId }
+                : { cityId: params.cityId });
+        }
+
+        // A field that the request leaves out keeps its value.
+        const meeting = await updateMeetingWithEffects(params.cityId, params.meetingId, {
+            ...pickRecordInput(input),
+            postponedFromId,
+            continuationOfId,
             dateTime: date,
-            youtubeUrl: youtubeUrl || null,
-            agendaUrl: agendaUrl || null,
-            administrativeBodyId: administrativeBodyId || null,
+            youtubeUrl,
+            agendaUrl,
+            ...(nextBodyId !== undefined && { administrativeBodyId: nextBodyId }),
         });
-
-        revalidateTag(`city:${params.cityId}:meetings`, 'max');
-        revalidatePath(`/${params.cityId}`, "layout");
-
-        // Propagate date, administrative body, and agenda changes to the
-        // Google Calendar event. The meeting name is not on the event.
-        await syncMeetingToCalendar(params.cityId, params.meetingId);
 
         return NextResponse.json(meeting);
     } catch (error) {
-        if (error instanceof z.ZodError) {
-            console.error('Validation error:', error.errors);
-            return NextResponse.json({ error: error.errors }, { status: 400 });
-        }
-        console.error('Failed to update meeting:', error);
-        return NextResponse.json(
-            { error: 'Failed to update meeting' },
-            { status: 500 }
-        );
+        return handleApiError(error, 'Failed to update meeting');
     }
 }

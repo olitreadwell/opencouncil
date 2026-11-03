@@ -1,0 +1,154 @@
+/** @jest-environment node */
+
+import { processTaskResponse } from '@/lib/tasks/tasks';
+
+const mockFindUnique = jest.fn();
+const mockUpdate = jest.fn();
+const mockUpdateMany = jest.fn();
+
+const mockNotify = jest.fn();
+jest.mock('@/lib/notifications/meetingNotifications', () => ({ notifySubscribersOfTask: (...args: unknown[]) => mockNotify(...args) }));
+jest.mock('@/lib/db/prisma', () => ({
+  __esModule: true,
+  default: {
+    taskStatus: {
+      findUnique: (...args: unknown[]) => mockFindUnique(...args),
+      update: (...args: unknown[]) => mockUpdate(...args),
+      updateMany: (...args: unknown[]) => mockUpdateMany(...args),
+    },
+  },
+}));
+jest.mock('@/env.mjs', () => ({ env: { NEXTAUTH_URL: 'http://test', TASK_API_URL: 'http://test', TASK_API_KEY: 'key' } }));
+jest.mock('next/cache', () => ({ revalidateTag: jest.fn() }));
+jest.mock('@/lib/auth', () => ({ withUserAuthorizedToEdit: jest.fn() }));
+jest.mock('@/lib/discord', () => ({ sendTaskAdminAlert: jest.fn() }));
+const mockSummarizeHandler = jest.fn();
+jest.mock('@/lib/tasks/registry', () => ({
+  taskHandlers: { summarize: (...args: unknown[]) => mockSummarizeHandler(...args) },
+  taskTerminalHooks: {},
+}));
+
+const TASK_ID = 'task-1';
+const storedResult = { foo: 'bar' };
+const storedTask = {
+  id: TASK_ID,
+  type: 'summarize',
+  cityId: 'city-1',
+  councilMeetingId: 'meeting-1',
+  responseBody: JSON.stringify(storedResult),
+};
+
+describe('processTaskResponse — replay of a stored payload', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockUpdateMany.mockResolvedValue({ count: 1 });
+  });
+
+  it('marks a failed task succeeded and clears failureReason when the replay succeeds', async () => {
+    mockFindUnique.mockResolvedValue({ ...storedTask, status: 'failed', failureReason: 'Error: earlier failure' });
+    mockSummarizeHandler.mockResolvedValue(undefined);
+
+    await processTaskResponse('summarize', TASK_ID);
+
+    expect(mockSummarizeHandler).toHaveBeenCalledWith(TASK_ID, storedResult, undefined);
+    expect(mockUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mockUpdateMany).toHaveBeenCalledWith({
+      where: { id: TASK_ID, status: { not: 'succeeded' } },
+      data: { status: 'succeeded', failureReason: null },
+    });
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockNotify).toHaveBeenCalledWith('city-1', 'meeting-1', 'summarize');
+    expect(mockUpdateMany.mock.invocationCallOrder[0]).toBeLessThan(mockNotify.mock.invocationCallOrder[0]);
+  });
+
+  it('does not notify again when the replayed task already read as succeeded', async () => {
+    mockFindUnique.mockResolvedValue({ ...storedTask, status: 'succeeded', failureReason: null });
+    mockSummarizeHandler.mockResolvedValue(undefined);
+    mockUpdateMany.mockResolvedValue({ count: 0 });
+
+    await processTaskResponse('summarize', TASK_ID, { force: true });
+
+    expect(mockNotify).not.toHaveBeenCalled();
+  });
+
+  it('finishes a claim whose handler never completed: an old pending task with a payload becomes succeeded', async () => {
+    // The success callback wrote responseBody, then the request was cut before
+    // the handler finished. The task stays pending; the replay completes it.
+    mockFindUnique.mockResolvedValue({
+      ...storedTask,
+      status: 'pending',
+      stage: 'persisting results',
+      failureReason: null,
+      updatedAt: new Date(Date.now() - 16 * 60_000),
+    });
+    mockSummarizeHandler.mockResolvedValue(undefined);
+
+    await processTaskResponse('summarize', TASK_ID);
+
+    expect(mockSummarizeHandler).toHaveBeenCalledWith(TASK_ID, storedResult, undefined);
+    expect(mockUpdateMany).toHaveBeenCalledWith({
+      where: { id: TASK_ID, status: { not: 'succeeded' } },
+      data: { status: 'succeeded', failureReason: null },
+    });
+  });
+
+  it('refuses a young claim: its handler may still be running', async () => {
+    mockFindUnique.mockResolvedValue({
+      ...storedTask,
+      status: 'pending',
+      stage: 'persisting results',
+      failureReason: null,
+      updatedAt: new Date(Date.now() - 2 * 60_000),
+    });
+
+    await expect(processTaskResponse('summarize', TASK_ID)).rejects.toThrow('still persisting its result');
+
+    expect(mockSummarizeHandler).not.toHaveBeenCalled();
+    expect(mockUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it('records the new failure of a failed task and rethrows when the replay fails', async () => {
+    mockFindUnique.mockResolvedValue({ ...storedTask, status: 'failed', failureReason: 'Error: earlier failure' });
+    const error = new Error('still broken');
+    error.stack = 'Error: still broken\n    at handler';
+    mockSummarizeHandler.mockRejectedValue(error);
+
+    await expect(processTaskResponse('summarize', TASK_ID)).rejects.toThrow('still broken');
+
+    expect(mockUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mockUpdateMany).toHaveBeenCalledWith({
+      where: { id: TASK_ID, status: { not: 'succeeded' } },
+      data: { status: 'failed', failureReason: 'Error: still broken\n    at handler' },
+    });
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it('never demotes a succeeded task whose replay fails', async () => {
+    mockFindUnique.mockResolvedValue({ ...storedTask, status: 'succeeded', failureReason: null });
+    mockSummarizeHandler.mockRejectedValue(new Error('force re-run broke'));
+
+    await expect(processTaskResponse('summarize', TASK_ID, { force: true })).rejects.toThrow('force re-run broke');
+
+    expect(mockSummarizeHandler).toHaveBeenCalledWith(TASK_ID, storedResult, { force: true });
+    // Every write skips a succeeded row, so it cannot change this one.
+    for (const [args] of mockUpdateMany.mock.calls) {
+      expect(args.where).toEqual({ id: TASK_ID, status: { not: 'succeeded' } });
+    }
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a pending task without a payload', { status: 'pending', responseBody: null }],
+    ['a failed task without a payload', { status: 'failed', responseBody: null, failureReason: 'backend failed' }],
+    ['a failed task from before failureReason, with failure text in responseBody',
+      { status: 'failed', responseBody: 'Processing error: boom', failureReason: null }],
+  ])('refuses %s before the handler runs and writes nothing', async (_, overrides) => {
+    mockFindUnique.mockResolvedValue({ ...storedTask, ...overrides });
+
+    await expect(processTaskResponse('summarize', TASK_ID)).rejects.toThrow('has no result to replay');
+
+    expect(mockSummarizeHandler).not.toHaveBeenCalled();
+    expect(mockUpdateMany).not.toHaveBeenCalled();
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+});

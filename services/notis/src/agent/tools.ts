@@ -1,3 +1,5 @@
+import { SUPPORT_REQUEST_KINDS } from "./schemas";
+
 /**
  * Client tools exposed to the model. The core records their invocations into
  * the WakeOutcome and answers with synthetic tool_results — no side effect
@@ -8,13 +10,28 @@ export const CLIENT_TOOLS = [
   {
     name: "finish_wake",
     description:
-      "End the wake, carrying your operator rationale (2-4 honest sentences; 1-2 for " +
-      "silence) about why this was, or was not, worth the reader's attention. REQUIRED " +
-      "on every wake, and call it in the SAME turn as your final send_message calls — " +
-      "one turn: sends plus finish_wake, nothing after.",
+      "End the wake, carrying your decision and your operator rationale (2-4 honest " +
+      "sentences; 1-2 for silence) about why this was, or was not, worth the reader's " +
+      "attention. REQUIRED on every wake, and call it in the SAME turn as your final " +
+      "send_message calls — one turn: sends plus finish_wake, nothing after. Write " +
+      "nothing outside your tool calls: text next to them is never delivered and never " +
+      "read.",
     input_schema: {
       type: "object" as const,
       properties: {
+        // The model's own account of the decision. The shell derives the real
+        // one from the sends; a declared «send» with nothing sent is a lost
+        // message, and the only way to catch it on a proactive wake — in
+        // production the model regularly decided to write, called only
+        // finish_wake, and the wake went down as silence.
+        decision: {
+          type: "string",
+          enum: ["send", "silence"],
+          description:
+            "What you did this wake: «send» if you called send_message, «silence» if " +
+            "you sent nothing. The shell checks this against your actual sends. On a " +
+            "reply wake «silence» fits only a bare acknowledgment that asks nothing.",
+        },
         rationale: {
           type: "string",
           description:
@@ -33,7 +50,9 @@ export const CLIENT_TOOLS = [
           description:
             "Did this wake teach you something lasting about the reader — what they " +
             "chase, where they live or work, how they want to be written to? Their " +
-            "questions and corrections count, not only what they declare. Answer " +
+            "questions count as much as their statements: a place, a body (their " +
+            "κοινότητα) or a project they asked about that the profile does not name, " +
+            "a wish for more or for less, «όχι μόνο τα δικά μου θέματα». Answer " +
             "honestly; if true, call update_taste_profile before finishing.",
         },
         // Same reason as the field above: the wake ends before anyone thinks
@@ -47,7 +66,7 @@ export const CLIENT_TOOLS = [
             "call record_commitment before finishing, or the promise is forgotten.",
         },
       },
-      required: ["rationale", "learnedSomethingLasting", "promisedFollowUp"],
+      required: ["decision", "rationale", "learnedSomethingLasting", "promisedFollowUp"],
     },
   },
   {
@@ -56,7 +75,8 @@ export const CLIENT_TOOLS = [
       "Remember something you owe this reader — a follow-up you promised, an update " +
       "they asked you to watch for. It stays in front of you on every future wake, " +
       "however long the conversation gets, until you resolve it. Use it whenever you " +
-      "tell them you will come back to them.",
+      "tell them you will come back to them. Never for the meetings of a city outside " +
+      "their profile: you are not woken for it, so the promise cannot be kept.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -97,12 +117,24 @@ export const CLIENT_TOOLS = [
     description:
       "Send one WhatsApp message to the reader, in their language (Greek unless they have " +
       "shown otherwise). One specific thing per message; " +
-      "two or three sentences is a whole message. Include an opencouncil.gr link. " +
-      "Call once per message, in sending order.",
+      "two or three sentences is a whole message. Include an opencouncil.gr link copied " +
+      "from a url field a tool returned — never one composed from a name: the shell holds " +
+      "a message whose link no tool result vouches for. Call once per message, in sending " +
+      "order.",
     input_schema: {
       type: "object" as const,
       properties: {
         text: { type: "string", description: "The message text, in the reader's language." },
+        // Explicit, not inferred: a short linkless message can be a complete
+        // answer («Όχι, δεν συζητήθηκε.»), so only the model can say which
+        // send was the holding line. The shell then knows that the answer is
+        // still owed once research follows.
+        holding: {
+          type: "boolean",
+          description:
+            "true for the one short holding line («Μισό, να το κοιτάξω») you send before " +
+            "researching, never for an answer. The answer must follow in this wake.",
+        },
       },
       required: ["text"],
     },
@@ -127,7 +159,8 @@ export const CLIENT_TOOLS = [
       "Wake yourself at a future moment for something NO event will cover — a " +
       "process to recheck, a deadline outside the meeting flow. Never schedule " +
       "for a meeting's aftermath: the published record wakes you automatically " +
-      "(meeting_summarized), and record_commitment carries any promise you made.",
+      "(meeting_summarized), and record_commitment carries any promise you made. " +
+      "Never to follow a city outside the reader's profile.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -146,6 +179,43 @@ export const CLIENT_TOOLS = [
       "Unsubscribe the reader from all proactive messages, immediately and permanently " +
       "(until they explicitly resubscribe). Use when they clearly want to leave. " +
       "Warm goodbye first via send_message is welcome; never argue.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        reason: { type: "string", description: "Their words or your one-line summary of why." },
+      },
+      required: ["reason"],
+    },
+  },
+  {
+    name: "open_support_request",
+    description:
+      "Ask the OpenCouncil team to contact this reader on this number. File first, without " +
+      "asking. Calling it while a request is open updates that request.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        kind: {
+          type: "string",
+          enum: [...SUPPORT_REQUEST_KINDS],
+          description:
+            "dissatisfaction: unhappy with you or OpenCouncil. contact: wants a person. " +
+            "help: needs help with OpenCouncil that you cannot give. data_error: says the " +
+            "record is wrong.",
+        },
+        summary: {
+          type: "string",
+          description:
+            "One to three sentences in Greek for the operator: what they need and why. The " +
+            "shell attaches their own words.",
+        },
+      },
+      required: ["kind", "summary"],
+    },
+  },
+  {
+    name: "withdraw_support_request",
+    description: "Withdraw the reader's open request when they do not want to be contacted.",
     input_schema: {
       type: "object" as const,
       properties: {

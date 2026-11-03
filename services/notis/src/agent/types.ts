@@ -1,10 +1,11 @@
-import { z } from "zod";
+import * as z from "zod";
 import {
   cityPreferenceSchema,
   conversationMessageSchema,
   editorialBriefSchema,
   editorialSubjectSchema,
   effortSchema,
+  supportRequestKindSchema,
   decisionEntrySchema,
   wakeEventSchema,
   wakeStateSchema,
@@ -27,6 +28,7 @@ export type WakeState = z.infer<typeof wakeStateSchema>;
 export type EditorialSubject = z.infer<typeof editorialSubjectSchema>;
 export type EditorialBrief = z.infer<typeof editorialBriefSchema>;
 export type WakeEvent = z.infer<typeof wakeEventSchema>;
+export type SupportRequestKind = z.infer<typeof supportRequestKindSchema>;
 
 export interface WakeOutcome {
   decision: "silence" | "send";
@@ -39,6 +41,9 @@ export interface WakeOutcome {
   truncated?: true;
   /** The wake ended without the REQUIRED finish_wake call. */
   finishWakeMissing?: true;
+  /** Only the declared holding line reached the reader: research followed it
+   *  and nothing went out after. */
+  holdingOnly?: true;
   /** Present iff the model called update_taste_profile (last call wins). */
   profileRewrite?: string;
   scheduledWakes: Array<{ at: string; reason: string }>;
@@ -49,6 +54,15 @@ export interface WakeOutcome {
     resolve?: string[];
   };
   unsubscribe?: { reason: string };
+  /**
+   * The support request this wake opened or withdrew. At most one of the two:
+   * within a wake the later tool call wins. Applied by the shell. Absent when
+   * the wake touched none.
+   */
+  supportRequest?: {
+    open?: { kind: SupportRequestKind; summary: string };
+    withdraw?: { reason: string };
+  };
   /**
    * The wake errored AFTER at least one incremental delivery reached (or
    * may still reach) the reader. The loop was finalized instead of retried:
@@ -90,6 +104,8 @@ export interface WakeTrace {
   usageTotal: Usage;
   costUsd: number;
   durationMs: number;
+  /** The effort the wake ran at — reactive and proactive wakes differ. */
+  effort: Effort;
 }
 
 /* ------------------------------------------------------------------ */
@@ -113,6 +129,19 @@ export function isTextBlock(b: unknown): b is TextBlock {
 
 export function isToolUseBlock(b: unknown): b is ToolUseBlock {
   return typeof b === "object" && b !== null && (b as { type?: string }).type === "tool_use";
+}
+
+/**
+ * A server-side research block inside an assistant turn: an MCP or web tool
+ * call, or its result. Client tool_result blocks never appear in assistant
+ * content, so every `*_tool_result` here is the server's.
+ */
+export function isResearchBlock(b: unknown): boolean {
+  const type = (b as { type?: unknown } | null)?.type;
+  return (
+    typeof type === "string" &&
+    (type === "mcp_tool_use" || type === "server_tool_use" || type.endsWith("_tool_result"))
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -173,6 +202,9 @@ export interface DepsConfig {
   mcpUrl: string;
   /** Sonnet 5 punches well above its weight at low effort — the cost lever for wakes. */
   effort: Effort;
+  /** A reader is waiting on a reactive wake, and the shallow research of low
+   *  effort lost answers there; the proactive volume stays at `effort`. */
+  reactiveEffort: Effort;
 }
 
 export interface Deps {
@@ -214,12 +246,16 @@ export interface Deps {
 }
 
 export const DEFAULT_CONFIG: DepsConfig = {
-  // Sonnet 5: near-Opus quality on agentic work at ~40% of the cost and
-  // noticeably lower latency — the right default for per-resident wakes.
-  model: "claude-sonnet-5",
+  // Sonnet 5.5: the current Sonnet, same price as Sonnet 5 ($2/$10 per
+  // million tokens), near-Opus quality on agentic work at a fraction of the
+  // cost — the right default for per-resident wakes. Effort stays at low
+  // until the live eval (npm run eval:prompt) says otherwise: 5.5
+  // recalibrated the effort levels.
+  model: "claude-sonnet-5-5",
   maxTurns: 8,
   mcpUrl: "https://opencouncil.gr/mcp",
   effort: "low",
+  reactiveEffort: "medium",
 };
 
 /** The most recent decision entries the prompt renders. */

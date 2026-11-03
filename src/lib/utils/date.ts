@@ -29,4 +29,4 @@ export function formatConsultationEndDate(endDate: Date, cityTimezone: string, l
     });
 
     return `${formattedDateTime} (${relativeTime})`;
-} 
+}

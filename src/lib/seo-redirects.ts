@@ -43,9 +43,11 @@ export function wwwRedirectTarget(host: string | null | undefined, pathname: str
  *   for development — unless `realmOverride` is set (the `?realm=` escape
  *   hatch, see `realmOverride` in `realm.ts`), in which case the host is
  *   treated as that realm's host so the emulation is faithful everywhere.
- * - The realm's own default prefix (`/el` on `.gr`) is next-intl's job — its
- *   middleware already redirects it away. `/en` intentionally keeps serving
- *   200 (it canonicalizes to the default-locale URL instead).
+ * - The realm's own locale prefixes are left alone. next-intl redirects `/el`
+ *   away on `.gr`; on a realm whose default is another locale (`/fr` on `.fr`,
+ *   `/en` on `.pl`) the prefixed URL serves 200 and canonicalizes to the
+ *   unprefixed one. `/en` on the other realms also keeps serving 200 (it
+ *   canonicalizes to the default-locale URL instead).
  */
 export function foreignLocaleRedirectPath(
     host: string | null | undefined,
@@ -88,7 +90,7 @@ const inLatTree = (pathname: string) => {
  *
  * - Cookie-gated, so crawlers (cookieless) always see the canonical tree:
  *   unprefixed Cyrillic, with the /lat variant canonicalised back to it (no
- *   hreflang cluster is emitted anywhere — see `buildCanonicalAlternates`).
+ *   hreflang cluster is emitted anywhere — see `withCanonicalUrl`).
  *   A 302 rather than a 301 because the response varies by cookie, so it must
  *   never be treated as permanent; no effect on indexing either way.
  * - Any explicit locale prefix wins over the cookie (`/lat` needs no

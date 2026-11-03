@@ -1,14 +1,16 @@
 import { Metadata } from "next";
 import { notFound, redirect } from "next/navigation";
+import { headers } from "next/headers";
 import { getTranslations } from "next-intl/server";
 import { NotificationSignup } from "@/components/notifications/signup/NotificationSignup";
 import { getCurrentUser } from "@/lib/auth";
+import { googleSignInAvailable } from "@/lib/auth/googleSignIn";
 import { getCityCached } from "@/lib/cache";
 import { getCity } from "@/lib/db/cities";
 import { getSignupPreference } from "@/lib/db/signup";
 import { getTopics } from "@/lib/db/topics";
 import { getRealm } from "@/lib/realm.server";
-import { buildCanonicalAlternates } from "@/lib/utils/hreflang";
+import { withCanonicalUrl } from "@/lib/utils/hreflang";
 import { firstSearchParam } from "@/lib/utils/searchParams";
 import { buildOgImageUrl } from "@/lib/og/locale";
 import { signupOpenGraph } from "@/lib/og/signupMetadata";
@@ -23,12 +25,11 @@ export async function generateMetadata(props: { params: Promise<{ cityId: string
 
     const title = t("metaTitle");
     const description = t("metaDescription");
-    return {
+    return withCanonicalUrl(`/${cityId}/notifications`, {
         title,
         description,
         ...signupOpenGraph(locale, title, description, buildOgImageUrl(locale, { pageType: "notifications", cityId })),
-        alternates: await buildCanonicalAlternates(`/${cityId}/notifications`),
-    };
+    });
 }
 
 interface PageProps {
@@ -46,10 +47,11 @@ interface PageProps {
  */
 export default async function NotificationSignupPage(props: PageProps) {
     const [{ cityId }, { step, q }] = await Promise.all([props.params, props.searchParams]);
-    const [city, realm, user] = await Promise.all([
+    const [city, realm, user, requestHeaders] = await Promise.all([
         getCity(cityId, { includeGeometry: true }),
         getRealm(),
         getCurrentUser(),
+        headers(),
     ]);
 
     if (!city) {
@@ -76,6 +78,7 @@ export default async function NotificationSignupPage(props: PageProps) {
                     ? { name: user.name ?? "", email: user.email, phone: user.phone ?? null, notifyByPhone: user.notifyByPhone }
                     : null
             }
+            googleAvailable={googleSignInAvailable(requestHeaders)}
         />
     );
 }

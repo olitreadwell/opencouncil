@@ -1,25 +1,26 @@
 "use server";
 import prisma from './prisma';
 import { AdministrativeBodyType, Prisma, Topic } from '@prisma/client';
-import { isUserAuthorizedToEdit } from '../auth';
-import { ContributionForPerson, roleWithRelationsInclude } from './types';
+import { getUnreleasedScope } from '@/lib/auth';
+import { unreleasedMeetingWhere, type UnreleasedScope } from '@/lib/unreleased';
+import { ContributionForPerson, contributionSubjectSelect, roleWithRelationsInclude } from './types';
 
-async function shouldIncludeUnreleasedForPerson(personId: string): Promise<boolean> {
+async function unreleasedScopeForPerson(personId: string): Promise<UnreleasedScope | undefined> {
     const person = await prisma.person.findUnique({
         where: { id: personId },
         select: { cityId: true },
     });
-    if (!person) return false;
-    return isUserAuthorizedToEdit({ cityId: person.cityId });
+    if (!person) return undefined;
+    return getUnreleasedScope(person.cityId);
 }
 
-async function shouldIncludeUnreleasedForParty(partyId: string): Promise<boolean> {
+async function unreleasedScopeForParty(partyId: string): Promise<UnreleasedScope | undefined> {
     const party = await prisma.party.findUnique({
         where: { id: partyId },
         select: { cityId: true },
     });
-    if (!party) return false;
-    return isUserAuthorizedToEdit({ cityId: party.cityId });
+    if (!party) return undefined;
+    return getUnreleasedScope(party.cityId);
 }
 
 /**
@@ -28,11 +29,11 @@ async function shouldIncludeUnreleasedForParty(partyId: string): Promise<boolean
  * different query functions can't drift.
  */
 function buildMeetingFilter(
-    includeUnreleased: boolean,
+    unreleased: UnreleasedScope | undefined,
     administrativeBodyType?: AdministrativeBodyType | null,
 ): Prisma.CouncilMeetingWhereInput {
     return {
-        ...(includeUnreleased ? {} : { released: true }),
+        ...unreleasedMeetingWhere(unreleased),
         ...(administrativeBodyType ? { administrativeBody: { type: administrativeBodyType } } : {}),
         // Hide meetings whose admin body hides unreviewed transcripts and
         // that haven't passed human review.
@@ -51,8 +52,8 @@ function buildMeetingFilter(
 export async function getDistinctTopicsForSpeakerContributions(
     personId: string,
 ): Promise<Topic[]> {
-    const includeUnreleased = await shouldIncludeUnreleasedForPerson(personId);
-    const meetingFilter = buildMeetingFilter(includeUnreleased);
+    const unreleased = await unreleasedScopeForPerson(personId);
+    const meetingFilter = buildMeetingFilter(unreleased);
 
     const subjects = await prisma.subject.findMany({
         where: {
@@ -75,10 +76,10 @@ export async function getLatestContributionsForSpeaker(
     page: number = 1,
     pageSize: number = 5,
     topicId?: string | null,
-): Promise<{ results: ContributionForPerson[]; totalCount: number }> {
+): Promise<{ results: ContributionForPerson[]; total: number }> {
     const skip = (page - 1) * pageSize;
-    const includeUnreleased = await shouldIncludeUnreleasedForPerson(personId);
-    const meetingFilter = buildMeetingFilter(includeUnreleased);
+    const unreleased = await unreleasedScopeForPerson(personId);
+    const meetingFilter = buildMeetingFilter(unreleased);
 
     const whereClause: Prisma.SpeakerContributionWhereInput = {
         speakerId: personId,
@@ -88,28 +89,14 @@ export async function getLatestContributionsForSpeaker(
         },
     };
 
-    const [contributions, totalCount] = await Promise.all([
+    const [contributions, total] = await Promise.all([
         prisma.speakerContribution.findMany({
             where: whereClause,
             include: {
                 speaker: {
                     include: { roles: roleWithRelationsInclude },
                 },
-                subject: {
-                    select: {
-                        id: true,
-                        name: true,
-                        cityId: true,
-                        councilMeetingId: true,
-                        agendaItemIndex: true,
-                        nonAgendaReason: true,
-                        withdrawn: true,
-                        topic: true,
-                        councilMeeting: {
-                            include: { administrativeBody: true },
-                        },
-                    },
-                },
+                subject: { select: contributionSubjectSelect },
             },
             orderBy: [
                 { subject: { councilMeeting: { dateTime: 'desc' } } },
@@ -121,7 +108,7 @@ export async function getLatestContributionsForSpeaker(
         prisma.speakerContribution.count({ where: whereClause }),
     ]);
 
-    return { results: contributions, totalCount };
+    return { results: contributions, total };
 }
 
 export async function getLatestContributionsForParty(
@@ -129,10 +116,10 @@ export async function getLatestContributionsForParty(
     page: number = 1,
     pageSize: number = 5,
     administrativeBodyType?: AdministrativeBodyType | null,
-): Promise<{ results: ContributionForPerson[]; totalCount: number }> {
+): Promise<{ results: ContributionForPerson[]; total: number }> {
     const skip = (page - 1) * pageSize;
-    const includeUnreleased = await shouldIncludeUnreleasedForParty(partyId);
-    const meetingFilter = buildMeetingFilter(includeUnreleased, administrativeBodyType);
+    const unreleased = await unreleasedScopeForParty(partyId);
+    const meetingFilter = buildMeetingFilter(unreleased, administrativeBodyType);
 
     // A contribution belongs to the party if its speaker holds any role linking
     // them to the party. Mirrors getLatestSegmentsForParty (no date-bounded role
@@ -146,28 +133,14 @@ export async function getLatestContributionsForParty(
         },
     };
 
-    const [contributions, totalCount] = await Promise.all([
+    const [contributions, total] = await Promise.all([
         prisma.speakerContribution.findMany({
             where: whereClause,
             include: {
                 speaker: {
                     include: { roles: roleWithRelationsInclude },
                 },
-                subject: {
-                    select: {
-                        id: true,
-                        name: true,
-                        cityId: true,
-                        councilMeetingId: true,
-                        agendaItemIndex: true,
-                        nonAgendaReason: true,
-                        withdrawn: true,
-                        topic: true,
-                        councilMeeting: {
-                            include: { administrativeBody: true },
-                        },
-                    },
-                },
+                subject: { select: contributionSubjectSelect },
             },
             orderBy: [
                 { subject: { councilMeeting: { dateTime: 'desc' } } },
@@ -179,5 +152,5 @@ export async function getLatestContributionsForParty(
         prisma.speakerContribution.count({ where: whereClause }),
     ]);
 
-    return { results: contributions, totalCount };
+    return { results: contributions, total };
 }

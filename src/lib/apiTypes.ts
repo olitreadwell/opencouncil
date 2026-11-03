@@ -18,13 +18,13 @@ export interface TaskRequest {
 // Content language of the city a task runs for. Kept as a self-contained string
 // union (this file is the backend contract and has no Prisma imports); mirrors
 // the Prisma `CityLanguage` enum.
-export type CityLanguage = 'el' | 'fr' | 'sr';
+export type CityLanguage = 'el' | 'fr' | 'sr' | 'de' | 'nl' | 'it' | 'pl' | 'pt' | 'es' | 'fi' | 'ca' | 'sv' | 'gl' | 'bs' | 'en' | 'cy' | 'ga' | 'da' | 'no' | 'is' | 'et' | 'lv' | 'lt' | 'cs' | 'sk' | 'hu' | 'sl' | 'hr' | 'ro' | 'bg' | 'mk' | 'mt' | 'lb' | 'uk' | 'ru' | 'tr' | 'sq' | 'eu';
 
-// ISO 3166-1 alpha-2 code (uppercase) of the country a task's city is in. The
+// Uppercase country code (ISO 3166-1 alpha-2, plus XK for Kosovo). The
 // backend restricts geocoding of subject locations to it; without it everything
 // is geocoded as if it were in Greece. Comes from the city's realm, not its
 // language — see `getRealmCountry`.
-export type Country = 'GR' | 'FR' | 'CY' | 'RS';
+export type Country = 'GR' | 'FR' | 'CY' | 'RS' | 'AT' | 'BE' | 'FI' | 'DE' | 'IT' | 'NL' | 'PL' | 'PT' | 'ES' | 'BA' | 'AD' | 'AL' | 'BG' | 'CH' | 'CZ' | 'DK' | 'EE' | 'GB' | 'HR' | 'HU' | 'IE' | 'IS' | 'LI' | 'LT' | 'LU' | 'LV' | 'MC' | 'MD' | 'ME' | 'MK' | 'MT' | 'NO' | 'RO' | 'SE' | 'SI' | 'SK' | 'SM' | 'UA' | 'XK';
 
 /*
  * System endpoints
@@ -131,6 +131,43 @@ export interface ProcessAgendaRequest extends TaskRequest {
     cityLanguage: CityLanguage;
     country: Country;
     date: string;
+    /** The body that holds the meeting, so its meeting can be told from another one in the same agenda. */
+    administrativeBody?: { name?: string; type: 'council' | 'committee' | 'community' };
+    /** The meeting's start in the city's time (HH:MM): two meetings of one body on one day differ by the hour. */
+    time?: string;
+}
+
+/**
+ * A meeting as its invitation states it (processAgenda v7). Each value is
+ * null when the invitation does not state it, and carries the phrase it was
+ * read from. The unions mirror the Prisma `MeetingKind` and `MeetingFormat`;
+ * urgency is a flag, false when the invitation does not say urgent.
+ */
+export interface AgendaMeetingRecord {
+    kind: 'ordinary' | 'special' | 'accountability' | 'activityReport' | 'budget' | 'presidencyElection' | 'financialAccounts' | null;
+    kindEvidence: string | null;
+    /** Convened urgently («κατεπείγουσα», «έκτακτη»), for any kind. */
+    urgent: boolean;
+    urgentEvidence: string | null;
+    sessionNumber: number | null;
+    sessionNumberEvidence: string | null;
+    format: 'inPerson' | 'remote' | 'hybrid' | 'byCirculation' | null;
+    formatEvidence: string | null;
+}
+
+/** One of the meetings that an agenda calls, with how many of the returned subjects are its own. */
+export interface AgendaMeetingInAgenda extends AgendaMeetingRecord {
+    /** As printed, e.g. «ΔΗΜΟΣ ΧΑΛΑΝΔΡΙΟΥ». */
+    municipality: string | null;
+    bodyName: string | null;
+    /** Whether the printed body is this meeting's body; null when not printed. */
+    ofThisBody: boolean | null;
+    /** YYYY-MM-DD, as printed. */
+    date: string | null;
+    /** HH:MM, as printed. */
+    time: string | null;
+    subjectCount: number;
+    isThisMeeting: boolean;
 }
 
 export interface SubjectContext {
@@ -172,14 +209,33 @@ export interface Location {
 }
 
 export interface Subject {
-    id?: string;  // Optional ID assigned by backend (used for mapping utteranceDiscussionStatuses)
+    /**
+     * The id of the subject row. For a subject that already exists, the app sends
+     * the database id in `existingSubjects` and the task server hands it back, so
+     * `categorizeSubjectsForUpsert` keeps that row (issue 366). A new subject
+     * carries an id that the task server generates. `utteranceDiscussionStatuses`
+     * and `discussedIn` reference these ids.
+     */
+    id?: string;
     name: string;
     description: string;  // Markdown with special reference links: [text](REF:UTTERANCE:id), [text](REF:PERSON:id), [text](REF:PARTY:id)
+    /**
+     * What the body decided, in one or two plain sentences with no reference links,
+     * for the Πίνακας αποφάσεων. Null when the transcript shows no outcome. When the
+     * field is absent (an older task), the stored value stays as it is.
+     */
+    outcome?: string | null;
     /**
      * The item as written on the official agenda (#616). processAgenda sets it for
      * every subject. summarize never sets it. When the field is absent, the stored value stays as it is.
      */
     agendaItemTitle?: string | null;
+    /**
+     * The agenda section the item sits under (issue 366). processAgenda sets it for
+     * every subject; null means the agenda has one numbered list. summarize never
+     * sends it, and an absent field leaves the stored value alone.
+     */
+    agendaSection?: { index: number; title: string } | null;
     agendaItemIndex: number | "BEFORE_AGENDA" | "OUT_OF_AGENDA";
     introducedByPersonId: string | null;
 
@@ -202,6 +258,13 @@ export interface Subject {
 
 export interface ProcessAgendaResult {
     subjects: Subject[];
+    /** Absent before v7; null when the invitation could not be read. */
+    meetingRecord?: AgendaMeetingRecord | null;
+    /**
+     * Absent before v7. Every meeting the agenda calls; more than one means the
+     * subjects of other meetings are among `subjects`, since a record holds one meeting.
+     */
+    meetingsInAgenda?: AgendaMeetingInAgenda[];
 }
 
 /*
@@ -261,6 +324,9 @@ export interface RequestOnTranscript extends TaskRequest {
         speakerRole: string | null;
         speakerId: string | null;  // personId from voiceprint matching
         speakerSegmentId: string;
+        // The diarization speaker this segment belongs to. Every segment of one
+        // voice shares it, whether or not that voice has been matched to a person.
+        speakerTagId?: string;
         text: string;
         utterances: {
             text: string;
@@ -274,6 +340,17 @@ export interface RequestOnTranscript extends TaskRequest {
     cityLanguage: CityLanguage;
     country: Country;
     administrativeBodyName: string | null;
+    /**
+     * The people who may speak at the meeting: the one list of people the
+     * transcript tasks get. fixTranscript corrects names against it, and
+     * identifies speakers from it when segments carry speakerTagId.
+     */
+    people: RosterPerson[];
+    /**
+     * @deprecated The same people grouped by party, without the ones who have
+     * no party. A task server that predates `people` reads this. Remove it once
+     * every task server reads `people`.
+     */
     partiesWithPeople: {
         name: string;
         people: {
@@ -288,7 +365,56 @@ export interface RequestOnTranscript extends TaskRequest {
  * Fix Transcript
  */
 
-export interface FixTranscriptRequest extends RequestOnTranscript { }
+/** One of a meeting's people: someone who may speak at it, and so someone a speaker can be identified as. */
+export interface RosterPerson {
+    id: string;
+    name: string;
+    /** Roles held on the meeting date, the ones in the meeting's body first. */
+    role: string | null;
+    /** The party's name on the meeting date. */
+    party: string | null;
+    /** Leads that party: "the head of the party" is a common way to give the floor. */
+    partyHead?: boolean;
+    /** Holds an active role in the administrative body that is meeting. */
+    memberOfMeetingBody?: boolean;
+}
+
+/**
+ * The kind of cue a transcript identification rests on, strongest first.
+ * - named:          the speaker is given the floor by name, right before they speak
+ * - rollCall:       a name is read out and the speaker answers
+ * - selfIntroduced: the speaker states their own name or role
+ * - addressed:      others address the speaker by name or role title
+ * - roleBehaviour:  only what the speaker does (chairs, answers as the
+ *                   executive); no name or title is spoken
+ */
+export type SpeakerEvidenceKind = "named" | "rollCall" | "selfIntroduced" | "addressed" | "roleBehaviour";
+
+/**
+ * Who a diarization speaker is, judged from the transcript text alone (the
+ * chair giving the floor by name, roll calls, self-introductions). Independent
+ * of voiceprint matching: the caller reconciles the two.
+ */
+export interface SpeakerHint {
+    speakerTagId: string;
+    personId: string;
+    /**
+     * Whether the task would act on this identification by itself. The task
+     * decides, next to the prompt that produces the evidence, as it decides
+     * whether a voiceprint matched: the caller compares identities and never
+     * thresholds a number. A hint that is not actionable is a suggestion for a
+     * reviewer and nothing more.
+     */
+    actionable: boolean;
+    /** The strongest kind of evidence behind the identification; null when the model named none. */
+    evidenceKind: SpeakerEvidenceKind | null;
+    /** 0–100, the model's own number. For a reviewer to read, not a contract. */
+    confidence: number;
+    /** The decisive transcript line(s) with their timestamp, for a reviewer to check the name. */
+    evidence: string;
+}
+
+export type FixTranscriptRequest = RequestOnTranscript;
 
 export interface FixTranscriptResult {
     updateUtterances: {
@@ -296,6 +422,8 @@ export interface FixTranscriptResult {
         markUncertain: boolean;
         text: string;
     }[];
+    /** One entry per speaker the transcript identifies. Absent when the task did not run the identification. */
+    speakerHints?: SpeakerHint[];
 }
 
 /*
@@ -318,7 +446,9 @@ export interface SummarizeResult {
 
     subjects: Subject[];
 
-    utteranceDiscussionStatuses: {
+    // Optional because stored responses from before February 2026 lack it, and a
+    // replay hands them to the handler unvalidated.
+    utteranceDiscussionStatuses?: {
         utteranceId: string;
         status: DiscussionStatus;
         subjectId: string | null;  // only for SUBJECT_DISCUSSION and VOTE
@@ -407,25 +537,60 @@ export interface DecisionWarning {
     message: string;
 }
 
+export type VoteValue = 'FOR' | 'AGAINST' | 'ABSTAIN' | 'PRESENT' | 'DID_NOT_VOTE';
+
+/** The roll call as printed on one page, with the ids the names resolved to (task v4). */
+export interface DocumentRollCall {
+    layout: 'composition_and_absent' | 'present_and_absent';
+    composition: string[];
+    present: string[];
+    absent: string[];
+    presentIds: string[];
+    absentIds: string[];
+}
+
+/**
+ * What one document states, matched to ids — the mirror of opencouncil-tasks'
+ * ExtractedDecisionResult (task v4). The v3 fields stay optional so results
+ * stored by older task versions still parse; nothing derives from them.
+ */
 export interface ExtractedDecisionData {
     subjectId: string;
     excerpt: string;
     references: string;
-    presentMemberIds: string[];
-    absentMemberIds: string[];
-    mayorPresent?: boolean;
-    voteResult: string | null;
-    voteDetails: { personId: string; vote: 'FOR' | 'AGAINST' | 'ABSTAIN' | 'PRESENT' | 'DID_NOT_VOTE' }[];
-    unmatchedMembers: string[];
-    subjectInfo: { number: number; isOutOfAgenda: boolean } | null;
-    fromCache?: boolean;
-    warnings?: DecisionWarning[];
+    /** One or two plain sentences of what the document decides, for the Πίνακας αποφάσεων. Absent on readings stored before the field. */
+    summary?: string | null;
     /** The decision's own number (Αρ. Απόφασης / Πράξη), extracted from the document. */
     decisionNumber?: string | null;
-    /**
-     * @deprecated Older tasks versions sent the extracted decision number under this
-     * name. It was never Diavgeia's protocol number. Read for transition tolerance only.
-     */
+    subjectInfo: { number: number; isOutOfAgenda: boolean } | null;
+    /** The extractor did not reach ΑΠΟΦΑΣΙΖΕΙ (v4; v3 signals it through warnings). */
+    incomplete?: boolean;
+    rollCall?: DocumentRollCall | null;
+    mayorPresent?: boolean | { present: boolean; rawText: string } | null;
+    presidedBy?: { name: string; personId: string | null; rawText: string } | null;
+    /** Who kept the minutes in the secretary's place, when the page says so (task v4 from 2026-09-22). */
+    actingSecretary?: { name: string; personId: string | null; rawText: string } | null;
+    /** The item heading as printed; "" when the page prints none. Absent on readings stored before 2026-09-22. */
+    subjectHeading?: string;
+    /** The page's own list of who was present for THIS decision (ΤΑ ΜΕΛΗ after the decision text), never the opening roll call (v4). */
+    decisionAttendance?: { present: string[]; presentIds: string[]; rawText: string } | null;
+    voteResult: string | null;
+    voteTally?: Record<VoteValue, number | null>;
+    voteDetails: { personId: string; name?: string; vote: VoteValue }[];
+    /** The changes this document states (v4): arrivals, departures and per-vote absences (`absent_for_vote`). A reading stored before `absent_for_vote` holds a per-vote absence as a departure/arrival pair. */
+    attendanceChanges?: PollDecisionsAttendanceEvent[];
+    unmatchedMembers: string[];
+    /** How each name was matched (task v4 from C1); absent on older readings. */
+    nameMatches?: { name: string; personId: string | null; method: 'token' | 'llm' | null }[];
+    fromCache?: boolean;
+    warnings?: DecisionWarning[];
+    /** @deprecated task v3: replayed snapshot; ignored. */
+    presentMemberIds?: string[];
+    /** @deprecated task v3: replayed snapshot; ignored. */
+    absentMemberIds?: string[];
+    /** @deprecated task v3; ignored. */
+    absentForVoteIds?: string[];
+    /** @deprecated Diavgeia's protocol number is mirrored at match time. */
     protocolNumber?: string | null;
     /** Metadata fetched from Diavgeia API for needsExtraction subjects */
     diavgeiaTitle?: string;
@@ -452,7 +617,7 @@ export interface PollDecisionsRequest extends TaskRequest {
         agendaItemIndex: number | null;
         nonAgendaReason: string | null;
         existingDecision?: {
-            ada: string;
+            ada?: string; // absent for a decision that is not on Diavgeia
             decisionTitle: string;
             pdfUrl: string;
             needsExtraction?: boolean;
@@ -465,10 +630,20 @@ export interface PollDecisionsRequest extends TaskRequest {
     /**
      * Reading-cache handshake, scoped by the WINDOW, not the meeting: every
      * DecisionCandidate the city holds whose publishDate falls inside the poll
-     * window. Presence + readStatus decide whether tasks reads again;
-     * meetingDate decides which partition the decision belongs to.
+     * window, plus this meeting's own open candidates (`own`). Presence +
+     * readStatus decide whether tasks reads again; meetingDate decides which
+     * partition the decision belongs to. Tasks fetches an `own` candidate that
+     * its window does not return.
      */
-    knownDecisions?: Array<{ ada: string; meetingDate: string | null; readStatus: string }>;
+    knownDecisions?: Array<{ ada: string; meetingDate: string | null; readStatus: string; own?: boolean }>;
+    /** The body's conventions rendered as sentences for the prompt; opencouncil owns the glossary. */
+    conventionsText?: string | null;
+    /**
+     * false = match and link only, read no page: the body has no conventions
+     * record. Absent = extract, for a request from an older app.
+     */
+    extract?: boolean;
+    lookupAdas?: string[]; // typed ΑΔΑ values, fetched outside the poll scope
 }
 
 /**
@@ -504,6 +679,55 @@ export interface PollDecisionsMatch {
     reasoning?: string | null; // resolver's stated reasoning for this match
 }
 
+/**
+ * Token usage a task reports with its result. Mirrors opencouncil-tasks
+ * `TaskTokenUsage` in `src/types.ts`: one shape for every task, so the two
+ * results that carry it cannot drift apart one field at a time.
+ */
+export interface TaskTokenUsage {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens: number;
+    cache_read_input_tokens: number;
+}
+
+export interface PollDecisionsAttendanceEvent {
+    personId: string | null;
+    name: string;
+    /**
+     * `absent_for_vote`: the page states the member was out of the room for a
+     * vote — this page's decision (anchor `subject` or `this_document`), or the
+     * range of decisions the anchor names (`decision_number` to `decisionNumberTo`).
+     * A reading stored before this value existed carries it as a departure before
+     * and an arrival after the page's own subject, with one rawText.
+     */
+    type: 'arrival' | 'departure' | 'absent_for_vote';
+    anchor: {
+        kind: 'agenda_item' | 'decision_number' | 'subject' | 'phase' | 'session_start' | 'session_end' | 'clock_time' | 'session_phase' | 'this_document';
+        agendaItemIndex: number | null;
+        nonAgendaReason: 'outOfAgenda' | null;
+        decisionNumber: string | null;
+        /** The last decision of a range the page names («στις με αρ. 31 – 40»), for kind `decision_number`; absent or null otherwise. */
+        decisionNumberTo?: string | null;
+        /** The document's own subject, for kind `subject`. */
+        subjectId?: string | null;
+        phase: 'pre_agenda' | 'out_of_agenda' | string | null;
+        timing: 'before' | 'during' | 'after' | null;
+    };
+    rawText: string;
+    reportingPdfCount: number;
+    totalPdfCount: number;
+}
+
+/** What the tasks server found for one typed ΑΔΑ. */
+export interface PollDecisionsLookup {
+    ada: string;
+    outcome: 'found' | 'not_found' | 'error';
+    organizationId: string | null;
+    /** Set only when the document belongs to another organization than the city's. */
+    organizationLabel: string | null;
+}
+
 export interface PollDecisionsResult {
     /** Every decision read in the poll window. Absent from older tasks versions. */
     decisions?: PollDecisionsReadDecision[];
@@ -529,23 +753,8 @@ export interface PollDecisionsResult {
     extractions: {
         decisions: ExtractedDecisionData[];
         warnings: string[];
-        /** Initial roll call — who was present/absent at session start (meeting-level, not per-subject) */
-        initialAttendance?: { personId: string; status: 'PRESENT' | 'ABSENT' }[];
-        /** Names from the initial roll call that couldn't be matched to any person in the database */
-        unmatchedInitialAttendance?: string[];
-        /** Effective attendance for subjects WITHOUT linked decisions */
-        nonDecisionSubjectAttendance?: Array<{
-            subjectId: string;
-            presentMemberIds: string[];
-            absentMemberIds: string[];
-        }>;
     } | null;
-    costs: {
-        input_tokens: number;
-        output_tokens: number;
-        cache_creation_input_tokens: number;
-        cache_read_input_tokens: number;
-    };
+    usage: TaskTokenUsage;
     metadata?: {
         diavgeiaUid: string;
         query: object;
@@ -554,4 +763,5 @@ export interface PollDecisionsResult {
         unmatchedCount: number;
         ambiguousCount: number;
     };
+    lookups?: PollDecisionsLookup[]; // absent from older tasks versions and from polls with no lookupAdas
 }

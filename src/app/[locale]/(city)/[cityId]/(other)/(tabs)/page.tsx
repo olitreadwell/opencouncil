@@ -6,9 +6,9 @@ import { MeetingsTimeline } from "@/components/cities/overview/MeetingsTimeline"
 import { HotTopicsCard } from "@/components/cities/overview/HotTopicsCard";
 import { CouncilBand } from "@/components/cities/overview/CouncilBand";
 import { getAdministrativeBodiesWithPublicMeetingsCached, getCityCached, getCouncilMeetingsPreviewPublicCached, getPartiesForCityCached, getPeopleForCityCached } from "@/lib/cache";
-import { HOT_PERIODS, HOT_SCOPES, periodStart, readPeriod, readScope, type HotScope } from "@/lib/utils/hotTopicFilters";
+import { HOT_PERIODS, HOT_SCOPES, isBeyondPeriod, readPeriod, readScope, type HotScope } from "@/lib/utils/hotTopicFilters";
 import { getHotSubjectCardsCached } from "@/lib/hotSubjectCards";
-import { buildCanonicalAlternates } from "@/lib/utils/hreflang";
+import { withCanonicalUrl } from "@/lib/utils/hreflang";
 import { getLocalizedName } from "@/lib/formatters/name";
 import { getOgLocale } from '@/i18n/config';
 import { getTranslations } from 'next-intl/server';
@@ -38,18 +38,17 @@ export async function generateMetadata(
     const t = await getTranslations({ locale, namespace: 'metadata.city' });
 
     if (!city) {
-        return {
+        return withCanonicalUrl(`/${cityId}`, {
             title: t('notFoundTitle'),
             description: t('notFoundDescription'),
-            alternates: await buildCanonicalAlternates(`/${cityId}`),
-        };
+        });
     }
 
     const cityName = getLocalizedName(city, locale);
     const description = t('description', { cityName });
     const ogImageUrl = buildOgImageUrl(locale, { cityId });
 
-    return {
+    return withCanonicalUrl(`/${cityId}`, {
         title: `${cityName} | OpenCouncil`,
         description,
         keywords: [cityName, ...(t.raw('keywords') as string[]), "OpenCouncil"],
@@ -75,8 +74,7 @@ export async function generateMetadata(
             description,
             images: [ogImageUrl],
         },
-        alternates: await buildCanonicalAlternates(`/${cityId}`),
-    };
+    });
 }
 
 /**
@@ -159,11 +157,7 @@ export default async function CityOverviewPage(
     // The ranking falls back to the most recent meetings when the chosen period
     // holds none — say so rather than letting the dates quietly contradict the
     // picker.
-    const windowStart = periodStart(period);
-    const beyondPeriod =
-        windowStart !== null &&
-        hotSubjects.length > 0 &&
-        hotSubjects.every(card => new Date(card.meeting.dateTime) < windowStart);
+    const beyondPeriod = isBeyondPeriod(period, hotSubjects.map(card => card.meeting.dateTime));
 
     // One instant for every card on this page, so the server render and the
     // hydration that follows it judge each meeting's stage against the same clock.

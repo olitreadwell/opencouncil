@@ -4,10 +4,14 @@ import { CouncilMeeting, SpeakerSegment } from "@prisma/client";
 import { Utterance as ApiUtterance } from "../apiTypes";
 import prisma from "../db/prisma";
 import { withUserAuthorizedToEdit } from "../auth";
-import { buildUnknownSpeakerLabel } from "../utils";
+import { buildUnknownSpeakerLabel } from "@/lib/utils/unknownSpeakerLabel";
 import { requestTranscribeInternal, deleteExistingSpeakerData } from "./transcribeInternal";
 import { requestFixTranscriptInternal } from "./fixTranscriptInternal";
 import { autoTriggerTask } from "./autoTrigger";
+import { meetingLabelInCity } from '@/lib/meetingName';
+import { ConflictError, NotFoundError } from '@/lib/api/errors';
+import { webUrl } from '@/lib/zod-schemas/primitives';
+import { PipelineBusyError, TaskAlreadyExistsError, taskScope } from './types';
 
 // Full-precision doubles are near-incompressible and inflate the meeting page
 // payload; 4 significant figures is far finer than the ASR signal warrants.
@@ -16,13 +20,33 @@ const round4 = (v: number | null | undefined) => (v == null ? null : Number(v.to
 /**
  * Public entry point for transcription. Authorizes the caller, then delegates to
  * requestTranscribeInternal (which the unauthenticated poll-livestreams cron also calls).
+ * A refusal comes back as a value: production Next hides the message of an
+ * error that a Server Action throws.
  */
 export async function requestTranscribe(youtubeUrl: string, councilMeetingId: string, cityId: string, options: {
     force?: boolean;
-} = {}) {
-    await withUserAuthorizedToEdit({ cityId });
+} = {}): Promise<{ ok: true } | { ok: false; message: string }> {
+    await withUserAuthorizedToEdit(taskScope({ type: 'transcribe', cityId, councilMeetingId }));
 
-    return requestTranscribeInternal(youtubeUrl, councilMeetingId, cityId, options);
+    // The URL reaches yt-dlp on the task server and the public meeting page,
+    // so the same rule as the REST and MCP paths applies: http(s) only.
+    const mediaUrl = webUrl().safeParse(youtubeUrl);
+    if (!mediaUrl.success) {
+        return { ok: false, message: 'The media URL must start with http:// or https://' };
+    }
+
+    try {
+        await requestTranscribeInternal(mediaUrl.data, councilMeetingId, cityId, options);
+        return { ok: true };
+    } catch (error) {
+        // Every refusal that an admin can act on comes back as a value:
+        // production Next hides the message of an error that a Server Action throws.
+        if (error instanceof ConflictError || error instanceof NotFoundError
+            || error instanceof PipelineBusyError || error instanceof TaskAlreadyExistsError) {
+            return { ok: false, message: error.message };
+        }
+        throw error;
+    }
 }
 
 export async function handleTranscribeResult(taskId: string, response: TranscribeResult, options?: { force?: boolean }) {
@@ -39,9 +63,12 @@ export async function handleTranscribeResult(taskId: string, response: Transcrib
                 include: {
                     city: {
                         select: {
-                            name_en: true
+                            name_en: true,
+                            timezone: true,
+                            realm: true,
                         }
                     },
+                    administrativeBody: { select: { name: true, name_en: true } },
                     speakerSegments: {
                         select: {
                             id: true
@@ -84,9 +111,10 @@ export async function handleTranscribeResult(taskId: string, response: Transcrib
     const transactionStartTime = Date.now();
 
     await prisma.$transaction(async (tx) => {
-        // Delete existing data only when force=true. No UI flow reaches this handler
-        // with force=false while segments exist (the admin Reprocess dialog always
-        // deletes first); the preserve-and-log branch below is a defensive fallback.
+        // Delete existing data only when force=true, which the callback route
+        // reads from the stored request. The request itself refuses a re-run
+        // without force while segments exist, so the preserve-and-log branch
+        // below is a defensive fallback.
         // Note: We delete SpeakerTags (not SpeakerSegments) because the cascade relationship
         // goes from SpeakerTag -> SpeakerSegment, so deleting SpeakerTags will automatically
         // delete their associated SpeakerSegments via onDelete: Cascade
@@ -100,7 +128,7 @@ export async function handleTranscribeResult(taskId: string, response: Transcrib
         const speakerTags = new Map<number, string>();
         let identifiedSpeakersCount = 0;
         let unknownCounter = 1;
-        const nextUnknownLabel = () => buildUnknownSpeakerLabel(unknownCounter++);
+        const nextUnknownLabel = () => buildUnknownSpeakerLabel(unknownCounter++, task.councilMeeting.city.realm);
 
         // Process speaker identification results
         if (response.transcript.transcription.speakers && response.transcript.transcription.speakers.length > 0) {
@@ -146,8 +174,23 @@ export async function handleTranscribeResult(taskId: string, response: Transcrib
                         label: isMatched
                             ? `SPEAKER_${speakerId}`
                             : nextUnknownLabel(),
-                        // Only connect if we verified the person exists
-                        ...(isMatched ? { person: { connect: { id: matchInfo.match! } } } : {})
+                        // Only connect if we verified the person exists. The match is
+                        // also kept as the tag's voiceprint identification, which stays
+                        // as it is when a reviewer or the transcript later changes the
+                        // person. The task server decided it is a match, so it is one
+                        // the method acts on.
+                        ...(isMatched ? {
+                            person: { connect: { id: matchInfo.match! } },
+                            personSetBy: 'voiceprint' as const,
+                            identifications: {
+                                create: {
+                                    method: 'voiceprint' as const,
+                                    personId: matchInfo.match!,
+                                    actionable: true,
+                                    confidence: matchInfo.confidence[matchInfo.match!] ?? null,
+                                },
+                            },
+                        } : {})
                     }
                 });
 
@@ -238,7 +281,7 @@ export async function handleTranscribeResult(taskId: string, response: Transcrib
             cityId: task.cityId,
             meetingId: task.councilMeetingId,
             cityName: task.councilMeeting.city.name_en,
-            meetingName: task.councilMeeting.name_en,
+            meetingName: meetingLabelInCity(task.councilMeeting, 'en'),
             source: { taskType: 'transcribe', taskId },
         },
         () => requestFixTranscriptInternal(task.councilMeetingId, task.cityId, { force: true })

@@ -1,97 +1,63 @@
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { ChevronDown, MessageCircle } from "lucide-react";
-import PermalinkButton from "./PermalinkButton";
-import AISummaryCard from "./AISummaryCard";
+import { ChevronDown } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { smallActionClass, ViewLink } from "./views/ui";
 import MarkdownContent from "./MarkdownContent";
-import CommentSection from "./CommentSection";
-import { Article, ReferenceFormat, RegulationData, CurrentUser } from "./types";
-import { ConsultationCommentWithUpvotes } from "@/lib/db/consultations";
+import { Article, ReferenceFormat, RegulationData } from "./types";
 
 interface ArticleViewProps {
     article: Article;
-    baseUrl: string;
     isExpanded: boolean;
     onToggle: () => void;
     referenceFormat?: ReferenceFormat;
     onReferenceClick?: (referenceId: string) => void;
     regulationData?: RegulationData;
-    comments?: ConsultationCommentWithUpvotes[];
-    currentUser?: CurrentUser;
-    consultationId?: string;
-    cityId?: string;
-    consultationIsActive?: boolean;
+    commentCount: number;
+    commentHref: string;
+    active: boolean;
 }
 
+/** An article inside its chapter's card: its number and title open the text and its comment button. */
 export default function ArticleView({
     article,
-    baseUrl,
     isExpanded,
     onToggle,
     referenceFormat,
     onReferenceClick,
     regulationData,
-    comments,
-    currentUser,
-    consultationId,
-    cityId,
-    consultationIsActive = true
+    commentCount,
+    commentHref,
+    active
 }: ArticleViewProps) {
-    // Count comments for this article
-    const articleCommentCount = comments?.filter(comment =>
-        comment.entityType === 'ARTICLE' && comment.entityId === article.id
-    ).length || 0;
     return (
-        <div id={article.id} className="pl-3 md:pl-6 border-l-2 border-muted">
+        <div id={article.id} className="scroll-mt-16 border-t border-stone-100 sm:scroll-mt-24">
             <Collapsible open={isExpanded} onOpenChange={onToggle}>
-                <div className="flex items-start justify-between w-full py-2 group">
-                    <CollapsibleTrigger className="flex items-start justify-between w-full text-left hover:opacity-80 transition-opacity mr-2">
-                        <div className="flex-1">
-                            <div className="text-xs text-muted-foreground font-medium mb-1 uppercase tracking-wider">
-                                ΑΡΘΡΟ {article.num}
-                            </div>
-                            <h3 className="font-semibold text-base md:text-lg mb-1 md:mb-2">{article.title}</h3>
-                        </div>
-                        <div className="flex items-center gap-2 self-center">
-                            <div className="flex items-center gap-1 text-xs text-muted-foreground">
-                                <MessageCircle className="h-3 w-3" />
-                                <span className="font-medium">{articleCommentCount}</span>
-                            </div>
-                            <ChevronDown className={`h-4 w-4 shrink-0 transition-transform text-muted-foreground ${isExpanded ? 'rotate-180' : ''}`} />
-                        </div>
+                <h3 className="m-0">
+                    <CollapsibleTrigger className="flex w-full items-center gap-3 px-5 py-3.5 text-left hover:bg-stone-50">
+                        <span className="min-w-0 flex-1">
+                            <span className="block text-[13px] font-normal text-stone-600">Άρθρο {article.num}</span>
+                            <span className="block text-[17px] font-semibold leading-snug">{article.title}</span>
+                        </span>
+                        {commentCount > 0 && (
+                            <span className="shrink-0 text-[13px] font-normal text-stone-600">{commentCount} {commentCount === 1 ? 'σχόλιο' : 'σχόλια'}</span>
+                        )}
+                        <ChevronDown className={cn("h-[18px] w-[18px] shrink-0 text-stone-500 transition-transform", isExpanded && "rotate-180")} aria-hidden="true" />
                     </CollapsibleTrigger>
-                    <div className="flex items-center self-center">
-                        <PermalinkButton entityId={article.id} view="document" />
-                    </div>
-                </div>
+                </h3>
 
-                {/* AI Summary Card - outside collapsible trigger for full width */}
-                {article.summary && (
-                    <div className="mt-1 md:mt-2 mb-2">
-                        <AISummaryCard summary={article.summary} />
-                    </div>
-                )}
-
-                <CollapsibleContent className="pt-3 md:pt-4 pb-2">
+                <CollapsibleContent className="px-5 pb-4">
                     <MarkdownContent
                         content={article.body}
+                        className="text-[17px] text-stone-700"
                         referenceFormat={referenceFormat}
                         onReferenceClick={onReferenceClick}
                         regulationData={regulationData}
                     />
-
-                    {/* Comment Section */}
-                    <CommentSection
-                        entityType="article"
-                        entityId={article.id}
-                        entityTitle={article.title}
-                        contactEmail={regulationData?.contactEmail}
-                        comments={comments}
-                        consultationId={consultationId}
-                        cityId={cityId}
-                        consultationIsActive={consultationIsActive}
-                    />
+                    <ViewLink href={commentHref} className={cn(smallActionClass, "mt-3 inline-flex")}>
+                        {active ? 'Σχολιάστε αυτό το άρθρο' : 'Τα σχόλια'}{commentCount > 0 ? ` (${commentCount})` : ''}
+                    </ViewLink>
                 </CollapsibleContent>
             </Collapsible>
         </div>
     );
-} 
+}

@@ -2,11 +2,11 @@ import { NextResponse } from 'next/server'
 import { revalidatePath, revalidateTag } from 'next/cache'
 import { uploadFile } from '@/lib/s3'
 import { getPerson, editPerson, deletePerson } from '@/lib/db/people'
-import { getPartiesForCity } from '@/lib/db/parties'
-import { getAdministrativeBodiesForCity } from '@/lib/db/administrativeBodies'
-import { Role } from '@prisma/client'
-import { isUserAuthorizedToEdit } from '@/lib/auth'
-import { validateRoles } from '@/lib/utils/roles'
+import { validatePersonRoles } from '@/lib/db/personRoles'
+import { parseFormData, readFormData } from '@/lib/api/form-data-parser'
+import { personUpdateFormDataSchema, type PersonUpdateFormDataOutput } from '@/lib/zod-schemas/person'
+import { isUserAuthorizedToEdit, getRoleLimitForCity, getCurrentUser } from '@/lib/auth'
+import { handleApiError, notAuthorizedErrorResponse } from '@/lib/api/errors'
 
 export async function GET(
     request: Request,
@@ -24,55 +24,21 @@ export async function PUT(
     const params = await props.params;
     const authorizedToEdit = await isUserAuthorizedToEdit({ personId: params.personId })
     if (!authorizedToEdit) {
-        return new NextResponse("Unauthorized", { status: 401 });
+        return notAuthorizedErrorResponse(Boolean(await getCurrentUser()));
     }
     console.log(`Updating person ${params.personId}`)
-    let formData: FormData;
+    let data: PersonUpdateFormDataOutput
     try {
-        console.log('About to parse form data...', {
-            contentType: request.headers.get('content-type'),
-            method: request.method,
-            bodyUsed: request.bodyUsed
-        })
-        formData = await request.formData()
-        console.log('Form data received')
+        data = parseFormData(await readFormData(request), personUpdateFormDataSchema)
     } catch (error) {
-        console.error('Error parsing form data:', error)
-        return NextResponse.json({ error: 'Failed to parse form data' }, { status: 400 })
+        return handleApiError(error, 'Failed to parse form data')
     }
+    const { name, name_en, name_short, name_short_en, image, removeImage, profileUrl, roles } = data
 
-    // Log received data
-    console.log('Received form data fields:', Array.from(formData.keys()))
-
-    const name = formData.get('name') as string
-    const name_en = formData.get('name_en') as string
-    const name_short = formData.get('name_short') as string
-    const name_short_en = formData.get('name_short_en') as string
-    const image = formData.get('image') as File | null
-    const removeImage = formData.get('removeImage') === 'true'
-    const profileUrl = formData.get('profileUrl') as string
-    const rolesJson = formData.get('roles') as string
-    console.log('Raw roles JSON:', rolesJson)
-    let roles: Role[];
-
-    try {
-        roles = JSON.parse(rolesJson) as Role[]
-        console.log('Parsed roles:', roles)
-
-        // Validate roles
-        console.log('Starting role validation...')
-        // Get valid parties and administrative bodies for this city
-        const [parties, adminBodies] = await Promise.all([
-            getPartiesForCity(params.cityId),
-            getAdministrativeBodiesForCity(params.cityId)
-        ]);
-        console.log('Got parties and admin bodies')
-
-        const validPartyIds = new Set(parties.map(p => p.id));
-        const validAdminBodyIds = new Set(adminBodies.map(a => a.id));
-
-        // Validate roles using shared helper
-        const validationError = validateRoles(roles, params.cityId, validPartyIds, validAdminBodyIds);
+    // Absent roles stay as they are: a person who claimed their own page
+    // edits name and photo only, and their form sends no roles.
+    if (roles !== undefined) try {
+        const validationError = await validatePersonRoles(params.cityId, roles, await getRoleLimitForCity(params.cityId));
         if (validationError) {
             console.log('Validation failed:', validationError);
             return NextResponse.json(validationError, { status: 400 });
@@ -85,7 +51,7 @@ export async function PUT(
 
     let imageUrl: string | undefined = undefined
 
-    if (image && image instanceof File) {
+    if (image) {
         try {
             const result = await uploadFile(image, { prefix: 'person-images' })
             imageUrl = result.url
@@ -128,9 +94,9 @@ export async function DELETE(
     props: { params: Promise<{ cityId: string, personId: string }> }
 ) {
     const params = await props.params;
-    const authorizedToDelete = await isUserAuthorizedToEdit({ personId: params.personId })
+    const authorizedToDelete = await isUserAuthorizedToEdit({})
     if (!authorizedToDelete) {
-        return new NextResponse("Unauthorized", { status: 401 });
+        return notAuthorizedErrorResponse(Boolean(await getCurrentUser()));
     }
     try {
         await deletePerson(params.personId)

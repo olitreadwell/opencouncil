@@ -1,10 +1,12 @@
 import { el } from 'date-fns/locale';
 import { formatInTimeZone } from 'date-fns-tz';
 import { Document, Paragraph, TextRun, HeadingLevel, ExternalHyperlink, Packer, AlignmentType } from 'docx';
-import { getSpeakerDisplayInfo, simplifyRoleName, formatTimestamp } from '@/lib/utils';
+import { formatTimestamp } from '@/lib/utils';
+import { getSpeakerLabels, type RoleTitles } from '@/lib/utils/roles';
 import { getShortName } from '@/lib/formatters/name';
 import { MeetingDataForExport } from '@/lib/export/meetings';
 import { getRealmDomain } from '@/lib/realm';
+import { meetingLabel } from '@/lib/meetingName';
 
 const createTitlePage = ({ meeting, city }: Pick<MeetingDataForExport, 'meeting' | 'city'>) => {
     return [
@@ -16,7 +18,7 @@ const createTitlePage = ({ meeting, city }: Pick<MeetingDataForExport, 'meeting'
             spacing: { after: 400 },
             children: [
                 new TextRun({
-                    text: meeting.name,
+                    text: meetingLabel(meeting, 'el', city.timezone),
                     size: 32, // 16pt
                     bold: true
                 })
@@ -79,7 +81,7 @@ const createTitlePage = ({ meeting, city }: Pick<MeetingDataForExport, 'meeting'
     ];
 };
 
-const createTranscriptSection = ({ transcript, people, meeting }: Pick<MeetingDataForExport, 'transcript' | 'people' | 'meeting'>) => {
+const createTranscriptSection = ({ transcript, people, meeting }: Pick<MeetingDataForExport, 'transcript' | 'people' | 'meeting'>, roleTitles: RoleTitles) => {
     const paragraphs = [
         new Paragraph({
             heading: HeadingLevel.HEADING_1,
@@ -94,16 +96,11 @@ const createTranscriptSection = ({ transcript, people, meeting }: Pick<MeetingDa
     transcript.forEach((speakerSegment) => {
         const speaker = speakerSegment.speakerTag.personId ? people.find(p => p.id === speakerSegment.speakerTag.personId) : null;
         const speakerName = speaker ? (speaker.name_short || getShortName(speaker.name)) : speakerSegment.speakerTag.label;
-        const { party, role, isPartyHead } = speaker
-            ? getSpeakerDisplayInfo(speaker.roles || [], new Date(meeting.dateTime))
-            : { party: null, role: null, isPartyHead: false };
+        const { partyLabel, role } = getSpeakerLabels(speaker?.roles ?? [], roleTitles, new Date(meeting.dateTime));
 
-        const partyLabel = party
-            ? isPartyHead ? `(${party.name_short}, Επικεφαλής) ` : `(${party.name_short}) `
-            : '';
         const children = [
             new TextRun({
-                text: `${speakerName} ${partyLabel}`,
+                text: `${speakerName} ${partyLabel ? `(${partyLabel}) ` : ''}`,
                 bold: true,
                 size: 24 // 12pt
             }),
@@ -111,7 +108,7 @@ const createTranscriptSection = ({ transcript, people, meeting }: Pick<MeetingDa
 
         if (role) {
             children.push(new TextRun({
-                text: `${simplifyRoleName(role.name)} `,
+                text: `${role} `,
                 size: 20, // 10pt
                 color: '666666'
             }));
@@ -139,11 +136,12 @@ const createTranscriptSection = ({ transcript, people, meeting }: Pick<MeetingDa
     return paragraphs;
 };
 
-export const renderDocx = async ({ meeting, transcript, people, city }: MeetingDataForExport) => {
+/** `roleTitles` in the city's language: the municipality reads this document. */
+export const renderDocx = async ({ meeting, transcript, people, city }: MeetingDataForExport, roleTitles: RoleTitles) => {
     const doc = new Document({
         creator: "OpenCouncil",
         description: "Council Meeting Transcript",
-        title: meeting.name,
+        title: meetingLabel(meeting, 'el', city.timezone),
         subject: "Council Meeting",
         keywords: ["council", "meeting", "transcript"].join(", "),
         lastModifiedBy: "OpenCouncil",
@@ -151,7 +149,7 @@ export const renderDocx = async ({ meeting, transcript, people, city }: MeetingD
             properties: {},
             children: [
                 ...createTitlePage({ meeting, city }),
-                ...createTranscriptSection({ transcript, people, meeting }),
+                ...createTranscriptSection({ transcript, people, meeting }, roleTitles),
             ],
         }],
     });

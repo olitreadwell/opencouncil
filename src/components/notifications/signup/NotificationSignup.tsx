@@ -4,7 +4,6 @@ import { useEffect, useRef, useState } from 'react';
 import type { Topic } from '@prisma/client';
 import { useTranslations } from 'next-intl';
 import { SignupFooter, SignupLayout, SignupProgress } from '@/components/signup/SignupChrome';
-import { draftKey } from '@/components/signup/signup-draft';
 import { SIGN_IN_LINK_SENT, failureKind, saveErrorKey } from '@/components/signup/signup-shared';
 import { useSignupFlow } from '@/components/signup/useSignupFlow';
 import { saveNotificationPreferences } from '@/lib/actions/notifications';
@@ -18,6 +17,7 @@ import { CompleteAside, CompleteScreen } from './CompleteScreen';
 import { IntroAside, IntroStep } from './IntroStep';
 import { PreferencesAside, PreferencesStep } from './PreferencesStep';
 import { SignupSummary } from './SignupSummary';
+import { useNearbySubjects } from './useNearbySubjects';
 import {
     type ExistingPreference,
     type NotisStatus,
@@ -34,27 +34,17 @@ import {
 const TOTAL_STEPS = 3;
 
 /**
- * What a kept draft may put back. The step comes from the URL, not the
- * draft. The account fields belong to the session once there is one. The
- * WhatsApp tick is Notis's answer and is never restored — a stale tick over
- * his could resubscribe a reader who said ΣΤΟΠ.
+ * What a kept draft may put back of this flow's own fields. The step comes
+ * from the URL, not the draft, and the account fields are the hook's rule
+ * (see useSignupFlow). The WhatsApp tick is Notis's answer and is never
+ * restored — a stale tick over his could resubscribe a reader who said ΣΤΟΠ.
  */
-function notificationsDraft(cityId: string, signedIn: boolean) {
+function applyNotificationsDraft(state: SignupState, stored: Partial<SignupState>): SignupState {
     return {
-        key: draftKey('notifications', cityId),
-        apply: (state: SignupState, stored: Partial<SignupState>): SignupState => ({
-            ...state,
-            locations: stored.locations ?? state.locations,
-            topics: stored.topics ?? state.topics,
-            emailChannel: stored.emailChannel ?? state.emailChannel,
-            ...(signedIn
-                ? {}
-                : {
-                      name: stored.name ?? state.name,
-                      email: stored.email ?? state.email,
-                      phone: stored.phone ?? state.phone,
-                  }),
-        }),
+        ...state,
+        locations: stored.locations ?? state.locations,
+        topics: stored.topics ?? state.topics,
+        emailChannel: stored.emailChannel ?? state.emailChannel,
     };
 }
 
@@ -77,6 +67,7 @@ export function NotificationSignup({
     pickerQuery,
     existing,
     account,
+    googleAvailable,
 }: {
     city: CityWithGeometry;
     topics: Topic[];
@@ -85,6 +76,8 @@ export function NotificationSignup({
     pickerQuery: string;
     existing: ExistingPreference | null;
     account: SignupAccount | null;
+    /** Whether the account fields offer "Continue with Google" (see googleSignInAvailable). */
+    googleAvailable: boolean;
 }) {
     const t = useTranslations('notificationSignup');
     const ts = useTranslations('signup');
@@ -97,7 +90,7 @@ export function NotificationSignup({
         // Nothing is kept for a reader who is editing what they already
         // saved: the server's answers are the truth, and a draft from an
         // abandoned session would put yesterday's places over them.
-        draft: existing ? undefined : notificationsDraft(city.id, signedIn),
+        draft: existing ? undefined : { flow: 'notifications', account, apply: applyNotificationsDraft },
     });
     const { state, patch, goTo, edited, done, submitting, attempted, failures, saveError, validity, setPhoneValidity } = flow;
 
@@ -138,6 +131,10 @@ export function NotificationSignup({
     const channelLocked = notisPending || phoneChannelLocked(notisStatus);
     const issues = attempted ? channelIssues(state, validity) : [];
     const failure = failureKind(issues, saveError);
+
+    // One request for the step and its aside, about the place added last.
+    const latestPlace = state.locations.length > 0 ? state.locations[state.locations.length - 1] : null;
+    const nearby = useNearbySubjects(city.id, state.step === 2 ? latestPlace : null);
 
     const submit = () =>
         flow.submit(async () => {
@@ -211,7 +208,7 @@ export function NotificationSignup({
         state.step === 1 ? (
             <IntroAside city={city} />
         ) : state.step === 2 ? (
-            <PreferencesAside city={city} locations={state.locations} />
+            <PreferencesAside city={city} locations={state.locations} nearby={nearby} />
         ) : (
             <SignupSummary city={city} state={state} onEdit={() => goTo(2)} />
         );
@@ -232,6 +229,7 @@ export function NotificationSignup({
                     topics={topics}
                     locations={state.locations}
                     selectedTopics={state.topics}
+                    nearby={nearby}
                     onLocationsChange={(locations: Location[]) => patch({ locations })}
                     onTopicsChange={(selected: Topic[]) => patch({ topics: selected })}
                 />
@@ -244,6 +242,11 @@ export function NotificationSignup({
                     submitting={submitting}
                     state={state}
                     signedIn={signedIn}
+                    googleAvailable={googleAvailable}
+                    onGoogleStart={() => {
+                        flow.stashPhoneForGoogle();
+                        captureEvent('notification_signup_google_started', { city_id: city.id });
+                    }}
                     phoneChannelLocked={channelLocked}
                     phoneChannelPending={notisPending}
                     issues={issues}
@@ -260,8 +263,16 @@ export function NotificationSignup({
             {state.step === 1 && <SignupFooter actionLabel={t('ctaStart')} onAction={() => goTo(2)} />}
             {state.step === 2 && (
                 <SignupFooter
-                    actionLabel={t('ctaContinue')}
-                    onAction={() => goTo(3)}
+                    // The label says what pressing it means: skipping the places is allowed, but it is a choice.
+                    actionLabel={state.locations.length > 0 ? t('ctaContinue') : t('ctaContinueWithoutPlace')}
+                    onAction={() => {
+                        captureEvent('notification_signup_preferences_continued', {
+                            city_id: city.id,
+                            location_count: state.locations.length,
+                            topic_count: state.topics.length,
+                        });
+                        goTo(3);
+                    }}
                     backLabel={ts('back')}
                     onBack={() => goTo(1)}
                 />

@@ -1,10 +1,13 @@
 import { Client } from '@elastic/elasticsearch';
 import { Prisma, Realm } from '@prisma/client';
 import prisma from "@/lib/db/prisma";
+import { publicAdministrativeBodyRelation, roleWithRelationsInclude, subjectDecisionSelect, subjectHighlightsInclude } from '@/lib/db/types';
+import { TRANSCRIPT_PUBLIC_WHERE } from '@/lib/db/sharing/publicContent';
 import { MATCH_FIELDS } from './constants';
 import { SearchRequest, SearchResponse, SearchResultLight, SearchResultDetailed, SubjectDocument, ExtractedFilters, DerivedFilters, SearchMatches, RelatedScope } from './types';
 import { buildSearchQuery } from './query';
-import { buildRelatedSubjectsQuery, relatedScopeCityIds, RELATED_MIN_SIMILARITY, RELATED_SUBJECTS_SIZE, type RelatedSubjectSeed } from './related';
+import { buildRelatedSubjectsQuery, relatedScopeCityIds, RELATED_SUBJECTS_SIZE, type RelatedSubjectSeed } from './related';
+import { withIndexProfile, type IndexProfile } from './profile';
 import { extractFilters, processFilters, NO_EXTRACTED_FILTERS } from './filters';
 import { sendErrorAdminAlert } from '@/lib/discord-core';
 import { executeElasticsearchWithRetry } from './retry';
@@ -13,6 +16,7 @@ import { getCities, getListedCitiesCached, filterCityIdsByRealm } from '@/lib/db
 import { logSearchQuery } from '@/lib/db/searchQueries';
 import { createCache } from '@/lib/cache/index';
 import { env } from '@/env.mjs';
+import { resolveSearchDayRange } from '@/lib/dates/cityDateRange';
 
 // Initialize Elasticsearch client
 const client = new Client({
@@ -38,13 +42,7 @@ const subjectDiscussionSegmentInclude = {
         include: {
             person: {
                 include: {
-                    roles: {
-                        include: {
-                            party: true,
-                            city: true,
-                            administrativeBody: true
-                        }
-                    }
+                    roles: roleWithRelationsInclude
                 }
             }
         }
@@ -99,9 +97,13 @@ function searchFailureContext(request: SearchRequest): SearchFailureContext {
         cityIds: request.cityIds?.join(', '),
         personIds: request.personIds?.join(', '),
         partyIds: request.partyIds?.join(', '),
+        administrativeBodyIds: request.administrativeBodyIds?.join(', '),
+        administrativeBodyTypes: request.administrativeBodyTypes?.join(', '),
         topicIds: request.topicIds?.join(', '),
         dateRange: request.dateRange ? `${request.dateRange.start}..${request.dateRange.end}` : undefined,
-        hasLocations: request.locations?.length ? 'true' : undefined,
+        location: request.location
+            ? `${request.location.point.lat},${request.location.point.lng} within ${request.location.radiusMeters}m`
+            : undefined,
     };
 }
 
@@ -240,9 +242,12 @@ export async function searchSubjectsInRealm(
                 cityIds,
                 personIds: request.personIds,
                 partyIds: request.partyIds,
+                administrativeBodyIds: request.administrativeBodyIds,
+                administrativeBodyTypes: request.administrativeBodyTypes,
                 topicIds: request.topicIds,
                 dateRange: request.dateRange,
-                hasLocations: request.locations ? request.locations.length > 0 : false
+                fallbackDateRange: request.fallbackDateRange,
+                location: request.location
             }
         });
 
@@ -283,16 +288,24 @@ export async function searchSubjectsInRealm(
         // win would search a municipality or period that contradicts the pills
         // on screen. An extracted city id outside the realm is dropped too —
         // the model reads a realm-scoped list but can still name anything.
-        const extractedCityIds = !hasExplicitCityFilter && processedFilters.cityIds?.length
+        // A caller's point names the place as well: a city read from the text
+        // ("πάρκα στο Χαλάνδρι" with a point in Athens) would lie outside it and
+        // leave nothing, so it is ignored. A period read from the text still
+        // applies.
+        const extractedCityIds = !hasExplicitCityFilter && !request.location && processedFilters.cityIds?.length
             ? await filterCityIdsByRealm(processedFilters.cityIds, realm)
             : [];
 
-        // Merge with explicit filters
+        // Merge with explicit filters. A calendar day of the range is a day
+        // in the city's zone, not the UTC day that Elasticsearch would read.
+        // The fallback window comes last: it is the caller's default, not a
+        // period the reader set, so a period in the text still applies.
+        const mergedCityIds = extractedCityIds.length > 0 ? extractedCityIds : cityIds;
+        const mergedDateRange = request.dateRange ?? processedFilters.dateRange ?? request.fallbackDateRange;
         const mergedRequest: SearchRequest = {
             ...request,
-            cityIds: extractedCityIds.length > 0 ? extractedCityIds : cityIds,
-            dateRange: request.dateRange ?? processedFilters.dateRange,
-            locations: request.locations ?? processedFilters.locations
+            cityIds: mergedCityIds,
+            dateRange: mergedDateRange && await resolveSearchDayRange(mergedCityIds, mergedDateRange),
         };
 
         // Report back the filters the query text supplied, so a caller showing
@@ -302,20 +315,22 @@ export async function searchSubjectsInRealm(
         const derivedFilters: DerivedFilters = {
             ...(extractedCityIds.length > 0 && { cityIds: extractedCityIds }),
             ...(!request.dateRange && processedFilters.dateRange && { dateRange: processedFilters.dateRange }),
-            ...(!request.locations && processedFilters.locations && { locations: processedFilters.locations }),
+            ...(processedFilters.locations && { locations: processedFilters.locations }),
         };
 
-        // Build and execute the search query with retry logic
-        const searchQuery = buildSearchQuery(mergedRequest, extractedFilters);
-        
-        logEssential('Executing search query', { 
-            hasSemanticSearch: request.config?.enableSemanticSearch 
+        logEssential('Executing search query', {
+            hasSemanticSearch: request.config?.enableSemanticSearch
         });
 
-        const response = await executeElasticsearchWithRetry(
-            () => client.search<SubjectDocument>(searchQuery),
-            'Search'
-        );
+        // Build and execute the search query with retry logic, against the
+        // index the alias serves and with that index's thresholds.
+        const response = await withIndexProfile(client, profile => {
+            const searchQuery = buildSearchQuery(mergedRequest, extractedFilters, processedFilters.locations, profile);
+            return executeElasticsearchWithRetry(
+                () => client.search<SubjectDocument>(searchQuery),
+                'Search'
+            );
+        });
 
         // Get total hits
         const total = response.hits.total as { value: number; relation: string };
@@ -368,37 +383,25 @@ async function hydrateSubjectHits(hits: SubjectSearchHit[], detailed: boolean): 
             councilMeeting: {
                 include: {
                     city: true,
-                    administrativeBody: true
+                    administrativeBody: publicAdministrativeBodyRelation
                 }
             },
             introducedBy: {
                 include: {
-                    roles: {
-                        include: {
-                            party: true,
-                            city: true,
-                            administrativeBody: true
-                        }
-                    }
+                    roles: roleWithRelationsInclude
                 }
             },
             contributions: {
                 include: {
                     speaker: {
                         include: {
-                            roles: {
-                                include: {
-                                    party: true,
-                                    city: true,
-                                    administrativeBody: true
-                                }
-                            }
+                            roles: roleWithRelationsInclude
                         }
                     }
                 }
             },
-            highlights: true,
-            decision: true,
+            highlights: subjectHighlightsInclude,
+            decision: { select: subjectDecisionSelect },
             discussedIn: {
                 include: {
                     topic: true
@@ -417,7 +420,9 @@ async function hydrateSubjectHits(hits: SubjectSearchHit[], detailed: boolean): 
         const subjectIdSet = new Set(subjectIds);
         const segments = await prisma.speakerSegment.findMany({
             where: {
-                utterances: { some: { discussionSubjectId: { in: subjectIds } } }
+                utterances: { some: { discussionSubjectId: { in: subjectIds } } },
+                // Search is public: no text of a transcript that a reader may not read.
+                meeting: TRANSCRIPT_PUBLIC_WHERE,
             },
             include: subjectDiscussionSegmentInclude,
             orderBy: { startTimestamp: 'asc' }
@@ -578,12 +583,13 @@ function relatedCacheTags(seed: RelatedSubjectSeed, scopeCityIds: string[]): str
 
 /**
  * The parts of the answer that no tag can invalidate: the floor and the page
- * size are constants, and the index is swapped under an alias without a
- * deploy. Putting them in the key retires the entries written under the old
- * values, where a version string would have to be bumped by hand.
+ * size, and the index itself, which is rebuilt under an alias without a
+ * deploy. The key carries the concrete index behind the alias and the floor
+ * resolved for it (see resolveIndexProfile), so a rebuild retires every entry
+ * written against the old index, where the alias name would have kept them.
  */
-function relatedCacheKey(seed: RelatedSubjectSeed, scope: RelatedScope, realm: Realm): string[] {
-    return ['subject', seed.id, 'related', scope, realm, String(RELATED_MIN_SIMILARITY), String(RELATED_SUBJECTS_SIZE), env.ELASTICSEARCH_INDEX];
+function relatedCacheKey(seed: RelatedSubjectSeed, scope: RelatedScope, realm: Realm, profile: IndexProfile): string[] {
+    return ['subject', seed.id, 'related', scope, realm, String(profile.relatedMinSimilarity), String(RELATED_SUBJECTS_SIZE), profile.index];
 }
 
 /**
@@ -620,17 +626,17 @@ export async function searchRelatedSubjectsInRealm(
         // visibility re-check and the hydration below run on every request,
         // so a neighbour that is unpublished after the entry was written
         // still drops out on the next visit.
-        const esHits = await createCache(
+        const esHits = await withIndexProfile(client, profile => createCache(
             async () => {
                 const response = await executeElasticsearchWithRetry(
-                    () => client.search<SubjectDocument>(buildRelatedSubjectsQuery(seed, scope, realmCityIds)),
+                    () => client.search<SubjectDocument>(buildRelatedSubjectsQuery(seed, scope, realmCityIds, profile)),
                     'Related subjects'
                 );
                 return response.hits.hits.map(hit => ({ _score: hit._score, _source: hit._source }));
             },
-            relatedCacheKey(seed, scope, realm),
+            relatedCacheKey(seed, scope, realm, profile),
             { tags: relatedCacheTags(seed, scopeCityIds), revalidate: RELATED_CACHE_TTL_SECONDS },
-        )();
+        )());
         const { hits } = await resolveVisibleHits(esHits, 'Related subjects', seed.name);
         if (hits.length === 0) return [];
         return await hydrateSubjectHits(hits, false);

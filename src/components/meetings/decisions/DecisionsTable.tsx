@@ -8,8 +8,12 @@ import { cn } from '@/lib/utils';
 import { surfaceCardClass } from '@/components/ui/surface-card';
 import { getWithdrawnLabel, sectionHeadingAt, type RecordSection } from '@/lib/utils/subjects';
 import type { ResultKey } from '@/lib/utils/decisionResult';
+import { RESULT_MESSAGE_KEY } from '@/lib/decisionsTable/rows';
 import { QuietButton } from '@/components/meetings/decisions/controls';
 import { Chip } from '@/components/meetings/decisions/RecordRow';
+import { AuditLine } from '@/components/meetings/decisions/AuditLine';
+import { AuditIssueRow } from '@/components/meetings/decisions/AuditIssueRow';
+import type { AuditSignal } from '@/components/meetings/decisions/auditSignal';
 
 /** How many rows show before the fold. */
 export const VISIBLE_ROWS = 12;
@@ -103,14 +107,23 @@ export interface TableRow {
     proposal: { candidateId: string; number: string; title: string | null; likely: boolean } | null;
     /** Set for a short while after "Όχι", so the answer can be taken back. */
     rejected: { candidateId: string; number: string } | null;
+    /** How this row's outcome came to be. Null unless audit mode is on, and
+     * null under it too for a row whose outcome has nothing to audit. */
+    audit: AuditSignal | null;
 }
+
+/** Which rows the table shows: everything, the outstanding ones, or the ones audit mode flagged. */
+export type DecisionsFilter = 'all' | 'missing' | 'audit';
 
 export interface DecisionsTableProps {
     rows: TableRow[];
     beforeAgenda: { id: string; name: string }[];
-    filter: 'all' | 'missing';
+    filter: DecisionsFilter;
     missingCount: number;
-    onFilterChange: (f: 'all' | 'missing') => void;
+    /** Subjects with at least one issue. 0 whenever audit mode is off, which is
+     * what keeps the chip out of an ordinary reader's way. */
+    auditCount: number;
+    onFilterChange: (f: DecisionsFilter) => void;
     openPanelSubjectId: string | null;
     onOpenPanel: (subjectId: string, mode: 'link' | 'change') => void;
     renderPanel: (subjectId: string) => ReactNode;
@@ -118,9 +131,19 @@ export interface DecisionsTableProps {
     onRejectProposal: (subjectId: string, candidateId: string) => void;
     onUndoReject: (subjectId: string, candidateId: string) => void;
     onOpenDecision: (subjectId: string) => void;
-    onOpenProposalDocument: (candidateId: string) => void;
+    onOpenProposalDocument: (candidateId: string, subjectId: string) => void;
     busySubjectId: string | null;
+    /** The subject whose issues are open in a row under it; null when none is. */
+    openAuditSubjectId: string | null;
+    /** Opens a subject's issue row, or closes it when it is the open one. */
+    onToggleAudit: (subjectId: string) => void;
+    /** Opens the page's derivation glossary from a subject's issue row. Superadmin-only,
+     * so the page passes it to one and withholds it from everyone else. */
+    onExplainDerivation?: () => void;
 }
+
+/** The id of a subject's issue row, which its audit line controls. */
+const issueRowId = (subjectId: string) => `audit-issues-${subjectId}`;
 
 type T = ReturnType<typeof useTranslations>;
 
@@ -173,33 +196,12 @@ const CHANGE_ACTION =
     + ' md:[@media(hover:hover)]:opacity-0 md:[@media(hover:hover)]:group-hover:opacity-100';
 
 /**
- * Literal message keys for every non-withdrawn `ResultKey`. The
- * `Record<Exclude<ResultKey, 'withdrawn'>, string>` type is what keeps this
- * map complete: TypeScript rejects the map if a union member has no value,
- * so it grows whenever `ResultKey` grows.
- *
- * `t(RESULT_MESSAGE_KEY[row.result])` passes a dynamic property lookup to
- * `t`, not a string literal, so this is not a `table.result.${row.result}`
- * interpolation — the "every computed group is registered in
- * COMPUTED_GROUPS" guard never triggers on it. That also means the five
- * strings in this map are not literal calls the repo's key scanner
- * (`translation-key-references.test.ts`) can read, unlike `Subject.categories.`.
- * A typo in one of them is caught by nothing; only the `Record` type above
- * guarantees every member gets a key at all.
- */
-const RESULT_MESSAGE_KEY: Record<Exclude<ResultKey, 'withdrawn'>, string> = {
-    unanimous: 'table.result.unanimous',
-    majority: 'table.result.majority',
-    rejected: 'table.result.rejected',
-    none: 'table.result.none',
-    noVote: 'table.result.noVote',
-};
-
-/**
  * The Αποτέλεσμα cell: the one word a posted Πίνακας αποφάσεων carries, with
- * the counts behind it kept out of the way until the row is hovered.
+ * the counts behind it kept out of the way until the row is hovered. The word
+ * comes from the `decisionsTable` namespace the public table reads too, so the
+ * two tables cannot name one result differently.
  */
-function ResultCell({ row, t, tSubject }: { row: TableRow; t: T; tSubject: T }) {
+function ResultCell({ row, tResult, tSubject }: { row: TableRow; tResult: T; tSubject: T }) {
     return (
         <span className="relative block">
             <span
@@ -212,7 +214,7 @@ function ResultCell({ row, t, tSubject }: { row: TableRow; t: T; tSubject: T }) 
             >
                 {row.result === 'withdrawn'
                     ? getWithdrawnLabel(tSubject, row.subject)
-                    : t(RESULT_MESSAGE_KEY[row.result])}
+                    : tResult(RESULT_MESSAGE_KEY[row.result])}
             </span>
             {row.voteCounts && <span className={VOTE_COUNTS}>{row.voteCounts}</span>}
         </span>
@@ -226,11 +228,13 @@ function ResultCell({ row, t, tSubject }: { row: TableRow; t: T; tSubject: T }) 
  */
 function ProposalLine({
     proposal,
+    subjectId,
     onOpenProposalDocument,
     t,
 }: {
     proposal: NonNullable<TableRow['proposal']>;
-    onOpenProposalDocument: (candidateId: string) => void;
+    subjectId: string;
+    onOpenProposalDocument: (candidateId: string, subjectId: string) => void;
     t: T;
 }) {
     // Document order is the one line this reads as from `md` up. Below it the
@@ -250,7 +254,7 @@ function ProposalLine({
             )}
             <StackBreak order="order-6" />
             {proposal.likely && <span className="order-2 font-semibold text-green-700 md:order-none">{t('attention.likelyMatch')}</span>}
-            <QuietButton className="order-7 md:order-none" onClick={() => onOpenProposalDocument(proposal.candidateId)}>{t('table.openDocument')}</QuietButton>
+            <QuietButton className="order-7 md:order-none" onClick={() => onOpenProposalDocument(proposal.candidateId, subjectId)}>{t('table.openDocument')}</QuietButton>
         </div>
     );
 }
@@ -437,6 +441,20 @@ function NumberCell({
     );
 }
 
+/** The count a filter chip carries, in the chip's own two colourways. */
+function ChipCount({ active, children }: { active: boolean; children: ReactNode }) {
+    return (
+        <span
+            className={cn(
+                'ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold',
+                active ? 'bg-background/20' : 'bg-foreground/10',
+            )}
+        >
+            {children}
+        </span>
+    );
+}
+
 function FilterChip({ active, children, onClick }: { active: boolean; children: ReactNode; onClick: () => void }) {
     return (
         <button
@@ -469,6 +487,7 @@ export function DecisionsTable({
     beforeAgenda,
     filter,
     missingCount,
+    auditCount,
     onFilterChange,
     openPanelSubjectId,
     onOpenPanel,
@@ -479,13 +498,26 @@ export function DecisionsTable({
     onOpenDecision,
     onOpenProposalDocument,
     busySubjectId,
+    openAuditSubjectId,
+    onToggleAudit,
+    onExplainDerivation,
 }: DecisionsTableProps) {
     const t = useTranslations('admin.decisionsPage');
+    const tResult = useTranslations('decisionsTable');
     const tSubject = useTranslations('Subject');
     const [expanded, setExpanded] = useState(false);
 
-    const filteredRows = filter === 'missing' ? rows.filter(r => r.result === 'none') : rows;
-    const effectiveExpanded = expanded || filter === 'missing' || filteredRows.length <= VISIBLE_ROWS;
+    const filteredRows = filter === 'missing'
+        ? rows.filter(r => r.result === 'none')
+        : filter === 'audit'
+            ? rows.filter(r => r.audit?.needsCheck)
+            : rows;
+    // A filtered table is already the short list someone asked for; folding it
+    // would hide part of the answer behind a second click. A subject whose
+    // issues the rail's card opened is an answer too, wherever it sits.
+    const openRowIsFolded = openAuditSubjectId !== null
+        && filteredRows.slice(VISIBLE_ROWS).some(r => r.subject.id === openAuditSubjectId);
+    const effectiveExpanded = expanded || filter !== 'all' || filteredRows.length <= VISIBLE_ROWS || openRowIsFolded;
     const visibleRows = effectiveExpanded ? filteredRows : filteredRows.slice(0, VISIBLE_ROWS);
     const hiddenRows = effectiveExpanded ? [] : filteredRows.slice(VISIBLE_ROWS);
     const hiddenMissing = hiddenRows.filter(r => r.result === 'none').length;
@@ -512,22 +544,23 @@ export function DecisionsTable({
         <section className={cn(surfaceCardClass, 'overflow-hidden')}>
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-foreground/10 px-5 py-4">
                 <h2 className="text-[15px] font-semibold">{t('table.title')}</h2>
-                {missingCount > 0 && (
+                {(missingCount > 0 || auditCount > 0) && (
                     <div className="flex flex-wrap items-center gap-2">
                         <FilterChip active={filter === 'all'} onClick={() => onFilterChange('all')}>
                             {t('table.filterAll')}
                         </FilterChip>
-                        <FilterChip active={filter === 'missing'} onClick={() => onFilterChange('missing')}>
-                            {t('table.filterMissing')}
-                            <span
-                                className={cn(
-                                    'ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold',
-                                    filter === 'missing' ? 'bg-background/20' : 'bg-foreground/10',
-                                )}
-                            >
-                                {missingCount}
-                            </span>
-                        </FilterChip>
+                        {missingCount > 0 && (
+                            <FilterChip active={filter === 'missing'} onClick={() => onFilterChange('missing')}>
+                                {t('table.filterMissing')}
+                                <ChipCount active={filter === 'missing'}>{missingCount}</ChipCount>
+                            </FilterChip>
+                        )}
+                        {auditCount > 0 && (
+                            <FilterChip active={filter === 'audit'} onClick={() => onFilterChange('audit')}>
+                                {t('table.filterAudit')}
+                                <ChipCount active={filter === 'audit'}>{auditCount}</ChipCount>
+                            </FilterChip>
+                        )}
                     </div>
                 )}
             </div>
@@ -572,6 +605,7 @@ export function DecisionsTable({
                             )}
                             <div
                                 role="row"
+                                data-subject-id={row.subject.id}
                                 className={cn(
                                     ROW_LAYOUT,
                                     // Every cell centres against the row's tallest one, which is
@@ -579,6 +613,8 @@ export function DecisionsTable({
                                     // nine lines, and `items-start` stranded the Α/Α number, the
                                     // result and the decision number up at its first line.
                                     'group items-center border-b border-foreground/5 py-3',
+                                    // The issue row under it closes the row instead.
+                                    openAuditSubjectId === row.subject.id && (row.audit?.issues.length ?? 0) > 0 && 'border-b-0',
                                     proposal && 'bg-amber-50',
                                 )}
                             >
@@ -591,13 +627,27 @@ export function DecisionsTable({
                                         index={row.subject.agendaItemIndex}
                                         muted={row.subject.withdrawn}
                                     />
+                                    {/* The proposal first, then the audit line
+                                        under it: the question the row is asking
+                                        outranks the note on how its facts were
+                                        reached, and the audit line sits on the
+                                        row's existing amber rather than
+                                        bringing a second ground of its own. */}
                                     {proposal && (
-                                        <ProposalLine proposal={proposal} onOpenProposalDocument={onOpenProposalDocument} t={t} />
+                                        <ProposalLine proposal={proposal} subjectId={row.subject.id} onOpenProposalDocument={onOpenProposalDocument} t={t} />
+                                    )}
+                                    {row.audit && (
+                                        <AuditLine
+                                            signal={row.audit}
+                                            open={openAuditSubjectId === row.subject.id}
+                                            onOpen={() => onToggleAudit(row.subject.id)}
+                                            controls={issueRowId(row.subject.id)}
+                                        />
                                     )}
                                 </div>
                                 <StackBreak />
                                 <div role="cell" className="order-4 text-right md:order-none md:text-left">
-                                    <ResultCell row={row} t={t} tSubject={tSubject} />
+                                    <ResultCell row={row} tResult={tResult} tSubject={tSubject} />
                                 </div>
                                 <div role="cell" className="order-3 flex grow justify-start md:order-none md:justify-end">
                                     <NumberCell
@@ -612,6 +662,18 @@ export function DecisionsTable({
                                     />
                                 </div>
                             </div>
+                            {/* Across the whole card, like the panel below: the
+                                Θέμα cell is too narrow for a subject's issues. */}
+                            {openAuditSubjectId === row.subject.id && row.audit && row.audit.issues.length > 0 && (
+                                <div role="presentation" className="border-b border-foreground/5 px-5 pb-3 pt-1">
+                                    <AuditIssueRow
+                                        id={issueRowId(row.subject.id)}
+                                        issues={row.audit.issues}
+                                        onClose={() => onToggleAudit(row.subject.id)}
+                                        onExplainDerivation={onExplainDerivation}
+                                    />
+                                </div>
+                            )}
                             {openPanelSubjectId === row.subject.id && (
                                 <div role="presentation">{renderPanel(row.subject.id)}</div>
                             )}

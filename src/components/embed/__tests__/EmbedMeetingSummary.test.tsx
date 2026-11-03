@@ -18,6 +18,7 @@ function subject(id: string, name: string, contributions: number, description = 
         name,
         description,
         agendaItemIndex: null,
+        agendaSectionIndex: null,
         nonAgendaReason: null,
         topic: { name: 'Δικαιοσύνη', name_en: 'Justice', colorHex: '#112233', icon: 'scale' },
         _count: { contributions },
@@ -31,6 +32,9 @@ function summary(overrides: Partial<MeetingSummary> = {}): MeetingSummary {
             cityId: 'vouli',
             name: '25η συνεδρίαση',
             name_en: '25th session',
+            kind: null,
+            urgent: false,
+            sessionNumber: null,
             dateTime: new Date('2026-04-06T10:00:00Z'),
             administrativeBody: { name: 'Ολομέλεια της Βουλής', name_en: 'Plenary' },
             subjects: [

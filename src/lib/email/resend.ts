@@ -1,6 +1,8 @@
 "use server";
 import { Resend } from 'resend';
 import { env } from '@/env.mjs';
+import { emailFrom, type EmailSender } from '@/lib/email/senders';
+import { isMachineAccountAddress } from '@/lib/auth/machineAccounts';
 
 interface Attachment {
     filename: string;
@@ -14,7 +16,7 @@ export interface EmailTag {
 }
 
 interface EmailParams {
-    from: string;
+    from: EmailSender;
     to: string;
     cc?: string | string[];
     replyTo?: string | string[];
@@ -25,8 +27,8 @@ interface EmailParams {
     tags?: EmailTag[];
 }
 
-interface BatchEmailItem {
-    from: string;
+export interface BatchEmailItem {
+    from: EmailSender;
     to: string;
     replyTo?: string | string[];
     subject: string;
@@ -41,22 +43,30 @@ export interface BatchEmailResult {
     error?: string;
 }
 
-/** Resend's per-call batch cap. Anything bigger must be chunked by the caller. */
+/** Resend's per-call batch cap. `sendEmailInBatches` chunks to it. */
 const RESEND_BATCH_LIMIT = 100;
+
+/**
+ * Pause between successive batch calls. Resend's batch endpoint allows about
+ * two requests per second, and a fast round trip alone is not enough spacing.
+ */
+const RESEND_BATCH_INTERVAL_MS = 500;
 
 /**
  * Apply the dev-email override to a single batch item — same rewrite as
  * `sendEmail` does for one-shot sends.
  */
 function applyDevOverride(item: BatchEmailItem, override: string): BatchEmailItem {
+    const replyTo = item.replyTo ? (Array.isArray(item.replyTo) ? item.replyTo.join(', ') : item.replyTo) : 'none';
     const banner = `<div style="background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;padding:12px 16px;margin-bottom:16px;font-family:monospace;font-size:13px;color:#92400e;">
         <strong>🔧 Dev Email Override</strong><br/>
-        <strong>To:</strong> ${item.to}
+        <strong>To:</strong> ${item.to}<br/>
+        <strong>Reply-To:</strong> ${replyTo}
     </div>`;
+    // As in sendEmail: a reply from the dev inbox must not reach the real addresses.
     return {
         from: item.from,
         to: override,
-        replyTo: item.replyTo,
         subject: `[DEV → ${item.to}] ${item.subject}`,
         html: banner + item.html,
         text: item.text,
@@ -68,6 +78,13 @@ export async function sendEmail(params: EmailParams) {
     const resend = new Resend(env.RESEND_API_KEY);
     let { from, to, cc, replyTo, subject, html, text, attachments, tags } = params;
 
+    // Every app email passes here, and a machine account has no mailbox.
+    if (isMachineAccountAddress(to)) {
+        console.log('📧 Skipped an email to a machine account');
+        return { success: true, message: 'Skipped: machine account' };
+    }
+    if (cc) cc = (Array.isArray(cc) ? cc : [cc]).filter(address => !isMachineAccountAddress(address));
+
     // Development/preview email override: redirect all emails to a single address
     const isDev = process.env.NODE_ENV !== 'production';
     const isPreview = env.DEPLOYMENT_ENV === 'preview';
@@ -76,33 +93,41 @@ export async function sendEmail(params: EmailParams) {
     if ((isDev || isPreview) && devEmailOverride) {
         const originalTo = to;
         const originalCc = cc;
-        
+        const originalReplyTo = replyTo;
+
         // Redirect email to dev address
         to = devEmailOverride;
         cc = undefined; // Clear CC to avoid sending to real addresses
+        // A reply from the dev inbox must not reach the real addresses either.
+        replyTo = undefined;
 
         // Modify subject to include original recipient
         subject = `[DEV → ${originalTo}] ${subject}`;
 
         // Prepend a dev banner to the email body showing original recipients
-        const ccList = originalCc ? (Array.isArray(originalCc) ? originalCc.join(', ') : originalCc) : 'none';
+        const list = (addresses: string | string[] | undefined) =>
+            addresses ? (Array.isArray(addresses) ? addresses.join(', ') : addresses) : 'none';
         const devBanner = `<div style="background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;padding:12px 16px;margin-bottom:16px;font-family:monospace;font-size:13px;color:#92400e;">
             <strong>🔧 Dev Email Override</strong><br/>
             <strong>To:</strong> ${originalTo}<br/>
-            <strong>CC:</strong> ${ccList}
+            <strong>CC:</strong> ${list(originalCc)}<br/>
+            <strong>Reply-To:</strong> ${list(originalReplyTo)}
         </div>`;
         html = devBanner + html;
 
         // Log for debugging
         console.log(`📧 Dev mode: Redirecting email from "${originalTo}" to "${devEmailOverride}"`);
         if (originalCc) {
-            console.log(`   Original CC: ${Array.isArray(originalCc) ? originalCc.join(', ') : originalCc}`);
+            console.log(`   Original CC: ${list(originalCc)}`);
+        }
+        if (originalReplyTo) {
+            console.log(`   Original Reply-To: ${list(originalReplyTo)}`);
         }
     }
 
     try {
         const result = await resend.emails.send({
-            from,
+            from: emailFrom(from),
             to,
             cc,
             replyTo,
@@ -136,9 +161,11 @@ export async function sendEmail(params: EmailParams) {
  * rejected up-front rather than silently truncated.
  */
 export async function sendEmailBatch(
-    items: BatchEmailItem[],
+    allItems: BatchEmailItem[],
     opts: { idempotencyKey: string },
 ): Promise<BatchEmailResult> {
+    // As in sendEmail: a machine account has no mailbox.
+    const items = allItems.filter((item) => !isMachineAccountAddress(item.to));
     if (items.length === 0) return { success: true, failedTos: [] };
     if (items.length > RESEND_BATCH_LIMIT) {
         return {
@@ -160,8 +187,9 @@ export async function sendEmailBatch(
     // Resend's HTTP API uses snake_case (`reply_to`); the SDK exposes camelCase
     // (`replyTo`). We use the SDK for one-shot sends and direct fetch here, so
     // translate just before serializing.
-    const payload = rewritten.map(({ replyTo, ...rest }) => ({
+    const payload = rewritten.map(({ from, replyTo, ...rest }) => ({
         ...rest,
+        from: emailFrom(from),
         ...(replyTo !== undefined ? { reply_to: replyTo } : {}),
     }));
 
@@ -217,5 +245,33 @@ export async function sendEmailBatch(
             failedTos: items.map((i) => i.to),
             error: error instanceof Error ? error.message : 'Unknown error',
         };
+    }
+}
+
+/**
+ * Send any number of emails through `sendEmailBatch`: chunk to Resend's limit,
+ * send the chunks in order, and pause between calls.
+ *
+ * `onBatch` runs after each chunk, before the next one is sent, so a caller
+ * records each outcome before the next send starts. Each caller derives its own
+ * idempotency key and maps the result to its own records.
+ */
+export async function sendEmailInBatches<T>(
+    items: T[],
+    options: {
+        toEmail: (item: T) => BatchEmailItem;
+        idempotencyKey: (batch: T[]) => string;
+        onBatch: (batch: T[], result: BatchEmailResult) => Promise<void> | void;
+    },
+): Promise<void> {
+    for (let i = 0; i < items.length; i += RESEND_BATCH_LIMIT) {
+        if (i > 0) {
+            await new Promise((resolve) => setTimeout(resolve, RESEND_BATCH_INTERVAL_MS));
+        }
+        const batch = items.slice(i, i + RESEND_BATCH_LIMIT);
+        const result = await sendEmailBatch(batch.map(options.toEmail), {
+            idempotencyKey: options.idempotencyKey(batch),
+        });
+        await options.onBatch(batch, result);
     }
 }

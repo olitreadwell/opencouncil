@@ -16,20 +16,21 @@ import {
     DropdownMenuSubContent,
 } from '@/components/ui/dropdown-menu';
 import { Input } from '@/components/ui/input';
-import { Check, Link2, Loader2, Share2, Instagram, Code2, ChevronRight } from 'lucide-react';
+import { Check, Link2, Loader2, Share2, Code2, ChevronRight } from 'lucide-react';
+import { SiInstagram } from 'react-icons/si';
 import { useVideo } from './VideoProvider';
 import { usePathname, useParams } from 'next/navigation';
 import { useShare } from '@/contexts/ShareContext';
 import { formatTimestamp } from '@/lib/formatters/time';
-import { getLocalizedName } from '@/lib/formatters/name';
 import { localizeText } from '@/lib/serbian';
 import StoryTemplatePickerDialog from './StoryTemplatePickerDialog';
 import { captureEvent } from '@/lib/analytics/capture';
 import { useSharingTracker } from '@/lib/analytics/sharing';
 import { SubjectEmbedDialog } from '@/components/embed/SubjectEmbedDialog';
-import { validSourceId } from '@/lib/sharing/excerptSelector';
+import { EXCERPT_SELECTOR_KEYS, parseExcerptSelector, validSourceId } from '@/lib/sharing/excerptSelector';
 import { useCouncilMeetingData } from './CouncilMeetingDataContext';
 import { SubjectShareDialog } from '@/components/sharing/SubjectShareDialog';
+import { meetingLabel } from '@/lib/meetingName';
 
 
 interface ShareDropdownProps {
@@ -59,6 +60,8 @@ function buildShareUrl(source: string, timestamp: number | null, subjectPage: bo
     if (!source) return '';
     const result = new URL(source);
     result.searchParams.delete('t');
+    // A reader who arrived on a shared excerpt shares the meeting, not that excerpt.
+    if (parseExcerptSelector(result.searchParams)) for (const key of EXCERPT_SELECTOR_KEYS) result.searchParams.delete(key);
     if (timestamp !== null) result.searchParams.set('t', Math.floor(timestamp).toString());
     if (subjectPage) {
         result.searchParams.delete('contribution');
@@ -73,7 +76,7 @@ export default function ShareDropdown({ meetingId, cityId, className }: ShareDro
     const locale = useLocale();
     const fallbackId = useId();
     const params = useParams();
-    const { meeting, subjects } = useCouncilMeetingData();
+    const { city, meeting, subjects } = useCouncilMeetingData();
     const subjectId = meeting.released && validSourceId(params.subjectId) ? params.subjectId : null;
     const subject = subjects.find(item => item.id === subjectId);
     const [url, setUrl] = useState('');
@@ -95,7 +98,7 @@ export default function ShareDropdown({ meetingId, cityId, className }: ShareDro
     const effectiveTime = targetTimestamp ?? (currentTime > 0 ? currentTime : null);
     const sharedTime = includeTimestamp && effectiveTime !== null ? effectiveTime : null;
     const shareableUrl = buildShareUrl(url, sharedTime, subjectPage);
-    const shareTitle = subject ? localizeText(subject.name, locale) : getLocalizedName(meeting, locale);
+    const shareTitle = subject ? localizeText(subject.name, locale) : meetingLabel(meeting, locale, city.timezone);
     const actionDisabled = !shareableUrl || pending !== null;
     const operationRef = useRef(0);
     const track = useSharingTracker({ content_type: subject ? 'subject' : 'meeting', surface: subjectPage ? 'subject_menu' : pathname.includes('/transcript') ? 'transcript_menu' : 'meeting_menu', city_id: cityId, meeting_id: meetingId, subject_id: subject?.id, locale });
@@ -265,7 +268,7 @@ export default function ShareDropdown({ meetingId, cityId, className }: ShareDro
                         </DropdownMenuSubContent>
                     </DropdownMenuSub>}
                     {(subject || !subjectPage) && <DropdownMenuItem className={itemClass} onSelect={() => openDialog(subject ? setSubjectStoryOpen : setStoryPickerOpen)}>
-                        <Instagram className="size-4 text-muted-foreground" />{tSharing('storyTitle')}<ChevronRight className="ml-auto size-4 text-muted-foreground/60" />
+                        <SiInstagram className="size-4 text-muted-foreground" aria-hidden />{tSharing('storyTitle')}<ChevronRight className="ml-auto size-4 text-muted-foreground/60" />
                     </DropdownMenuItem>}
                     {subjectId && <>
                         <DropdownMenuSeparator className="mx-3 my-1" />

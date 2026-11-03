@@ -8,6 +8,8 @@ import { City } from '@prisma/client';
 type CityNavigationProps = {
     cityId: string;
     city?: { consultationsEnabled: boolean };
+    /** Consultations that take comments now; the tab shows the number in orange. */
+    openConsultations?: number;
 };
 
 // Custom NavLink component to handle active state styling
@@ -41,7 +43,7 @@ function NavLink({
     );
 }
 
-export function CityNavigation({ cityId, city }: CityNavigationProps) {
+export function CityNavigation({ cityId, city, openConsultations = 0 }: CityNavigationProps) {
     const t = useTranslations('City');
     const segment = useSelectedLayoutSegment();
 
@@ -54,7 +56,11 @@ export function CityNavigation({ cityId, city }: CityNavigationProps) {
         // of the old hero's choreography, which left the page's primary navigation
         // invisible on arrival — and permanently so if hydration was slow.
         <div className="mb-6 md:mb-8 border-b border-border">
-            <nav aria-label={t('citySections')} className="flex gap-4 sm:gap-6 md:gap-7 overflow-x-auto scrollbar-hide -mb-px">
+            {/* `relative` makes the nav the containing block of the badge's
+                `sr-only` span, which is absolutely positioned. Without it the
+                span escapes the nav's overflow clipping, sits past the last
+                tab and widens the whole page on a phone. */}
+            <nav aria-label={t('citySections')} className="relative flex gap-4 sm:gap-6 md:gap-7 overflow-x-auto scrollbar-hide -mb-px">
                 <NavLink
                     href={`/${cityId}`}
                     segment={currentSegment}
@@ -96,7 +102,18 @@ export function CityNavigation({ cityId, city }: CityNavigationProps) {
                         segment={currentSegment}
                         matchSegment="consultations"
                     >
-                        {t('consultations')}
+                        <span className="inline-flex items-center gap-1.5">
+                            {t('consultations')}
+                            {openConsultations > 0 && (
+                                <span
+                                    title={t('openConsultations', { count: openConsultations })}
+                                    className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-[hsl(var(--orange-deep))] px-1.5 text-xs font-bold tabular-nums text-white"
+                                >
+                                    <span aria-hidden="true">{openConsultations}</span>
+                                    <span className="sr-only">{t('openConsultations', { count: openConsultations })}</span>
+                                </span>
+                            )}
+                        </span>
                     </NavLink>
                 )}
             </nav>

@@ -1,8 +1,7 @@
 import { meetingSchema } from '../meeting';
+import { MEETING_RECORD_INPUT_KEYS } from '@/lib/meetingLifecycleRules';
 
 const validBase = {
-  name: 'Δημοτικό Συμβούλιο',
-  name_en: 'City Council',
   date: '2026-01-15T18:00:00.000Z',
 };
 
@@ -35,12 +34,34 @@ describe('meetingSchema', () => {
   it('accepts a valid URL or an empty string for youtubeUrl, rejects a non-URL', () => {
     expect(meetingSchema.parse({ ...validBase, youtubeUrl: 'https://youtu.be/abc' }).youtubeUrl)
       .toBe('https://youtu.be/abc');
-    expect(meetingSchema.parse({ ...validBase, youtubeUrl: '' }).youtubeUrl).toBe('');
+    // An empty string clears the link. An absent one leaves it as it is.
+    expect(meetingSchema.parse({ ...validBase, youtubeUrl: '' }).youtubeUrl).toBeNull();
+    expect(meetingSchema.parse(validBase).youtubeUrl).toBeUndefined();
     expect(() => meetingSchema.parse({ ...validBase, youtubeUrl: 'not a url' })).toThrow();
   });
 
-  it('rejects names shorter than 2 characters', () => {
-    expect(() => meetingSchema.parse({ ...validBase, name: 'A' })).toThrow();
-    expect(() => meetingSchema.parse({ ...validBase, name_en: 'A' })).toThrow();
+  it('refuses a session number above 999', () => {
+    expect(meetingSchema.safeParse({ ...validBase, sessionNumber: 999 }).success).toBe(true);
+    expect(meetingSchema.safeParse({ ...validBase, sessionNumber: 1000 }).success).toBe(false);
   });
+
+  it('drops a name that a client still sends, because the name is derived', () => {
+    const parsed = meetingSchema.parse({ ...validBase, name: 'Δημοτικό Συμβούλιο', name_en: 'A' });
+    expect(parsed).not.toHaveProperty('name');
+    expect(parsed).not.toHaveProperty('name_en');
+  });
+});
+
+describe('the fields of meetingSchema', () => {
+    // Create and update both take the facts of the record through
+    // MEETING_RECORD_INPUT_KEYS. A field that the schema gains must be one of
+    // them, or one of the other fields that both routes pass on by name.
+    const OTHER_FIELDS = [
+        'date', 'youtubeUrl', 'agendaUrl', 'meetingId', 'administrativeBodyId',
+        'processAgenda', 'postponedFromId', 'continuationOfId',
+    ];
+
+    it('are the record facts and the fields that the routes pass on by name', () => {
+        expect(Object.keys(meetingSchema.shape).sort()).toEqual([...MEETING_RECORD_INPUT_KEYS, ...OTHER_FIELDS].sort());
+    });
 });

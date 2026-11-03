@@ -1,5 +1,10 @@
 import type { EditorialBrief } from "../../agent/types";
-import { MAX_EVENTS_PER_TICK, classifyEvent, runPollerTick } from "../poller";
+import { STALE_MEETING_MS, classifyEvent } from "@opencouncil/ui/lib/meeting-news";
+import {
+  MAX_EVENTS_PER_TICK,
+  MEETING_SETTLE_MS,
+  runPollerTick,
+} from "../poller";
 import { PROACTIVE_PAUSED_KEY, futureSummaryAlertKey } from "../settings";
 import { type FakeDb, type Row, eventIdentity, makeFakeDb } from "./fake-db";
 import { FakeBird } from "./fake-bird";
@@ -153,13 +158,16 @@ function meetingRow(taskId: string, overrides: Row = {}): Row {
     completedAt: new Date(NOW.getTime() - 3_600_000),
     cityId: "athens",
     meetingId: "m1",
-    meetingName: "Δημοτικό Συμβούλιο",
+    meetingName: null,
     meetingDate: new Date("2026-08-17T18:00:00.000Z"),
     released: true,
-    adminBodyName: null,
+    adminBodyName: "Δημοτικό Συμβούλιο",
     realm: "greece",
     language: "el",
     timezone: "Europe/Athens",
+    meetingKind: "ordinary",
+    sessionNumber: 3,
+    urgent: false,
     ...overrides,
   };
 }
@@ -533,7 +541,7 @@ describe("meeting events", () => {
   // The poller tests below prove the wiring; this proves the rule.
   describe("classifyEvent", () => {
     const at = new Date(NOW);
-    const staleBefore = new Date(NOW.getTime() - 30 * 24 * 60 * 60_000);
+    const staleBefore = new Date(NOW.getTime() - STALE_MEETING_MS);
     const on = (type: string, meetingDate: string) =>
       classifyEvent({ type, meetingDate: new Date(meetingDate) }, at, staleBefore);
 
@@ -544,6 +552,7 @@ describe("meeting events", () => {
       ["summarize", "2026-08-20T18:00:00.000Z", "future-summary", "cannot be summarized yet"],
       ["summarize", "2026-08-15T18:00:00.000Z", "fanout", "held four days ago"],
       ["summarize", "2026-08-04T18:00:00.000Z", "fanout", "held two weeks ago"],
+      ["summarize", "2026-08-02T18:00:00.000Z", "stale", "held sixteen days ago"],
       ["summarize", "2026-01-10T18:00:00.000Z", "stale", "held months ago"],
     ])("%s dated %s → %s (%s)", (type, meetingDate, expected) => {
       expect(on(type, meetingDate)).toBe(expected);
@@ -893,6 +902,57 @@ describe("meeting events", () => {
     expect((row.events as Array<{ type: string }>)[0].type).toBe("meeting_summarized");
   });
 
+  it("carries the stored name, the kind, the urgency and the number into the ledger and the wake event", async () => {
+    // The view gives the facts, not a title: Notis derives the title itself.
+    const db = seededDb();
+    const main = makeFakeMain({
+      users: [{ id: "user1", name: "Μαρία", phone: "+306900000001" }],
+      targets: [target("user1", "athens")],
+      events: [
+        meetingRow("task-derived", { meetingId: "m-derived", urgent: true }),
+        meetingRow("task-named", {
+          meetingId: "m-named",
+          meetingName: "Λογοδοσία και Δημοτικό Συμβούλιο 04/02/26",
+          meetingKind: null,
+          sessionNumber: null,
+        }),
+      ],
+    });
+
+    await runPollerTick({ db, main, bird: new FakeBird(), alert: async () => {}, now, editorial: editorialOk });
+
+    expect(processedFor(db, "athens", "m-derived", "summarize")).toMatchObject({
+      meetingName: null,
+      meetingKind: "ordinary",
+      urgent: true,
+      sessionNumber: 3,
+    });
+    expect(processedFor(db, "athens", "m-named", "summarize")).toMatchObject({
+      meetingName: "Λογοδοσία και Δημοτικό Συμβούλιο 04/02/26",
+      meetingKind: null,
+      urgent: false,
+      sessionNumber: null,
+    });
+    const events = [...db.store.queue.values()].flatMap((r) => r.events as Array<Record<string, unknown>>);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          meetingId: "m-derived",
+          meetingName: null,
+          meetingKind: "ordinary",
+          urgent: true,
+          sessionNumber: 3,
+        }),
+        expect.objectContaining({
+          meetingId: "m-named",
+          meetingName: "Λογοδοσία και Δημοτικό Συμβούλιο 04/02/26",
+          meetingKind: null,
+          urgent: false,
+        }),
+      ]),
+    );
+  });
+
   it("unreleased events are skipped AND not recorded — a later release fires naturally", async () => {
     const db = seededDb();
     const events = [meetingRow("task1", { released: false })];
@@ -1164,5 +1224,71 @@ describe("meeting events", () => {
     });
     expect(again.wakesEnqueued).toBe(0);
     expect(alerts).toHaveLength(0);
+  });
+});
+
+describe("meeting events settle before the wake", () => {
+  it("schedules the wake MEETING_SETTLE_MS after the tick, so sibling meetings coalesce", async () => {
+    // Two sessions of one council day are summarized minutes apart. Woken at
+    // once, each produced its own push; delayed, the second event merges
+    // into the first event's pending batch row.
+    const db = makeFakeDb({ subscriptions: [activeSub("sub1", "user1")] });
+    const main = makeFakeMain({
+      users: [{ id: "user1", name: "Μαρία", phone: "+306900000001" }],
+      targets: [target("user1", "athens")],
+      events: [meetingRow("task-1")],
+    });
+
+    const result = await runPollerTick({
+      db,
+      main,
+      bird: new FakeBird(),
+      alert: async () => {},
+      now,
+      editorial: editorialOk,
+    });
+
+    expect(result.wakesEnqueued).toBe(1);
+    const row = [...db.store.queue.values()][0];
+    expect((row.runAfter as Date).toISOString()).toBe(
+      new Date(NOW.getTime() + MEETING_SETTLE_MS).toISOString(),
+    );
+  });
+});
+
+describe("meeting events settle — limits", () => {
+  it("does not settle across 23:00: an evening summary goes out now instead of next morning", async () => {
+    const evening = () => new Date("2026-08-18T19:30:00.000Z"); // 22:30 Athens
+    const db = makeFakeDb({ subscriptions: [activeSub("sub1", "user1")] });
+    const main = makeFakeMain({
+      users: [{ id: "user1", name: "Μαρία", phone: "+306900000001" }],
+      targets: [target("user1", "athens")],
+      events: [meetingRow("task-1", { completedAt: new Date("2026-08-18T18:30:00.000Z") })],
+    });
+
+    await runPollerTick({ db, main, bird: new FakeBird(), alert: async () => {}, now: evening, editorial: editorialOk });
+
+    const row = [...db.store.queue.values()][0];
+    expect((row.runAfter as Date).toISOString()).toBe("2026-08-18T19:30:00.000Z");
+  });
+
+  it("does not settle an agenda whose meeting starts inside the settle window", async () => {
+    const db = makeFakeDb({ subscriptions: [activeSub("sub1", "user1")] });
+    const main = makeFakeMain({
+      users: [{ id: "user1", name: "Μαρία", phone: "+306900000001" }],
+      targets: [target("user1", "athens")],
+      events: [
+        meetingRow("task-agenda", {
+          type: "processAgenda",
+          meetingId: "m-soon",
+          meetingDate: new Date(NOW.getTime() + 20 * 60_000),
+        }),
+      ],
+    });
+
+    await runPollerTick({ db, main, bird: new FakeBird(), alert: async () => {}, now, editorial: editorialOk });
+
+    const row = [...db.store.queue.values()][0];
+    expect((row.runAfter as Date).toISOString()).toBe(NOW.toISOString());
   });
 });

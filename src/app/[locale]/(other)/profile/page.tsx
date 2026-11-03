@@ -7,9 +7,15 @@ import { DevelopmentSection } from "@/components/profile/DevelopmentSection";
 import { showsDevelopmentSection } from "@/components/profile/dev-tools";
 import { ProfileHeader } from "@/components/profile/ProfileHeader";
 import { ProfileSettings, type ProfileAccount } from "@/components/profile/ProfileSettings";
+import { NotisInviteCard } from "@/components/signup/NotisInviteCard";
 import { StepHeading } from "@/components/signup/SignupChrome";
 import { getVoicePrintConsents } from "@/lib/db/personConsent";
+import { hasNotificationPreference } from "@/lib/db/signup";
 import { redirect } from "next/navigation";
+import { headers } from "next/headers";
+import { googleSignInAvailable } from "@/lib/auth/googleSignIn";
+import { getLinkedProviders } from "@/lib/db/accounts";
+import { ConnectedAccounts } from "@/components/profile/ConnectedAccounts";
 import { Metadata } from "next";
 import { env } from "@/env.mjs";
 
@@ -31,10 +37,21 @@ export default async function ProfilePage() {
         claimed,
         consent: consents.get(person.id) ?? null,
     }));
-    const [t, highlightsAllowed] = await Promise.all([
+    const [t, highlightsAllowed, signedUp, linkedProviders, requestHeaders] = await Promise.all([
         getTranslations("Profile"),
         canAccessMyHighlights(),
+        // Only the settings view invites; the onboarding form does not ask.
+        user.onboarded ? hasNotificationPreference(user.id) : true,
+        getLinkedProviders(user.id),
+        headers(),
     ]);
+    const googleLinked = linkedProviders.includes("google");
+    // The card is for connecting where the button works on this host, and
+    // for disconnecting wherever a link exists. Nothing to show otherwise.
+    const connections =
+        googleLinked || googleSignInAvailable(requestHeaders) ? (
+            <ConnectedAccounts googleLinked={googleLinked} />
+        ) : undefined;
     const isPreview = env.DEPLOYMENT_ENV === 'preview';
     const showDevTools = showsDevelopmentSection(isPreview);
     const administersSomething = user.isSuperAdmin || user.administers.length > 0;
@@ -44,6 +61,7 @@ export default async function ProfilePage() {
         name: user.name,
         email: user.email,
         phone: user.phone,
+        phoneVerifiedAt: user.phoneVerifiedAt,
         updatedAt: user.updatedAt,
         allowProductUpdates: user.allowProductUpdates,
         allowPetitionUpdates: user.allowPetitionUpdates,
@@ -76,6 +94,11 @@ export default async function ProfilePage() {
                 user={account}
                 persons={persons}
                 highlightsAllowed={highlightsAllowed}
+                // Offered to a reader on no municipality's list, which includes one
+                // who deleted their last municipality. An unsubscribe keeps the
+                // row, so it does not bring the offer back.
+                promo={signedUp ? undefined : <NotisInviteCard surface="profile" />}
+                connections={connections}
                 aside={administersSomething || showDevTools ? (
                     <>
                         {administersSomething && <AdminSection user={user} t={t} />}

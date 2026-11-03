@@ -1,7 +1,8 @@
 "use client";
 import { useLocale, useTranslations } from 'next-intl';
 import { captureEvent } from '@/lib/analytics/capture';
-import { City, Party, AdministrativeBody, Topic } from '@prisma/client';
+import { City, Party, Topic } from '@prisma/client';
+import type { PublicAdministrativeBody } from '@/lib/db/types';
 import { Button } from '../ui/button';
 import FormSheet from '../FormSheet';
 import PersonForm from './PersonForm';
@@ -20,10 +21,13 @@ import { motion } from 'framer-motion';
 import { ImageOrInitials } from '@/components/ImageOrInitials';
 import { PersonWithRelations } from '@/lib/db/people';
 import { cn, filterActiveRoles, filterInactiveRoles, formatDateRange, getPartyFromRoles, getRoleText } from '@/lib/utils';
+import { isIndependentCouncilMember, isMayorRole, type RoleTitles } from '@/lib/utils/roles';
+import { useRoleTitles } from '@/hooks/useRoleTitles';
 import { TWO_COLUMN_GRID_NARROW_RAIL } from '@/components/ui/surface-card';
 import { TopicFilter } from '@/components/TopicFilter';
 import { RoleWithRelations } from '@/lib/db/types';
 import { useSession } from 'next-auth/react';
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog';
 import { DebugMetadataButton } from '../ui/debug-metadata-button';
 import { AdminStrip, AdminToolButton, adminToolClass } from '@/components/admin/AdminStrip';
 import { RailCard, RailMeterRow } from '@/components/ui/rail-card';
@@ -34,19 +38,26 @@ import Icon from '@/components/icon';
 import { getLocalizedName } from '@/lib/formatters/name';
 import { topicStyle } from '@/lib/topicStyle';
 import { topicSurfaceStyle } from '@/components/TopicPill';
+import { meetingLabel } from '@/lib/meetingName';
 
 // A role name can be a full sentence (a deputy mayor's portfolio), so the chip
 // grows with the text instead of a fixed height that lets the text spill over
 // the rows below. One line still measures 24px: 2px border, 8px padding, 14px line.
 const headerChipClass = 'inline-flex items-start gap-1.5 rounded-[12px] border px-2.5 py-1 text-[11.5px] font-bold leading-[14px]';
 
-export default function PersonC({ city, person, parties, administrativeBodies, statistics, contributionTopics }: {
+export default function PersonC({ city, person, parties, administrativeBodies, statistics, contributionTopics, editableBodyIds }: {
     city: City,
     person: PersonWithRelations,
     parties: Party[],
-    administrativeBodies: AdministrativeBody[],
+    administrativeBodies: PublicAdministrativeBody[],
     statistics: Statistics,
     contributionTopics: Topic[],
+    /**
+     * The bodies the viewer may give roles on: absent for a city admin, the
+     * admin's bodies for a body admin, empty for a person who claimed their
+     * own page and edits name and photo only.
+     */
+    editableBodyIds?: string[],
 }) {
     const t = useTranslations('Person');
     const tCommon = useTranslations('Common');
@@ -60,11 +71,13 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
     // topic filter — totalCount tracks whatever the list currently shows.
     const [careerCount, setCareerCount] = useState(0);
     const [canEdit, setCanEdit] = useState(false);
+    const [confirmingDelete, setConfirmingDelete] = useState(false);
     const [selectedTopicId, setSelectedTopicId] = useState<string | null>(null);
     const [isLoadingContributions, setIsLoadingContributions] = useState(false);
     const { data: session } = useSession();
     const isSuperAdmin = session?.user?.isSuperAdmin ?? false;
     const locale = useLocale();
+    const roleTitles = useRoleTitles(city.language);
     const activeRoles = filterActiveRoles(person.roles as RoleWithRelations[]);
     const personParty = getPartyFromRoles(person.roles);
     const speakingMinutes = Math.round((statistics?.speakingSeconds ?? 0) / 60);
@@ -83,17 +96,7 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
     // Topic chips reflect the actual contributions list (already sorted server-side).
     const relevantTopics = contributionTopics;
 
-    // Check if person is an independent council member
-    const isIndependentCouncilMember = useMemo(() => {
-        const activeRoles = filterActiveRoles(person.roles as RoleWithRelations[]);
-        const partyRoles = activeRoles.filter(role => role.partyId);
-
-        if (partyRoles.length > 0) return false;
-
-        return activeRoles.some(role =>
-            role.administrativeBodyId && role.administrativeBody?.type === 'council'
-        );
-    }, [person.roles]);
+    const isIndependent = useMemo(() => isIndependentCouncilMember(person.roles), [person.roles]);
 
     useEffect(() => {
         const checkEditPermissions = async () => {
@@ -108,15 +111,15 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
             try {
                 setIsLoadingContributions(true);
                 setContributions([]);
-                const { results, totalCount } = await getLatestContributionsForSpeaker(
+                const { results, total } = await getLatestContributionsForSpeaker(
                     person.id,
                     1,
                     5,
                     selectedTopicId,
                 );
                 setContributions(results);
-                setTotalCount(totalCount);
-                if (!selectedTopicId) setCareerCount(totalCount);
+                setTotalCount(total);
+                if (!selectedTopicId) setCareerCount(total);
                 setPage(1);
             } catch (error) {
                 console.error('Error fetching contributions:', error);
@@ -167,6 +170,7 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
                 toast({
                     title: t('personDeleted', { name: person.name }),
                 });
+                setConfirmingDelete(false);
                 router.push(`/${city.id}`);
             } else {
                 const errorData = await response.json();
@@ -258,20 +262,19 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
                                         </Link>
                                     );
                                 }
-                                const cityLevel = role.cityId && !role.administrativeBodyId;
                                 return (
                                     <span
                                         key={role.id}
                                         className={cn(headerChipClass, 'border-transparent bg-muted text-muted-foreground')}
                                     >
-                                        {cityLevel && role.isHead
+                                        {isMayorRole(role)
                                             ? <Star className="mt-px h-3 w-3 shrink-0 text-[hsl(var(--orange-deep))]" aria-hidden />
                                             : <Landmark className="mt-px h-3 w-3 shrink-0" aria-hidden />}
-                                        {getRoleText(role, t)}
+                                        {getRoleText(role, roleTitles)}
                                     </span>
                                 );
                             })}
-                            {isIndependentCouncilMember && (
+                            {isIndependent && (
                                 <span className="text-sm italic text-muted-foreground">{t('independentCouncilMember')}</span>
                             )}
                             </>
@@ -303,16 +306,37 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
                                 <>
                                     <FormSheet
                                         FormComponent={PersonForm}
-                                        formProps={{ person, cityId: person.cityId, parties, administrativeBodies }}
+                                        formProps={editableBodyIds
+                                            ? {
+                                                person,
+                                                cityId: person.cityId,
+                                                parties: [],
+                                                administrativeBodies: administrativeBodies.filter(body => editableBodyIds.includes(body.id)),
+                                                canEditRoles: editableBodyIds.length > 0,
+                                                roleTypes: ['administrativeBody' as const],
+                                            }
+                                            : { person, cityId: person.cityId, parties, administrativeBodies }}
                                         title={t('editPerson')}
                                         type="edit"
                                         triggerVariant="ghost"
                                         triggerSize="sm"
                                         triggerClassName={adminToolClass}
                                     />
-                                    <AdminToolButton destructive onClick={onDelete}>
-                                        {t('deletePerson')}
-                                    </AdminToolButton>
+                                    {isSuperAdmin && (
+                                        <>
+                                            <AdminToolButton destructive onClick={() => setConfirmingDelete(true)}>
+                                                {t('deletePerson')}
+                                            </AdminToolButton>
+                                            <ConfirmDeleteDialog
+                                                open={confirmingDelete}
+                                                onOpenChange={setConfirmingDelete}
+                                                title={t('deletePerson')}
+                                                description={t('deletePersonConfirm')}
+                                                itemName={person.name}
+                                                onConfirm={onDelete}
+                                            />
+                                        </>
+                                    )}
                                 </>
                             )}
                             {isSuperAdmin && (
@@ -361,6 +385,7 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
                                         transition={{ delay: 0.1 * index }}
                                     >
                                         <ContributionCard
+                                            cityLanguage={city.language}
                                             contribution={contribution}
                                             subjectId={contribution.subject.id}
                                             meeting={{
@@ -370,7 +395,8 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
                                             }}
                                             speaker={contribution.speaker}
                                             contextHeader={{
-                                                meetingName: contribution.subject.councilMeeting.name,
+                                                // The card prints the date next to it.
+                                                meetingName: meetingLabel(contribution.subject.councilMeeting, locale, city.timezone, { date: false }),
                                                 adminBodyName: contribution.subject.councilMeeting.administrativeBody?.name ?? null,
                                                 meetingDate: contribution.subject.councilMeeting.dateTime,
                                                 subjectName: contribution.subject.name,
@@ -438,10 +464,10 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
                     <aside className="min-w-0 space-y-4 lg:pt-[3.25rem]">
                         <RailCard title={t('rolesCard')}>
                             <ul className="space-y-2.5">
-                                {activeRoles.map(role => <RoleRow key={role.id} role={role} t={t} tCommon={tCommon} />)}
+                                {activeRoles.map(role => <RoleRow key={role.id} role={role} roleTitles={roleTitles} tCommon={tCommon} />)}
                                 {activeRoles.length === 0 && (
                                     <li className="text-sm text-muted-foreground">
-                                        {isIndependentCouncilMember ? t('independentCouncilMember') : '—'}
+                                        {isIndependent ? t('independentCouncilMember') : '—'}
                                     </li>
                                 )}
                             </ul>
@@ -452,7 +478,7 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
                                         <ChevronDown className="ml-1 inline h-3.5 w-3.5 transition-transform group-open:rotate-180" aria-hidden />
                                     </summary>
                                     <ul className="mt-2.5 space-y-2.5 opacity-70">
-                                        {pastRoles.map(role => <RoleRow key={role.id} role={role} t={t} tCommon={tCommon} />)}
+                                        {pastRoles.map(role => <RoleRow key={role.id} role={role} roleTitles={roleTitles} tCommon={tCommon} />)}
                                     </ul>
                                 </details>
                             )}
@@ -495,9 +521,9 @@ export default function PersonC({ city, person, parties, administrativeBodies, s
  * Two translators: the label is `Person` copy, the date range is `Common` copy —
  * `from` and `until` exist in no other namespace.
  */
-function RoleRow({ role, t, tCommon }: {
+function RoleRow({ role, roleTitles, tCommon }: {
     role: RoleWithRelations;
-    t: ReturnType<typeof useTranslations>;
+    roleTitles: RoleTitles;
     tCommon: ReturnType<typeof useTranslations>;
 }) {
     const dates = formatDateRange(
@@ -513,13 +539,13 @@ function RoleRow({ role, t, tCommon }: {
                     style={{ backgroundColor: role.party.colorHex }}
                     aria-hidden
                 />
-            ) : role.cityId && !role.administrativeBodyId && role.isHead ? (
+            ) : isMayorRole(role) ? (
                 <Star className="mt-[3px] h-3.5 w-3.5 shrink-0 text-[hsl(var(--orange-deep))]" aria-hidden />
             ) : (
                 <Landmark className="mt-[3px] h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
             )}
             <span className="min-w-0 flex-1">
-                <span className="block text-[13px] font-semibold leading-snug">{getRoleText(role, t)}</span>
+                <span className="block text-[13px] font-semibold leading-snug">{getRoleText(role, roleTitles)}</span>
                 {dates && <span className="block text-[11.5px] text-muted-foreground">{dates}</span>}
             </span>
         </li>

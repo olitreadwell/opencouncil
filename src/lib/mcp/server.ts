@@ -1,9 +1,12 @@
-import { z } from 'zod4';
-import { AdministrativeBodyType } from '@prisma/client';
-import type { McpServer, ServerContext, CallToolResult } from '@modelcontextprotocol/server';
-import { ApiError } from '@/lib/api/errors';
+import * as z from 'zod';
+import { AdministrativeBodyType, Realm } from '@prisma/client';
+import type { McpServer, ServerContext } from '@modelcontextprotocol/server';
 import { identityFromContext } from './auth';
-import { currentMcpIdentity } from './realm-context';
+import { currentAdminAccess, currentMcpIdentity } from './realm-context';
+import { registerAdminTools } from './adminTools';
+import { category, run } from './toolSupport';
+import { latitude, longitude } from '@/lib/zod-schemas/primitives';
+import { jsonPageFields } from '@/lib/zod-schemas/listQuery';
 import {
     mcpCreateHighlight,
     mcpFetch,
@@ -26,42 +29,17 @@ import {
     mcpSearch,
 } from './data';
 
-function json(data: unknown): CallToolResult {
-    return { content: [{ type: 'text', text: JSON.stringify(data) }] };
-}
-
-function errorResult(message: string): CallToolResult {
-    return { isError: true, content: [{ type: 'text', text: message }] };
-}
-
-/**
- * Wrap a tool implementation so ApiErrors surface as readable tool errors and
- * anything unexpected stays generic (no stack traces to clients).
- */
-async function run(fn: () => Promise<unknown>): Promise<CallToolResult> {
-    try {
-        return json(await fn());
-    } catch (error) {
-        if (error instanceof ApiError) {
-            return errorResult(error.message);
-        }
-        console.error('MCP tool error:', error);
-        return errorResult('Internal error');
-    }
-}
-
-/**
- * Tool grouping, stamped into each tool's `_meta`. Not decorative: the
- * PostHog MCP analytics SDK reads exactly `_meta.category` into
- * $mcp_tool_category, so these strings become analytics dimensions — keep
- * them stable, and keep this union the only place they are defined.
- */
-type ToolCategory = 'discovery' | 'directory' | 'meetings' | 'highlights';
-const category = (category: ToolCategory) => ({ category });
-
 const paginationShape = {
-    page: z.number().int().min(1).default(1).describe('Page number, starting at 1'),
+    page: jsonPageFields.page.default(1).describe('Page number, starting at 1'),
 };
+
+/**
+ * The body-type filter list_meetings and search share. min(1): the data layer
+ * skips an empty filter, so `[]` would widen the query to every body — the
+ * opposite of what passing it means.
+ */
+const administrativeBodyTypesFilter = z.array(z.enum(AdministrativeBodyType)).min(1).optional()
+    .describe('Restrict to bodies of these kinds: council (Δημοτικό or Περιφερειακό Συμβούλιο; also matches meetings with no body, from cities imported before bodies existed), committee (Δημοτική or Περιφερειακή Επιτροπή), community (Δημοτική Κοινότητα; municipalities only)');
 
 /**
  * The render settings both highlight write tools accept. Shared so the two
@@ -84,17 +62,17 @@ export function registerOpenCouncilServer(server: McpServer) {
             _meta: category('discovery'),
             description:
                 'Full-text and semantic search over council meeting subjects (agenda items). ' +
-                'Filter by city, person, party, topic or date range. With a query, results are ' +
+                'Filter by city, person, party, administrative body, topic or date range. With a query, results are ' +
                 'ranked by relevance, not by date: the top hit is not the most recent match, and ' +
                 'absence from the first page is not absence from the record — page on, or widen ' +
                 'the filters, before concluding something does not exist. It ranks subjects, not ' +
-                'meetings, and cannot filter by administrative body — use list_meetings for that. ' +
+                'meetings — to find when a body last met, use list_meetings. ' +
                 'Omit the query to list everything matching the filters, newest first — e.g. all ' +
                 'subjects a person spoke about, or all subjects in a date range. ' +
                 'Returns compact results with URLs; ' +
-                'use get_subject / get_subject_transcript with a result id for details. `total` is ' +
+                'use get_subject / get_subject_transcript with a result id for details. `pagination.total` is ' +
                 'the search index\'s own match count — report it as approximate ("about N"), and ' +
-                'note it is omitted entirely when results had to be withheld. It searches subjects, so ' +
+                'note it and `pagination.totalPages` are omitted when results had to be withheld. It searches subjects, so ' +
                 'a meeting that is transcribed but not yet summarized has nothing here to match — use ' +
                 'list_meetings before you report that a topic was never discussed.',
             inputSchema: z.object({
@@ -102,11 +80,14 @@ export function registerOpenCouncilServer(server: McpServer) {
                 cityIds: z.array(z.string()).optional().describe('Restrict to these city IDs (see list_cities)'),
                 personIds: z.array(z.string()).optional().describe('Restrict to subjects a person spoke about'),
                 partyIds: z.array(z.string()).optional().describe('Restrict to subjects a party spoke about'),
+                administrativeBodyIds: z.array(z.string().min(1)).min(1).optional()
+                    .describe('Restrict to subjects of meetings of these administrative bodies (see get_city). An unknown id is an error, not an empty list. With administrativeBodyTypes also set, a subject must match both'),
+                administrativeBodyTypes: administrativeBodyTypesFilter,
                 topics: z.array(z.string()).optional()
                     .describe('Restrict to these topic labels, as returned in results (e.g. "Παιδεία", "Συγκοινωνίες"). An unknown label answers with the full list'),
                 dateFrom: z.iso.date().optional().describe('ISO date (YYYY-MM-DD), inclusive'),
                 dateTo: z.iso.date().optional().describe('ISO date (YYYY-MM-DD), inclusive'),
-                pageSize: z.number().int().min(1).max(20).default(10),
+                pageSize: jsonPageFields.pageSize.max(20).default(10),
                 ...paginationShape,
             }),
         },
@@ -157,8 +138,8 @@ export function registerOpenCouncilServer(server: McpServer) {
                 'bound the window, so report an empty list as "nothing since {oldestMeetingScanned}", ' +
                 'never as "nothing ever".',
             inputSchema: z.object({
-                lat: z.number().min(-90).max(90).describe('Latitude (WGS84)'),
-                lng: z.number().min(-180).max(180).describe('Longitude (WGS84)'),
+                lat: latitude.describe('Latitude (WGS84)'),
+                lng: longitude.describe('Longitude (WGS84)'),
                 radiusMeters: z.number().int().min(50).max(10000).default(1000)
                     .describe('Radius in meters around the point for location-pinned subjects'),
                 limit: z.number().int().min(1).max(50).default(10),
@@ -190,9 +171,14 @@ export function registerOpenCouncilServer(server: McpServer) {
             annotations: { readOnlyHint: true, openWorldHint: false },
             _meta: category('directory'),
             description: 'List the municipalities available on OpenCouncil, with ids and counts.',
-            inputSchema: z.object({}),
+            inputSchema: z.object({
+                realm: z.enum(Realm).optional()
+                    .meta({ description: 'Superadmins only: list another realm than the one of this domain (list_realms names them).' }),
+                includePending: z.boolean().optional()
+                    .meta({ description: 'Superadmins only: include the cities that are not public yet, with their status and content language.' }),
+            }),
         },
-        () => run(() => mcpListCities())
+        (args, ctx: ServerContext) => run(() => mcpListCities(identityFromContext(ctx), args))
     );
 
     server.registerTool(
@@ -204,7 +190,7 @@ export function registerOpenCouncilServer(server: McpServer) {
             description:
                 'Get a municipality profile: its political parties, and its administrative ' +
                 'bodies — the council, committees and κοινότητες that hold meetings. Each body ' +
-                'carries the id that list_meetings filters by.',
+                'carries the id that list_meetings and search filter by.',
             inputSchema: z.object({ cityId: z.string().min(1) }),
         },
         (args, ctx: ServerContext) => run(() => mcpGetCity(args.cityId, identityFromContext(ctx)))
@@ -261,9 +247,13 @@ export function registerOpenCouncilServer(server: McpServer) {
                 'scheduled meeting sorts ahead of every held one — pass timeFilter to separate ' +
                 'them. administrativeBodyIds answers "when did this body last meet": pair it ' +
                 'with timeFilter "past" for the last held session, "upcoming" for the next one. ' +
-                'Each row carries subjectCount and hasTranscript: `subjectCount: 0` with ' +
-                '`hasTranscript: true` is a meeting that is transcribed but not yet summarized, ' +
-                'and get_transcript still holds everything that was said in it.',
+                'Each row carries subjectCount, hasTranscript and summarized: `hasTranscript: true` ' +
+                'with `summarized: false` is a meeting that is transcribed but not yet summarized — ' +
+                'with no subjects, or with the agenda document\'s items only — and get_transcript ' +
+                'still holds everything that was said in it. '
+                + 'Read scheduleStatus before you call a row the last meeting of a body: a '
+                + '"postponed" or "cancelled" meeting did not take place on its date. '
+                + 'postponedFromDate is set on the new meeting of a postponement.',
             inputSchema: z.object({
                 cityId: z.string().min(1),
                 from: z.iso.date().optional().describe('ISO date (YYYY-MM-DD), inclusive'),
@@ -272,9 +262,8 @@ export function registerOpenCouncilServer(server: McpServer) {
                     .describe('Keep only meetings already held ("past") or still to come ("upcoming"). Omitted, the list holds both'),
                 administrativeBodyIds: z.array(z.string().min(1)).min(1).optional()
                     .describe('Restrict to these administrative body ids (see get_city). An unknown id is an error, not an empty list. Takes precedence over administrativeBodyTypes'),
-                administrativeBodyTypes: z.array(z.enum(AdministrativeBodyType)).min(1).optional()
-                    .describe('Restrict to bodies of these kinds: council (Δημοτικό or Περιφερειακό Συμβούλιο), committee (Δημοτική or Περιφερειακή Επιτροπή), community (Δημοτική Κοινότητα; municipalities only)'),
-                pageSize: z.number().int().min(1).max(50).default(10),
+                administrativeBodyTypes: administrativeBodyTypesFilter,
+                pageSize: jsonPageFields.pageSize.max(50).default(10),
                 ...paginationShape,
             }),
         },
@@ -308,9 +297,14 @@ export function registerOpenCouncilServer(server: McpServer) {
                 'agenda order does not reflect weight. Subjects are returned in agenda order. ' +
                 'An empty `subjects` list does not mean an empty meeting: subjects come from a ' +
                 'summarization step that runs after transcription, so a meeting can hold the full ' +
-                'verbatim record and no agenda yet. Read `hasTranscript` — when it is true, work ' +
-                'from get_transcript instead (summarize it yourself, quote it, or clip a highlight ' +
-                'from it) rather than reporting that there is nothing to show.',
+                'verbatim record and no agenda yet. Read `hasTranscript` and `summarized` — while ' +
+                '`summarized` is false, the subjects are at most the agenda document\'s items, with no ' +
+                'discussion, no contributions and nothing raised before the agenda; work from ' +
+                'get_transcript instead (summarize it yourself, quote it, or clip a highlight ' +
+                'from it) rather than reporting that there is nothing to show or that an item was ' +
+                'not raised. Each subject carries nonAgendaReason: "beforeAgenda" for an item raised ' +
+                'before the agenda (προ ημερησίας), "outOfAgenda" for an urgent item added to it. '
+                + 'scheduleStatus "postponed" or "cancelled" means that the meeting did not take place on its date.',
             inputSchema: z.object({
                 cityId: z.string().min(1),
                 meetingId: z.string().min(1),
@@ -370,18 +364,28 @@ export function registerOpenCouncilServer(server: McpServer) {
                 'resolved as of the meeting date. Long — prefer ' +
                 'get_subject_transcript when you care about one subject. Pass personId for ' +
                 'everything one councillor said in the meeting (the way to gather their own ' +
-                'moments). Set includeUtteranceIds to get utterance ids for highlight creation. ' +
+                'moments). Pass query for the segments that say a word, a name or a body: search ' +
+                'ranks subjects by their summaries, so a verbatim mention is reachable only here — ' +
+                'one call per meeting. Set includeUtteranceIds to get utterance ids for highlight creation. ' +
                 'This is also the whole record of a meeting that get_meeting reports with ' +
-                '`hasTranscript: true` and no subjects — one that is transcribed but not yet ' +
-                'summarized. For such a meeting this is the only record — summarize it, quote it, ' +
+                '`hasTranscript: true` and `summarized: false` — one that is transcribed but not yet ' +
+                'summarized, with no subjects or with the agenda document\'s items only. For such a ' +
+                'meeting this is the only record — summarize it, quote it, ' +
                 'and pick highlight utterances from it. It carries no agenda, decision or vote ' +
                 'tally, so never report those from a transcript alone.',
-            inputSchema: z.object({
+            // Strict: a client that still sends the old segmentsPerPage gets an
+            // error, not the default page size and page numbers that no longer match.
+            inputSchema: z.strictObject({
                 cityId: z.string().min(1),
                 meetingId: z.string().min(1),
                 personId: z.string().optional()
                     .describe('Only this person\'s segments (see list_people)'),
-                segmentsPerPage: z.number().int().min(1).max(100).default(40),
+                query: z.string().trim().min(2).max(100).optional()
+                    .describe('Only segments whose words contain every term, accent- and case-insensitive. ' +
+                        'For «was X mentioned» and «what was said about X». Combine with personId for one ' +
+                        'person\'s words on X. Matched segments carry snippets around the hits.'),
+                pageSize: jsonPageFields.pageSize.max(100).default(40)
+                    .describe('Speaker segments per page'),
                 includeUtteranceIds: z.boolean().default(false),
                 ...paginationShape,
             }),
@@ -393,9 +397,10 @@ export function registerOpenCouncilServer(server: McpServer) {
                     args.meetingId,
                     {
                         page: args.page,
-                        segmentsPerPage: args.segmentsPerPage,
+                        pageSize: args.pageSize,
                         includeUtteranceIds: args.includeUtteranceIds,
                         personId: args.personId,
+                        query: args.query,
                     },
                     identityFromContext(ctx)
                 )
@@ -468,11 +473,19 @@ export function registerOpenCouncilServer(server: McpServer) {
     if (currentMcpIdentity()) {
         registerHighlightTools(server);
     }
+
+    // Same rule, one level up: the admin tools go only to a caller who has
+    // admin access, and the access decides which of them. After the highlight
+    // suite, so every list a caller sees is a prefix of the next larger one.
+    const adminAccess = currentAdminAccess();
+    if (adminAccess) {
+        registerAdminTools(server, adminAccess);
+    }
 }
 
 /**
  * The highlight suite: creation, rendering, listing, showcasing. Every one
- * of these requires an identity (mcp_ or sk_ token), so they are only
+ * of these requires an identity (an mcp_ token), so they are only
  * registered — and therefore only advertised — on authenticated connections.
  */
 function registerHighlightTools(server: McpServer) {

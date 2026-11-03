@@ -1,7 +1,8 @@
 import { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import Link from 'next/link';
-import { MapPin, Calendar, Building2, ChevronRight, Bell, Mail, MessageSquare, Clock, Youtube } from 'lucide-react';
+import { MapPin, Calendar, Building2, ChevronRight, Bell, Mail, MessageSquare, Clock } from 'lucide-react';
+import { SiYoutube } from 'react-icons/si';
 import { formatDistanceToNow } from 'date-fns';
 import { el } from 'date-fns/locale';
 import { formatDate } from '@/lib/formatters/time';
@@ -13,10 +14,11 @@ import { ColorPercentageRing } from '@/components/ui/color-percentage-ring';
 import { getNotificationForView } from '@/lib/db/notifications';
 import { stripMarkdown } from '@/lib/formatters/markdown';
 import NotificationOpenTracker from '@/components/analytics/NotificationOpenTracker';
+import { hasPublicRecording } from '@/lib/meetingLifecycleRules';
 
 // Personalized notification view — keep it out of search indexes.
 export const metadata: Metadata = {
-    title: 'Ειδοποίηση | OpenCouncil',
+    title: 'Ενημέρωση | OpenCouncil',
     robots: { index: false, follow: false },
 };
 
@@ -31,7 +33,7 @@ export default async function NotificationPage(props: { params: Promise<{ id: st
     const meeting = notification.meeting;
     const city = notification.city;
     const meetingDate = new Date(meeting.dateTime);
-    const typeLabel = notification.type === 'beforeMeeting' ? 'Ειδοποίηση επερχόμενης συνεδρίασης' : 'Ειδοποίηση πρόσφατης συνεδρίασης';
+    const typeLabel = notification.type === 'beforeMeeting' ? 'Ενημέρωση για επερχόμενη συνεδρίαση' : 'Ενημέρωση για πρόσφατη συνεδρίαση';
 
     return (
         <div className="min-h-screen py-6 sm:py-8 px-4 sm:px-6 lg:px-8">
@@ -228,22 +230,28 @@ export default async function NotificationPage(props: { params: Promise<{ id: st
                         <Card className="bg-muted/30">
                             <CardContent className="pt-4 pb-4">
                                 <p className="text-center text-xs sm:text-sm text-muted-foreground leading-relaxed">
-                                    Αυτή η συνεδρίαση είναι προγραμματισμένη για τις {formatDate(meetingDate)}.
-                                    {meeting.administrativeBody?.youtubeChannelUrl ? (
-                                        <> Μπορείτε να τη δείτε{' '}
-                                            <a
-                                                href={meeting.administrativeBody.youtubeChannelUrl}
-                                                target="_blank"
-                                                rel="noopener noreferrer"
-                                                className="inline-flex items-baseline gap-1 text-primary hover:text-primary/80 underline"
-                                            >
-                                                <Youtube className="w-3.5 h-3.5 shrink-0 relative top-0.5" />
-                                                <span>στο κανάλι του Δήμου στο YouTube</span>
-                                            </a>
-                                            , ή μερικές ώρες αργότερα στο OpenCouncil.
-                                        </>
+                                    {!hasPublicRecording(meeting) ? (
+                                        <>Αυτή η συνεδρίαση θα γίνει δια περιφοράς, με γραπτή ψηφοφορία, στις {formatDate(meetingDate)}. Οι αποφάσεις θα εμφανιστούν στο OpenCouncil μόλις δημοσιευτούν στη Διαύγεια.</>
                                     ) : (
-                                        <> Μπορείτε να τη δείτε μερικές ώρες αργότερα στο OpenCouncil.</>
+                                        <>
+                                            Αυτή η συνεδρίαση είναι προγραμματισμένη για τις {formatDate(meetingDate)}.
+                                            {meeting.administrativeBody?.youtubeChannelUrl ? (
+                                                <> Μπορείτε να τη δείτε{' '}
+                                                    <a
+                                                        href={meeting.administrativeBody.youtubeChannelUrl}
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                        className="inline-flex items-baseline gap-1 text-primary hover:text-primary/80 underline"
+                                                    >
+                                                        <SiYoutube className="w-3.5 h-3.5 shrink-0 relative top-0.5" aria-hidden />
+                                                        <span>στο κανάλι του Δήμου στο YouTube</span>
+                                                    </a>
+                                                    , ή μερικές ώρες αργότερα στο OpenCouncil.
+                                                </>
+                                            ) : (
+                                                <> Μπορείτε να τη δείτε μερικές ώρες αργότερα στο OpenCouncil.</>
+                                            )}
+                                        </>
                                     )}
                                 </p>
                             </CardContent>

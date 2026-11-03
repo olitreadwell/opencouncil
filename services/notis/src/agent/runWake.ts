@@ -1,14 +1,18 @@
 import { buildDecisionEntry } from "./decisions";
+import { findUngroundedLinks, isServerResultBlock, linksOnly } from "./links";
 import { addUsage, emptyUsage, normalizeUsage, usageToCost } from "./pricing";
 import { assembleSystem, assembleUserTurn, neutralizeFences } from "./prompt";
+import { SUPPORT_REQUEST_KINDS } from "./schemas";
 import { buildMcpServers, buildTools } from "./tools";
 import {
   Deps,
   RecordedTurn,
+  SupportRequestKind,
   WakeEvent,
   WakeOutcome,
   WakeState,
   WakeTrace,
+  isResearchBlock,
   isTextBlock,
   isToolUseBlock,
 } from "./types";
@@ -25,6 +29,14 @@ const MAX_REPAIR_TURNS = 4;
 /** Longest commitment handle we store. The tool asks for a short one; this is
  *  what happens when the model does not oblige. */
 const SLUG_MAX_CHARS = 40;
+
+/** Longest support-request summary we store. The tool asks for one to three
+ *  sentences; the operator reads the reader's own words beside it. */
+const SUMMARY_MAX_CHARS = 600;
+
+function isSupportRequestKind(value: string): value is SupportRequestKind {
+  return (SUPPORT_REQUEST_KINDS as readonly string[]).includes(value);
+}
 
 /**
  * A commitment slug, forced into the shape the tool describes: lowercase
@@ -44,6 +56,66 @@ function normalizeSlug(input: unknown): string {
     .replaceAll(/-{2,}/g, "-")
     .replaceAll(/^-|-$/g, "")
     .slice(0, SLUG_MAX_CHARS);
+}
+
+/**
+ * Markup that must never reach a reader: web_fetch citation tags that the
+ * model copies from a fetched page (seen in three production messages). The
+ * cited words stay; only the tags go.
+ */
+export function sanitizeMessageText(text: string): string {
+  return text.replace(/<\/?cite\b[^>]*>/gi, "").trim();
+}
+
+/**
+ * A promise to come back, in the model's own Greek. finish_wake asks the
+ * model whether it promised anything, but in production 30 messages made a
+ * promise while the answer said no — the text itself is the better witness.
+ */
+export const PROMISE_PATTERN =
+  /(?<!δεν )(θα (σε|σας) (ενημερώσω|κρατ(ήσω|άω) ενήμερ)|θα επανέλθω|θα (σου|σας) (πω|γράψω|ξαναγράψω) (μόλις|όταν|αν|αφού|τι|πώς|πότε|ποι)|θα το κρατήσω|το κρατάω)/iu;
+
+/**
+ * Does prose written next to tool calls read like a message to the reader?
+ * In production, 1,548 of 1,654 "stranded prose" nudges answered «that was
+ * internal reasoning»: at low effort the model sometimes writes its reasoning
+ * as text instead of a thinking block. Reasoning is English; a message to a
+ * Greek reader is Greek — and a draft that was then sent is not stranded.
+ */
+export function proseLooksLikeAMessage(prose: string, sent: string[]): boolean {
+  // A link is Latin letters that say nothing about the language of the prose.
+  const words = prose.replace(/https?:\/\/\S+/g, "");
+  const greek = (words.match(/\p{Script=Greek}/gu) ?? []).length;
+  const latin = (words.match(/\p{Script=Latin}/gu) ?? []).length;
+  if (greek <= latin) return false;
+  // Only a sent message of some length can vouch that the prose went out:
+  // «Ναι.» inside a 200-character paragraph proves nothing.
+  const head = prose.slice(0, 80);
+  return !sent.some(
+    (s) => s.length >= 40 && (s.includes(head) || prose.includes(s.slice(0, 80))),
+  );
+}
+
+/**
+ * The nudge for a wake that sent its holding line («Μισό, να το κοιτάξω»),
+ * researched, and finished without the answer. In production the answer sat
+ * in a thinking block, finish_wake said «send», and the reader got only the
+ * holding line — the zero-send check cannot see it because the holding line
+ * is a send.
+ */
+function holdingOnlyNudge(line: string, where: "finish" | "end-turn"): string {
+  const lead =
+    where === "end-turn" ? "Your final text above is an operator rationale — it was NOT delivered. " : "";
+  return (
+    `(system check) ${lead}The only thing the reader has received in this wake is your holding line:\n«` +
+    line.slice(0, 300) +
+    "»\nYou researched after sending it, and NOTHING has gone out since — the answer you " +
+    "found exists only in your reasoning, and nothing reaches the reader except " +
+    "send_message content. They are still waiting for it. Call send_message with the " +
+    "answer now, then finish_wake again with the wake's own rationale — about the reader " +
+    "and this wake's decision, never about this check. If there is truly nothing more to " +
+    "tell them, call finish_wake again to confirm."
+  );
 }
 
 function textOf(content: unknown[]): string {
@@ -76,8 +148,9 @@ export async function runWake(
   if (eventsInput.length === 0) throw new Error("runWake: no events");
   const events = [...eventsInput].sort((a, b) => a.at.localeCompare(b.at));
   const hasUserMessage = events.some((e) => e.type === "user_message");
+  const effort = hasUserMessage ? deps.config.reactiveEffort : deps.config.effort;
   const started = deps.now().getTime();
-  const system = assembleSystem(deps.prompts);
+  const system = assembleSystem(deps.prompts, deps.config.model);
   // <current_time> is when this wake is being processed — the caller says
   // when that is. The shell passes the wall clock: a quiet-hours clamp or a
   // pause deferral can put hours or days between an event and its wake, and
@@ -117,11 +190,24 @@ export async function runWake(
   };
 
   const sent: string[] = [];
+  // True while a research block sits after the last delivered send. A holding
+  // line followed by research and no further send is an answer the reader
+  // never got; a send held by the shell delivered nothing and does not reset it.
+  let researchedSinceLastSend = false;
+  // Whether the last delivered send was declared a holding line (send_message
+  // with holding: true). Declared, not inferred: a short linkless message can
+  // be a complete answer, so only the model can say which send was the line
+  // before the research.
+  let lastSendIsHolding = false;
   // Commitments opened and closed this wake. The shell applies them; the core
   // stays free of side effects apart from deliver/absorb.
   const commitmentsRecorded: Array<{ slug: string; what: string }> = [];
   const commitmentsResolved: string[] = [];
   let declaredPromise = false;
+  // finish_wake's own account of the decision. The shell derives the real
+  // decision from the sends; this is what the model BELIEVED it did, and a
+  // «send» with nothing sent is a lost message the shell can catch.
+  let declaredDecision: "send" | "silence" | undefined;
   // Reader messages that arrived mid-run and were absorbed into this wake —
   // their own queued wakes are consumed by deps.absorb, so answering them
   // here is not optional: nobody else will.
@@ -176,6 +262,21 @@ export async function runWake(
   let profileRewrite: string | undefined;
   const scheduledWakes: Array<{ at: string; reason: string }> = [];
   let unsubscribe: { reason: string } | undefined;
+  // Reactive wakes only: the prompt defines holding lines for reader
+  // questions. Not gated on declaredDecision — a declared «silence» after a
+  // holding line is the same lost answer.
+  const holdingOwed = () => hasUserMessage && lastSendIsHolding && researchedSinceLastSend && !unsubscribe;
+  // The support request this wake opened or withdrew. The two are exclusive
+  // within one wake and the later call wins, so an open that the reader
+  // declines before the wake ends files nothing. Unlike the unsubscribe
+  // latch, a reader update mid-run does not clear it: it is reversible with
+  // withdraw_support_request, and a newer message does not undo that the
+  // reader was unhappy.
+  let supportRequestOpen: { kind: SupportRequestKind; summary: string } | undefined;
+  let supportRequestWithdraw: { reason: string } | undefined;
+  // The state can also carry a request that ended recently; only an open one
+  // can be updated or withdrawn.
+  const hasOpenRequest = state.supportRequest?.status === "open";
   let rationale = "";
   let refused = false;
   // Repairs come in two kinds and must not compete for one budget. A
@@ -186,7 +287,14 @@ export async function runWake(
   // single nudge on the commitment, and the reader got nothing at all.
   let deliveryRepaired = false;
   let bookkeepingRepaired = false;
+  // A send held because its link came from nowhere gets one nudge of its
+  // own: it is neither a delivery repair (the model did try to send) nor
+  // bookkeeping (the reader is owed the message).
+  let linkRepaired = false;
   let finished = false;
+  // finish_wake was called at least once. `finished` is reset when a nudge
+  // asks for a second call; a wake whose nudge went unanswered still finished.
+  let everFinished = false;
   // Instrument-panel truth: repairs that fired, and terminal anomalies. A
   // rescued or cut wake must never be indistinguishable from a healthy one —
   // the silence rate and the review queue read these records.
@@ -211,6 +319,16 @@ export async function runWake(
   // "rationale" is reliably meta chatter about the check itself.
   let preNudgeRationale: string | undefined;
   let sentAtNudge = -1;
+  const saveRationaleBeforeNudge = () => {
+    // A second nudge must not replace the genuine rationale with the model's
+    // answer to the first one («that prose was internal reasoning») — which
+    // is what the decision log kept whenever two nudges fired. The current
+    // rationale is genuine only if a send happened since the last nudge.
+    if (preNudgeRationale === undefined || sent.length !== sentAtNudge) {
+      preNudgeRationale = rationale;
+    }
+    sentAtNudge = sent.length;
+  };
 
   // Fail-forward fence: once a delivery attempt has been made, an error can
   // no longer roll this wake back — a retry would re-run the model after the
@@ -234,8 +352,8 @@ export async function runWake(
    * A nudge asks the model to do something, so it needs a turn to be
    * answered in. Fired on the last allowed turn it gets none: the loop
    * exits with the nudge unanswered, the repair never happens, and the wake
-   * records finishWakeMissing — a contract breach the model did not commit,
-   * on a turn it was never given. Each repair kind is one-shot, so the
+   * records «nudge/unanswered» among its repairs — the model was asked on a
+   * turn it was never given. Each repair kind is one-shot, so the
    * repair paths ask at most twice, and only for a wake already at the
    * ceiling. The pause path asks again for a nudge it left outstanding, so
    * MAX_REPAIR_TURNS bounds the total.
@@ -245,57 +363,62 @@ export async function runWake(
     if (turn + 1 >= deps.config.maxTurns + bonusTurns + repairTurns) repairTurns++;
   };
   /**
+   * Everything this wake has read from OUTSIDE itself, which is what can
+   * vouch for a link: the links written in the prompts, the events (their
+   * briefs carry every subject url and id), what the reader wrote — in the
+   * conversation and in the messages absorbed mid-run — and the
+   * server-produced result blocks of every assistant turn, the current one
+   * included. Left out on purpose: the model's own blocks (see links.ts), the
+   * shell's tool_results and nudges, which quote a held link back to the
+   * model, and the model's own past output in the user turn — its earlier
+   * sends, the profile, the memory and the decision log. A link the model
+   * once composed sits in all of those, and must not vouch for itself on
+   * the next wake. The prompts contribute only their links, never their
+   * prose, which names a bad example slug.
+   */
+  const groundingStatic = [
+    linksOnly(system.map((s) => s.text)),
+    JSON.stringify(events),
+    ...state.conversation.filter((m) => m.from === "reader").map((m) => m.text),
+  ].join("\n");
+  const groundingText = (current: unknown[]): string => {
+    const parts: string[] = [groundingStatic];
+    for (const e of absorbedAll) {
+      if (e.type === "user_message") parts.push(e.text);
+    }
+    for (const m of messages) {
+      const msg = m as { role?: string; content?: unknown };
+      if (msg.role === "assistant" && Array.isArray(msg.content)) {
+        parts.push(JSON.stringify(msg.content.filter(isServerResultBlock)));
+      }
+    }
+    parts.push(JSON.stringify(current.filter(isServerResultBlock)));
+    return parts.join("\n");
+  };
+  /**
    * The API rejects any request whose assistant turn carries `tool_use`
    * blocks that the next message does not answer — and the whole wake dies
-   * with a 400 that every retry reproduces. The loop answers them on every
-   * path it knows about; this is the backstop for the ones it does not, seen
-   * in a live eval as «`tool_use` ids were found without `tool_result`
-   * blocks». Synthesizing the missing acks costs nothing and keeps the
-   * conversation well-formed.
+   * with a 400 that every retry reproduces («`tool_use` ids were found without
+   * `tool_result` blocks»). The loop answers every tool call it dispatches, on
+   * every stop reason, so an unanswered call can only sit at the TAIL of the
+   * list, on a path this loop does not know yet. This backstop answers that
+   * tail by appending, and only by appending: Sonnet 5.5 binds its thinking
+   * blocks to the conversation prefix, so inserting a message before a later
+   * assistant turn would invalidate that turn's blocks.
    */
   const answerDanglingToolCalls = () => {
-    let repaired = false;
-    // Every assistant turn, not just the last one. The end_turn repair paths
-    // append the assistant turn and then a plain-text nudge, so a turn that
-    // carried tool calls is orphaned in the MIDDLE of the list — checking only
-    // the tail never saw it, and the request 400s on a message far behind.
-    for (let i = 0; i < messages.length; i++) {
-      const msg = messages[i] as { role?: string; content?: unknown };
-      if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
-      const calls = msg.content.filter(isToolUseBlock);
-      if (calls.length === 0) continue;
-
-      const next = messages[i + 1] as { role?: string; content?: unknown } | undefined;
-      const answered = new Set<string>();
-      if (next?.role === "user" && Array.isArray(next.content)) {
-        for (const block of next.content) {
-          const b = block as { type?: string; tool_use_id?: string };
-          if (b?.type === "tool_result" && b.tool_use_id) answered.add(b.tool_use_id);
-        }
-      }
-      const missing = calls.filter((c) => !answered.has(c.id));
-      if (missing.length === 0) continue;
-
-      repaired = true;
-      const results = missing.map((b) => ({
-        type: "tool_result",
-        tool_use_id: b.id,
-        content: "noted",
-      }));
-      // tool_result blocks must lead their user message, so merge at the front
-      // rather than appending after the nudge text.
-      if (next?.role === "user" && Array.isArray(next.content)) {
-        next.content.unshift(...results);
-      } else {
-        messages.splice(i + 1, 0, { role: "user", content: results });
-      }
-    }
-    // Once per wake, like every other tag here — the backstop runs on every
-    // turn, so pushing per invocation double-counts a wake that orphans calls
-    // on two separate turns.
-    if (repaired && !repairs.includes("dangling-tool-calls")) {
-      repairs.push("dangling-tool-calls");
-    }
+    const last = messages[messages.length - 1] as
+      | { role?: string; content?: unknown }
+      | undefined;
+    if (!last || last.role !== "assistant" || !Array.isArray(last.content)) return;
+    const calls = last.content.filter(isToolUseBlock);
+    if (calls.length === 0) return;
+    messages.push({
+      role: "user",
+      content: calls.map((b) => ({ type: "tool_result", tool_use_id: b.id, content: "noted" })),
+    });
+    // Once per wake, like every other tag here.
+    if (!repairs.includes("dangling-tool-calls")) repairs.push("dangling-tool-calls");
   };
 
   try {
@@ -315,7 +438,7 @@ export async function runWake(
       messages,
       tools: buildTools(),
       mcp_servers: buildMcpServers(deps.config.mcpUrl),
-      output_config: { effort: deps.config.effort },
+      output_config: { effort },
     });
 
     const usage = normalizeUsage(response.usage);
@@ -324,6 +447,9 @@ export async function runWake(
 
     const text = textOf(response.content);
     if (text) rationale = text;
+    // A turn that holds only server-side blocks never reaches the dispatch
+    // loop below, so the research is noted here as well.
+    if (response.content.some(isResearchBlock)) researchedSinceLastSend = true;
 
     if (response.stop_reason === "refusal") {
       refused = true;
@@ -347,7 +473,17 @@ export async function runWake(
     // all, but the nudge has had its turn.
     nudgeOutstanding = false;
 
-    if (response.stop_reason === "tool_use" || response.stop_reason === "pause_turn") {
+    // Dispatch on the content, not only on the stop reason: the model sometimes
+    // ends a turn that carries finish_wake (or a send) with stop_reason
+    // end_turn, and skipping those calls lost the rationale of 25 production
+    // wakes. A max_tokens turn is the one exception — its last tool_use block
+    // can be cut mid-JSON.
+    const hasClientToolCalls = response.content.some(isToolUseBlock);
+    if (
+      response.stop_reason === "tool_use" ||
+      response.stop_reason === "pause_turn" ||
+      (hasClientToolCalls && response.stop_reason !== "max_tokens")
+    ) {
       // Last look before bytes leave: if the reader wrote again while this
       // turn was streaming, hold its sends — the model re-decides with the
       // new message in hand instead of delivering a superseded answer.
@@ -367,20 +503,48 @@ export async function runWake(
         }
       }
       const results: unknown[] = [];
+      // Links a send_message of this turn carried that nothing vouches for.
+      // The send is held, the model is told why in the tool_result, and a
+      // finish_wake in the same turn earns the nudge below.
+      const heldLinks: string[] = [];
+      const vouchedText = response.content.some((b) => isToolUseBlock(b) && b.name === "send_message")
+        ? groundingText(response.content)
+        : "";
       for (const block of response.content) {
+        // In order: a send that precedes the research in the same turn is a
+        // holding line; one that follows it is the answer.
+        if (isResearchBlock(block)) {
+          researchedSinceLastSend = true;
+          continue;
+        }
         if (!isToolUseBlock(block)) continue;
         let ack = "noted";
         switch (block.name) {
           case "send_message": {
-            const t = String(block.input.text ?? "");
+            const t = sanitizeMessageText(String(block.input.text ?? ""));
             if (holdNote) {
               ack =
                 "held: the reader sent a new message before delivery (see the reader " +
                 "update below) — nothing was sent; decide again what to send now";
               break;
             }
+            const ungrounded = findUngroundedLinks(t, vouchedText);
+            if (ungrounded.length > 0) {
+              heldLinks.push(...ungrounded);
+              if (!repairs.includes("ungrounded-link/held")) repairs.push("ungrounded-link/held");
+              ack =
+                `not sent: the link ${ungrounded.join(" and ")} did not come from any tool ` +
+                "result in this wake, from the brief or from the conversation, and a composed " +
+                "link is usually wrong — a slug made from a name is a 404 in the reader's " +
+                "hands. Send the message again with a link copied from a url field a tool " +
+                "returned (look it up first if you must: get_person, list_people, search, " +
+                "get_meeting), or without that link.";
+              break;
+            }
             if (t) {
               sent.push(t);
+              researchedSinceLastSend = false;
+              lastSendIsHolding = block.input.holding === true;
               if (deps.deliver) {
                 deliveryAttempts++;
                 const result = await deps.deliver(t);
@@ -471,6 +635,61 @@ export async function runWake(
             }
             unsubscribe = { reason: String(block.input.reason ?? "") };
             break;
+          case "open_support_request": {
+            if (holdNote) {
+              ack = "held: re-decide after the reader update below";
+              break;
+            }
+            // Only the reader's own message can open a request about the
+            // reader: a proactive wake has nobody in it to be unhappy.
+            if (!hasUserMessage) {
+              ack =
+                "ignored: a support request is only available while replying to the " +
+                "reader; this wake has no reader message";
+              break;
+            }
+            const kind = String(block.input.kind ?? "");
+            const summary = String(block.input.summary ?? "").trim().slice(0, SUMMARY_MAX_CHARS);
+            if (!isSupportRequestKind(kind) || !summary) {
+              ack =
+                `ignored: kind must be one of ${SUPPORT_REQUEST_KINDS.join(", ")}, and the ` +
+                "summary cannot be empty";
+              break;
+            }
+            supportRequestOpen = { kind, summary };
+            supportRequestWithdraw = undefined;
+            ack =
+              (hasOpenRequest ? "updated the open request" : "filed") +
+              ": tell them in one line that the team will contact them, and that they can say no";
+            break;
+          }
+          case "withdraw_support_request": {
+            if (holdNote) {
+              ack = "held: re-decide after the reader update below";
+              break;
+            }
+            if (!hasUserMessage) {
+              ack =
+                "ignored: a support request can only be withdrawn while replying to the " +
+                "reader; this wake has no reader message";
+              break;
+            }
+            if (supportRequestOpen && !hasOpenRequest) {
+              // Opened in this wake and declined before the wake ended: the
+              // request never lands, and nobody is told about it.
+              supportRequestOpen = undefined;
+              ack = "cancelled: the request you opened in this wake was not filed";
+              break;
+            }
+            if (!hasOpenRequest) {
+              ack = "no open support request to withdraw";
+              break;
+            }
+            supportRequestOpen = undefined;
+            supportRequestWithdraw = { reason: String(block.input.reason ?? "").trim() };
+            ack = "withdrawn: tell them in one line that the team will not contact them";
+            break;
+          }
           case "finish_wake":
             if (holdNote) {
               ack = "not finished: address the reader's newest message first";
@@ -479,7 +698,12 @@ export async function runWake(
             rationale = String(block.input.rationale ?? "") || rationale;
             declaredLearning = block.input.learnedSomethingLasting === true;
             declaredPromise = block.input.promisedFollowUp === true;
+            declaredDecision =
+              block.input.decision === "send" || block.input.decision === "silence"
+                ? block.input.decision
+                : undefined;
             finished = true;
+            everFinished = true;
             ack = "wake recorded";
             break;
           default:
@@ -495,38 +719,81 @@ export async function runWake(
       // model pass — unless a repair is owed, in which case the nudge rides
       // along with the tool_results and the loop continues. At most one nudge
       // per turn: each one costs a model turn of its own.
-      let nudge: { text: string; tag: string; kind: "delivery" | "bookkeeping" } | undefined;
+      let nudge: { text: string; tag: string; kind: "delivery" | "bookkeeping" | "link" } | undefined;
       // Delivery repairs come first, and each kind carries its own budget:
       // the reader feels an undelivered answer, and nobody but us feels a
       // missing commitment. A spent delivery budget falls through to the
       // bookkeeping checks, which still have theirs.
       if (finished) {
-        if (!deliveryRepaired && hasUserMessage && sent.length === 0 && !unsubscribe) {
+        // An answer is owed when the model's own finish_wake says «send» and
+        // nothing went out — a proactive wake that decided to write and never
+        // called send_message was recorded as silence in 14+ production wakes
+        // — and whenever the reader wrote. A declared «silence» on a reader
+        // message used to skip this check so that a «thanks» earns no reply;
+        // in production that exemption also dropped direct questions whose
+        // searches found nothing. The nudge now fires once there too, and
+        // the model confirms silence only for a bare acknowledgment.
+        const draft = strandedProse !== undefined && proseLooksLikeAMessage(strandedProse, sent);
+        const answerOwed = sent.length === 0 && (declaredDecision === "send" || hasUserMessage);
+        const silentOnReader = hasUserMessage && declaredDecision === "silence" && !draft;
+        // A held link comes first: the model believes it sent, and without
+        // the nudge the wake ends here with the message unsent. The tool
+        // result already says what was wrong; the nudge says it is not done.
+        if (heldLinks.length > 0 && !linkRepaired) {
+          nudge = {
+            kind: "link",
+            tag: "ungrounded-link/held",
+            text:
+              "(system check) A send_message of yours was NOT delivered: its link (" +
+              heldLinks.join(", ") +
+              ") did not come from any tool result in this wake — see its tool result " +
+              "above. The reader is still owed that message. Send it again with a link " +
+              "copied from a url field a tool returned, looking it up first if you must, " +
+              "or without the link; then finish_wake again with the wake's own rationale " +
+              "— about the reader and this wake's decision, never about this check.",
+          };
+        } else if (!deliveryRepaired && answerOwed && !unsubscribe) {
           // When the answer sits stranded as prose, quote it back. Without the
           // quote the model rereads its own text above and concludes it already
           // answered ("message already sent") — observed failure.
+          const waiting = hasUserMessage
+            ? "The person asked you something directly and NOTHING has been delivered " +
+              "to them — they are still waiting."
+            : "Your finish_wake says the decision is «send», but NOTHING has been " +
+              "delivered to the reader.";
           nudge = {
             kind: "delivery",
-            tag: strandedProse ? "stranded-prose/finish" : "zero-send/finish",
-            text: strandedProse
-              ? "(system check) The person asked you something directly and NOTHING has " +
-                "been delivered to them — they are still waiting. The text you wrote next " +
-                "to your tool calls was NOT delivered; nothing reaches the person except " +
-                "send_message content. The undelivered text was:\n«" +
+            tag: silentOnReader
+              ? "declared-silence/finish"
+              : strandedProse
+                ? "stranded-prose/finish"
+                : "zero-send/finish",
+            text: silentOnReader
+              ? "(system check) The person wrote to you and you chose silence, so NOTHING " +
+                "has been delivered to them. Silence answers a reader's message only when " +
+                "it asks nothing — a bare «ευχαριστώ», an «οκ», an emoji. Anything else " +
+                "gets a reply, even when the record has nothing: say in one line what you " +
+                "looked at and ask what they mean. Never guess, and never leave them " +
+                "waiting. If their message asks something, call send_message with the " +
+                "reply now, then finish_wake again with the wake's own rationale — about " +
+                "the reader and this wake's decision, never about this check. Only if it " +
+                "truly asks nothing, call finish_wake again with decision «silence» to confirm."
+              : strandedProse
+              ? `(system check) ${waiting} The text you wrote next to your tool calls ` +
+                "was NOT delivered; nothing reaches the person except send_message " +
+                "content. The undelivered text was:\n«" +
                 strandedProse.slice(0, 1200) +
                 "»\nIf it was meant for them, send it now with send_message, then " +
                 "finish_wake again with the wake's own rationale — about the reader and " +
                 "this wake's decision, never about this check. If you truly intend to stay " +
-                "silent, call finish_wake again to confirm."
-              : "(system check) You finished the wake without sending anything, but the " +
-                "person asked you something directly. Nothing has been delivered to them — " +
-                "they are still waiting. If you meant to answer them, call send_message " +
-                "with the message now, then finish_wake again with the wake's own " +
-                "rationale — about the reader and this wake's decision, never about this " +
-                "check. If you truly intend to stay silent, call finish_wake again to " +
-                "confirm.",
+                "silent, call finish_wake again with decision «silence» to confirm."
+              : `(system check) ${waiting} If you meant to write to them, call ` +
+                "send_message with the message now, then finish_wake again with the " +
+                "wake's own rationale — about the reader and this wake's decision, never " +
+                "about this check. If you truly intend to stay silent, call finish_wake " +
+                "again with decision «silence» to confirm.",
           };
-        } else if (!deliveryRepaired && strandedProse) {
+        } else if (!deliveryRepaired && strandedProse && draft) {
           nudge = {
             kind: "delivery",
             tag: "stranded-prose/finish",
@@ -540,9 +807,15 @@ export async function runWake(
               "reasoning, call finish_wake again with the wake's own rationale — about the " +
               "reader and this wake's decision, never about this check.",
           };
+        } else if (!deliveryRepaired && holdingOwed()) {
+          nudge = {
+            kind: "delivery",
+            tag: "holding-only/finish",
+            text: holdingOnlyNudge(sent[sent.length - 1], "finish"),
+          };
         } else if (
           !bookkeepingRepaired &&
-          declaredPromise &&
+          (declaredPromise || sent.some((s) => PROMISE_PATTERN.test(s))) &&
           commitmentsRecorded.length === 0 &&
           !unsubscribe
         ) {
@@ -550,14 +823,20 @@ export async function runWake(
             kind: "bookkeeping",
             tag: "promised/no-commitment",
             text:
-              "(system check) You answered that you promised the reader a follow-up, but " +
-              "you never called record_commitment — so nothing will remind you: the " +
-              "decision log rolls, and by the time the thing happens this exchange is out " +
-              "of view. Record it now with a short slug, then call finish_wake again. If " +
-              "you promised nothing after all, finish with promisedFollowUp false.",
+              "(system check) You promised the reader a follow-up — your finish_wake said " +
+              "so, or your message did («θα σε ενημερώσω», «θα σου πω») — but you never " +
+              "called record_commitment, so nothing will remind you: the decision log " +
+              "rolls, and by the time the thing happens this exchange is out of view. " +
+              "Record it now with a short slug, then call finish_wake again. If an open " +
+              "commitment already covers it, or you promised nothing after all, finish " +
+              "with promisedFollowUp false.",
           };
         } else if (
           !bookkeepingRepaired &&
+          // Only the reader's own words teach something lasting. On a
+          // proactive wake this nudge forced guesses into the profile — twelve
+          // readers became «the councillor» because a speaker shared their name.
+          hasUserMessage &&
           declaredLearning &&
           profileRewrite === undefined &&
           !unsubscribe
@@ -575,18 +854,20 @@ export async function runWake(
           };
         }
         if (nudge) {
-          preNudgeRationale = rationale;
-          sentAtNudge = sent.length;
+          saveRationaleBeforeNudge();
           finished = false;
           nudgeOutstanding = true;
           grantTurnForNudge(turn);
-          repairs.push(nudge.tag);
+          // The link hold already tagged the wake when it held the send.
+          if (!repairs.includes(nudge.tag)) repairs.push(nudge.tag);
           recordInjected(nudge.text);
           if (nudge.kind === "delivery") {
             deliveryRepaired = true;
             // The quote is in the nudge now; a bookkeeping nudge quotes
             // nothing, so it must leave the prose for the delivery check.
             strandedProse = undefined;
+          } else if (nudge.kind === "link") {
+            linkRepaired = true;
           } else {
             bookkeepingRepaired = true;
           }
@@ -622,8 +903,7 @@ export async function runWake(
         // Same rationale protection as the other three repair paths: if the
         // nudged turn adds no sends, post-nudge check-chatter must not become
         // the decision-log rationale the next thirty wakes read as memory.
-        preNudgeRationale = rationale;
-        sentAtNudge = sent.length;
+        saveRationaleBeforeNudge();
         deliveryRepaired = true;
         nudgeOutstanding = true;
         grantTurnForNudge(turn);
@@ -639,12 +919,27 @@ export async function runWake(
         messages.push({ role: "user", content: nudge });
         continue;
       }
-      // (b) A tool-calling turn carried substantive prose next to its tool
+      // (b) Only the holding line went out before the research. Before the
+      // stranded-prose check on purpose: that one has no language gate, and
+      // most stranded prose is reasoning — the single delivery budget must
+      // go to the answer the reader is waiting for.
+      if (holdingOwed()) {
+        saveRationaleBeforeNudge();
+        deliveryRepaired = true;
+        nudgeOutstanding = true;
+        grantTurnForNudge(turn);
+        repairs.push("holding-only/end-turn");
+        const nudge = holdingOnlyNudge(sent[sent.length - 1], "end-turn");
+        recordInjected(nudge);
+        messages.push({ role: "assistant", content: response.content });
+        messages.push({ role: "user", content: nudge });
+        continue;
+      }
+      // (c) A tool-calling turn carried substantive prose next to its tool
       // calls: that prose was never delivered, and is often the missing half
       // of a multi-message answer.
       if (strandedProse) {
-        preNudgeRationale = rationale;
-        sentAtNudge = sent.length;
+        saveRationaleBeforeNudge();
         deliveryRepaired = true;
         nudgeOutstanding = true;
         grantTurnForNudge(turn);
@@ -682,6 +977,11 @@ export async function runWake(
     partialDeliveryError = error instanceof Error ? error.message : String(error);
   }
 
+  // A nudge still outstanding here was never answered: the turn budget ran
+  // out under it. The panel must be able to tell that wake from one whose
+  // nudge was answered with a confirmed silence.
+  if (nudgeOutstanding) repairs.push("nudge/unanswered");
+
   if (preNudgeRationale && sent.length === sentAtNudge) {
     rationale = preNudgeRationale;
   }
@@ -706,7 +1006,11 @@ export async function runWake(
 
   // finish_wake is REQUIRED by the prompt; when the loop ends without it (and
   // without a terminal anomaly explaining why), record the contract breach.
-  const finishWakeMissing = !finished && !refused && !truncated && !partialDeliveryError;
+  const finishWakeMissing = !everFinished && !refused && !truncated && !partialDeliveryError;
+  // Read from the state, not from which nudge fired: a stranded-prose nudge
+  // can take the one delivery repair, and the reader still has the holding
+  // line alone when the model then finishes without a send.
+  const holdingOnly = holdingOwed();
 
   const outcome: WakeOutcome = {
     decision,
@@ -715,6 +1019,7 @@ export async function runWake(
     ...(repairs.length > 0 ? { repairs } : {}),
     ...(truncated ? { truncated: true as const } : {}),
     ...(finishWakeMissing ? { finishWakeMissing: true as const } : {}),
+    ...(holdingOnly ? { holdingOnly: true as const } : {}),
     ...(profileRewrite !== undefined ? { profileRewrite } : {}),
     scheduledWakes,
     ...(commitmentsRecorded.length > 0 || commitmentsResolved.length > 0
@@ -726,6 +1031,11 @@ export async function runWake(
         }
       : {}),
     ...(unsubscribe ? { unsubscribe } : {}),
+    ...(supportRequestOpen
+      ? { supportRequest: { open: supportRequestOpen } }
+      : supportRequestWithdraw
+        ? { supportRequest: { withdraw: supportRequestWithdraw } }
+        : {}),
     ...(partialDeliveryError !== undefined ? { partialDeliveryError } : {}),
   };
 
@@ -736,6 +1046,7 @@ export async function runWake(
     usageTotal,
     costUsd: usageToCost(usageTotal, deps.config.model),
     durationMs: deps.now().getTime() - started,
+    effort,
   };
 
   return { outcome, trace, absorbed: absorbedAll };
@@ -768,18 +1079,31 @@ export function applyOutcome(
       }),
     ...recorded
       .filter((r) => !existing.some((c) => c.slug === r.slug))
-      // Date only, exactly as the shell renders it from createdAt — the
+      // An instant, exactly as the shell stores it from createdAt — the
       // simulation surfaces feed the model the same block production does.
       .map((r) => ({
         slug: r.slug,
         what: r.what,
-        since: ordered[ordered.length - 1].at.slice(0, 10),
+        since: ordered[ordered.length - 1].at,
       })),
   ];
 
+  // The shell keeps one open request per reader: an open replaces it (an
+  // update keeps its age), and a withdrawal ends it but keeps it in view.
+  const { supportRequest: previousRequest, ...rest } = state;
+  const at = ordered[ordered.length - 1].at;
+  const wasOpen = previousRequest?.status === "open";
+  const opened = outcome.supportRequest?.open;
+  const supportRequest = opened
+    ? { ...opened, status: "open" as const, since: wasOpen ? previousRequest.since : at }
+    : outcome.supportRequest?.withdraw && wasOpen
+      ? { ...previousRequest, status: "withdrawn" as const, endedAt: at }
+      : previousRequest;
+
   return {
-    ...state,
+    ...rest,
     commitments,
+    ...(supportRequest ? { supportRequest } : {}),
     profile: outcome.profileRewrite !== undefined ? outcome.profileRewrite : state.profile,
     conversation: [
       ...state.conversation,

@@ -93,7 +93,8 @@ graph TD;
     -   `type`: The type of the task (e.g., "transcribe", "summarize").
     -   `status`: The current status of the task ("pending", "processing", "succeeded", "failed").
     -   `requestBody`: The JSON payload sent to the task server.
-    -   `responseBody`: The JSON result received from the task server.
+    -   `responseBody`: The JSON result received from the task server. It holds only a task-server payload, or null.
+    -   `failureReason`: The failure text of a failed task. It is set for every failure: the task server reports an error, the result handler throws (the stack of the error), or the task does not start (`Failed to start task: …`). A success callback sets it to null.
     -   `councilMeetingId`: Foreign key to the `CouncilMeeting` table.
     -   `version`: A version number for the task, allowing for reprocessing.
     -   ...and other relevant fields.
@@ -110,7 +111,7 @@ The `pollDecisions` task can be triggered automatically to fetch decisions from 
 **Authentication:** `Authorization: Bearer <CRON_SECRET>`
 
 **What it does:**
-1. Finds meetings from the last 90 days in cities that have `diavgeiaUid` configured
+1. Finds meetings from the last 90 days in supported cities that have `diavgeiaUid` configured. A poll is a paid task, so the cron does not poll a pending or demo city. An admin can still poll any meeting by hand. The filter is `decisionPollCandidateWhere` in `src/lib/db/decisionEligibility.ts`, which the polling stats also use.
 2. Filters to meetings that still have subjects with no linked decision
 3. Applies progressive backoff based on previous polling history (see below)
 4. Dispatches `pollDecisions` tasks to the backend task server for up to 10 meetings per invocation
@@ -152,9 +153,11 @@ This returns per-decision data showing: when Diavgeia published it, when the cro
 **Key files:**
 - `src/app/api/cron/poll-decisions/route.ts` — Cron API route
 - `src/app/api/cron/poll-decisions-stats/route.ts` — Polling effectiveness stats
-- `src/lib/tasks/pollDecisions.ts` — `pollDecisionsForRecentMeetings()` (cron logic), `getPollingStats()` (stats), `pollDecisionsForMeeting()` (core logic shared with admin UI and cron)
+- `src/lib/tasks/pollDecisions.ts` — `pollDecisionsForRecentMeetings()` (cron logic), `pollDecisionsForMeeting()` (core logic shared with admin UI and cron)
+- `src/lib/tasks/pollingStats.ts` — `getPollingStats()` (stats)
 
 **Prerequisites per city:**
+- City must be `supported` (`CUSTOMER_CITY_WHERE` in `src/lib/cityStatus.ts`)
 - City must have `diavgeiaUid` set (configured in city settings)
 - Optionally, administrative bodies can have `diavgeiaUnitIds` for more precise matching
 
@@ -164,13 +167,14 @@ The `poll-livestreams` cron closes the manual gap between a meeting being livest
 and its transcription: it finds the meeting's YouTube video and triggers `transcribe`
 automatically.
 
-**Endpoint:** `GET /api/cron/poll-livestreams` (`?dryRun=1` logs decisions without acting)
+**Endpoint:** `GET /api/cron/poll-livestreams` (`?dryRun=true` logs decisions without acting; `?dryRun=1` works too)
 **Authentication:** `Authorization: Bearer <CRON_SECRET>`
 
 **What it does (each run):**
 1. Finds candidate meetings: a `processAgenda` task has `succeeded`, `dateTime` is within
-   ±12h of now, `youtubeUrl` is still null, the administrative body has a `youtubeChannelUrl`,
-   and no `transcribe` task is already in flight.
+   ±12h of now, `youtubeUrl` is still null, the city is supported (a transcribe is a paid
+   task), the administrative body has a `youtubeChannelUrl`, and no `transcribe` task is
+   already in flight.
 2. Lists recent videos for each distinct channel from the channel's uploads playlist
    (`playlistItems.list` + `videos.list`) — reliable and immediate, unlike `search.list`,
    whose index lags for just-finished livestreams and intermittently 403s. Resolved channel
@@ -186,6 +190,7 @@ automatically.
 **Requirements:**
 - `YOUTUBE_API_KEY` (Google Cloud, "YouTube Data API v3"). When unset, the cron no-ops.
 - `CACHE_URL` (Valkey). When unset, the cron still works but the multi-meeting alert may repeat.
+- The city must be `supported` (`CUSTOMER_CITY_WHERE` in `src/lib/cityStatus.ts`).
 - Each administrative body that should be polled must have `youtubeChannelUrl` set.
 
 **Setup:** alongside the `poll-decisions` trigger, schedule:
@@ -226,8 +231,12 @@ To add a new cron-triggered task:
 
 4.  **Update Handling:**
     -   The Next.js application's callback endpoint receives the update.
-    -   The `handleTaskUpdate` function updates the corresponding `TaskStatus` record in the database.
-    -   If the task was successful, a task-specific result handler (e.g., `handleTranscribeResult`) is called to process the results.
+    -   On success, `handleTaskUpdate` claims the callback first: it stores the result in `responseBody` and sets `stage` to `persisting results`. `responseBody` is null until this write, so a retried callback finds it set and does nothing. The status does not change yet.
+    -   The task-specific result handler (e.g., `handleTranscribeResult`) then writes the results.
+    -   Only after the handler returns does the task become `succeeded`, and `stage` returns to the task server's last report. A reader of `succeeded` outside this app, such as the Notis event feed, therefore sees complete results. If the handler throws, the task becomes `failed`, keeps the payload, and keeps the stage `persisting results`, which says where it failed.
+    -   A `processing` callback that arrives after the claim is ignored.
+    -   A success callback without a result has nothing to write. The status flip is the whole claim for it.
+    -   A late error callback does not fail a task whose result has arrived.
 
 ## 5. Task Handler Registry Pattern
 
@@ -262,28 +271,22 @@ The optional `options` parameter allows handlers to accept flags like `force` fo
 
 A key feature of the task architecture is the ability to reprocess the results of a task without having to re-run the entire task on the backend server. This is made possible by storing the complete `responseBody` from the task server in the `TaskStatus` table.
 
+When the result handler throws, the task becomes `failed`. `responseBody` keeps the payload and `failureReason` holds the error. After a fix to the handler, a reprocess of the task uses the stored payload.
+
+The `failureReason` column starts with migration `20261006120000_task_status_failure_reason`. A failed row from before that migration has no `failureReason`, and its `responseBody` can hold failure text instead of a payload. A reprocess refuses such a row when the text is not JSON.
+
+The `responseBody` of a `processAgenda` task is also an input to a later task. For a forced summarize, `getSummarizeRequestBody` reads the newest succeeded one by `createdAt` and sends its description of each agenda subject. A summarize that already succeeded runs again only with force. summarize overwrites `Subject.description`, so after the first summary this payload is the only copy of the agenda text. A change to how `TaskStatus` bodies are kept, masked or deleted must keep these payloads. A replay of an older `processAgenda` task writes its subjects again, but the newer task is still the one that summarize reads.
+
 ### Basic Reprocessing
 
-The `processTaskResponse` function in `src/lib/tasks/tasks.ts` uses the task handler registry to reprocess stored results:
+The `processTaskResponse` function in `src/lib/tasks/tasks.ts` uses the task handler registry to reprocess stored results. It calls the handler of the task type with the stored `responseBody` directly. The rules:
 
-```typescript
-import { taskHandlers } from './registry';
+-   `responseBody` must not be null. Otherwise `processTaskResponse` throws before the handler runs and writes nothing. A pending task without a payload can still receive its callback. A failed task without a payload has nothing to replay.
+-   A pending task with a payload is a claim whose handler never finished, for example because the request was cut mid-write. The replay is how it finishes. The replay refuses such a task for 15 minutes after the claim (`CLAIM_REPLAY_AFTER_MS`), because the handler may still be running.
+-   If the handler succeeds, the task becomes `succeeded` and `failureReason` becomes null. If the handler throws, the task becomes `failed`, `failureReason` gets the new error, and `processTaskResponse` rethrows the error.
+-   A replay never changes a `succeeded` task. Both writes use `updateMany` with `status: { not: 'succeeded' }` in the `where` clause.
 
-export const processTaskResponse = async (taskType: string, taskId: string, options?: { force?: boolean }) => {
-    const task = await prisma.taskStatus.findUnique({ where: { id: taskId } });
-    if (!task) {
-        console.error(`Task ${taskId} not found`);
-        return;
-    }
-
-    const handler = taskHandlers[taskType];
-    if (!handler) {
-        throw new Error(`Unsupported task type: ${taskType}`);
-    }
-
-    await handler(taskId, JSON.parse(task.responseBody!), options);
-}
-```
+Two concurrent replays of the same task can both run the handler. This race is known and accepted.
 
 ### Force Mode for Data Cleanup
 

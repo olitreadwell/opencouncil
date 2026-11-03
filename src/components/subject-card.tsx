@@ -1,4 +1,5 @@
-import { AdministrativeBody, City, CouncilMeeting, Party } from "@prisma/client";
+import { City, CouncilMeeting, Party } from "@prisma/client";
+import type { PublicAdministrativeBody } from "@/lib/db/types";
 import { Statistics } from "@/lib/statistics";
 import { SubjectWithRelations } from "@/lib/db/subject";
 import { SubjectCardContent } from "./subject/SubjectCardContent";
@@ -10,7 +11,7 @@ import { getAgendaLabel, getWithdrawnLabel } from "@/lib/utils/subjects";
 import { Link, useRouter } from "@/i18n/routing";
 import { PersonWithRelations } from '@/lib/db/people';
 import { HighlightVideo } from "./meetings/HighlightVideo";
-import { HighlightWithUtterances } from "@/lib/db/highlights";
+import type { SubjectHighlight } from "@/lib/db/types";
 import { subjectTitle, subjectDescription, subjectLocation } from "@/lib/subjectText";
 import type { SearchMatches } from "@/lib/search/types";
 import { formatDate } from "@/lib/formatters/time";
@@ -19,15 +20,16 @@ import { usePathname } from "next/navigation";
 import { useLocale, useTranslations } from "next-intl";
 import { useLocalizeText } from "@/hooks/useLocalizeText";
 import { getLocalizedName } from "@/lib/formatters/name";
+import { meetingDisplayName } from '@/lib/meetingName';
 
 interface SubjectCardProps {
     subject: SubjectWithRelations & { statistics?: Statistics; matches?: SearchMatches };
     city: City;
-    meeting: CouncilMeeting & { administrativeBody?: AdministrativeBody | null };
+    meeting: CouncilMeeting & { administrativeBody?: PublicAdministrativeBody | null };
     parties: Party[];
     persons: PersonWithRelations[];
     fullWidth?: boolean;
-    highlight?: HighlightWithUtterances;
+    highlight?: SubjectHighlight;
     disableHover?: boolean;
     showContext?: boolean;
     openInNewTab?: boolean;
@@ -87,7 +89,7 @@ export function SubjectCard({ subject, city, meeting, parties, persons, fullWidt
                 topic={subject.topic}
                 context={showContext ? {
                     meta: [getLocalizedName(city, locale), meeting.administrativeBody ? getLocalizedName(meeting.administrativeBody, locale) : null, formatDate(new Date(meeting.dateTime), undefined, locale)].filter(Boolean).join(" · "),
-                    meetingName: getLocalizedName(meeting, locale),
+                    meetingName: meetingDisplayName(meeting, locale, city.timezone),
                 } : null}
                 locationText={subjectLocation(subject, localize) ?? t("noLocation")}
                 agendaLabel={getAgendaLabel(t, subject)}

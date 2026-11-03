@@ -3,6 +3,7 @@ import { getTranscript, Transcript } from '@/lib/db/transcript';
 import { CityWithGeometry, getCity } from '@/lib/db/cities';
 import { PersonWithRelations } from '@/lib/db/people';
 import { getHighlightsForMeeting, HighlightWithUtterances } from '@/lib/db/highlights';
+import { meetingTranscriptIsPublic } from '@/lib/db/sharing/publicContent';
 import { cache } from 'react';
 import { getAllCityIdsCached, getPeopleForCityCached, getPartiesForCityCached, getSubjectsForMeetingCached, getSubjectStatisticsCached } from '@/lib/cache/queries';
 import { SubjectWithRelations } from '@/lib/db/subject';
@@ -10,8 +11,11 @@ import { Statistics } from '@/lib/statistics';
 import { getMeetingTaskStatus, MeetingTaskStatus } from '@/lib/db/tasks';
 import { createCache } from '@/lib/cache';
 import { getRealm } from '@/lib/realm.server';
+import { isUserAuthorizedToEdit } from '@/lib/auth';
 import { Realm, SpeakerTag } from '@prisma/client';
 import { Party } from '@prisma/client';
+import { originalScheduledDate } from '@/lib/db/meetingLifecycle';
+import { hideLinks } from '@/lib/meetingPublic';
 
 const EMPTY_STATISTICS: Statistics = {
     speakingSeconds: 0,
@@ -20,8 +24,15 @@ const EMPTY_STATISTICS: Statistics = {
     topics: []
 };
 
+/**
+ * The meeting as the page receives it. The link to the meeting that it
+ * replaced is cleared, because that meeting is not public; the page shows the
+ * date for which the meeting was first scheduled instead.
+ */
+export type MeetingForPage = CouncilMeetingWithAdminBody & { postponedFromDate: Date | null };
+
 export type MeetingDataCore = {
-    meeting: CouncilMeetingWithAdminBody;
+    meeting: MeetingForPage;
     transcript: Transcript;
     city: CityWithGeometry;
     people: PersonWithRelations[];
@@ -71,8 +82,12 @@ export const getMeetingDataCore = async (cityId: string, meetingId: string): Pro
     // deduped waiter reuses the leader's promise and skips it. Without realm in
     // the key, a concurrent .fr request for a French slug could coalesce with a
     // .gr request for the same ids and receive the other realm's payload.
-    const realm = await getRealm();
-    const key = `${realm}/${cityId}/${meetingId}`;
+    // Key by edit access as well: getCouncilMeeting returns an unreleased
+    // meeting to an editor only, and a waiter takes the leader's result. The
+    // scope is the meeting's, as in getCouncilMeeting, so that the admin of
+    // its body is an editor here too and never shares a key with a reader.
+    const [realm, canEdit] = await Promise.all([getRealm(), isUserAuthorizedToEdit({ cityId, councilMeetingId: meetingId })]);
+    const key = `${realm}/${cityId}/${meetingId}/${canEdit ? 'editor' : 'reader'}`;
 
     const existing = coreInflight.get(key);
     if (existing) {
@@ -106,7 +121,7 @@ async function fetchMeetingDataCore(cityId: string, meetingId: string, realm: Re
     const meetingTags = { tags: ['city', `city:${cityId}`, `city:${cityId}:meetings`, `city:${cityId}:meeting:${meetingId}`] };
     const cityTags = { tags: ['city', `city:${cityId}`, `city:${cityId}:basic`] };
 
-    const [meeting, transcript, city, people, parties, subjects, taskStatus] = await Promise.all([
+    const [meeting, transcript, city, people, parties, subjects, taskStatus, transcriptIsPublic] = await Promise.all([
         // Meeting query is NOT cached — it calls isUserAuthorizedToEdit (uses headers())
         // to allow admins to view unreleased meetings. It's a fast PK lookup anyway.
         getCouncilMeeting(cityId, meetingId),
@@ -124,7 +139,10 @@ async function fetchMeetingDataCore(cityId: string, meetingId: string, realm: Re
             () => getMeetingTaskStatus(cityId, meetingId),
             ['city', cityId, 'meeting', meetingId, 'taskStatus'],
             meetingTags
-        )()
+        )(),
+        // The review rule reads a setting of the body, which the public body
+        // on the page does not carry. Read here so the page waits for no extra query.
+        meetingTranscriptIsPublic(cityId, meetingId),
     ]);
 
     if (!meeting || !city || !transcript || !subjects) {
@@ -146,11 +164,12 @@ async function fetchMeetingDataCore(cityId: string, meetingId: string, realm: Re
     }
     const speakerTags = Array.from(speakerTagsMap.values());
 
-    const transcriptHiddenForReview = !taskStatus.humanReview
-        && meeting.administrativeBody?.showUnreviewedTranscript === false;
+    const postponedFromDate = meeting.postponedFromId
+        ? await originalScheduledDate(cityId, meetingId)
+        : null;
 
     return {
-        meeting,
+        meeting: { ...hideLinks(meeting), postponedFromDate },
         transcript,
         city,
         people,
@@ -158,7 +177,7 @@ async function fetchMeetingDataCore(cityId: string, meetingId: string, realm: Re
         subjects: subjectsWithStatistics,
         speakerTags,
         taskStatus,
-        transcriptHiddenForReview
+        transcriptHiddenForReview: !transcriptIsPublic,
     };
 }
 

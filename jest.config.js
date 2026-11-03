@@ -1,8 +1,6 @@
 // Shared config for both test projects below.
 const shared = {
   preset: 'ts-jest',
-  maxWorkers: '50%',
-  workerIdleMemoryLimit: '512MB',
   moduleNameMapper: {
     '^@/(.*)$': '<rootDir>/src/$1',
     '\\.css$': '<rootDir>/__mocks__/styleMock.js',
@@ -12,7 +10,10 @@ const shared = {
     '^client-only$': '<rootDir>/__mocks__/empty.js',
   },
   setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
-  testPathIgnorePatterns: ['<rootDir>/.next/', '<rootDir>/node_modules/', '<rootDir>/tests/integration/'],
+  // Worktrees the Claude app keeps under .claude/ hold a second copy of every
+  // workspace package, which the haste map reports as a duplicate module.
+  modulePathIgnorePatterns: ['<rootDir>/.claude/worktrees/'],
+  testPathIgnorePatterns: ['<rootDir>/.next/', '<rootDir>/node_modules/', '<rootDir>/tests/integration/', '<rootDir>/.claude/worktrees/'],
   // next-intl and its ICU message-formatting dependency chain (use-intl,
   // intl-messageformat, icu-minify, the @formatjs/* and @schummar/* packages)
   // ship ESM-only builds. Let ts-jest transpile those too, instead of the
@@ -21,12 +22,12 @@ const shared = {
     '<rootDir>/node_modules/(?!(next-intl|use-intl|intl-messageformat|icu-minify|@formatjs|@schummar)/)',
   ],
   transform: {
-    '^.+\\.(ts|tsx|js|jsx)$': ['ts-jest', {
+    '^.+\\.(ts|tsx|js|jsx|mjs)$': ['ts-jest', {
       tsconfig: 'tsconfig.jest.json',
       isolatedModules: true,
     }],
   },
-  moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json', 'node'],
+  moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'mjs', 'json', 'node'],
 };
 
 // Two projects so server-side tests run under the Node environment, where all
@@ -35,12 +36,16 @@ const shared = {
 // them with polyfills is a losing game (each one undici needs reveals another).
 // Component tests (.test.tsx) that render React still need jsdom.
 module.exports = {
+  // Jest reads these two options only at the top level. Inside a project
+  // config it ignores them without a warning and uses every core but one.
+  maxWorkers: '50%',
+  workerIdleMemoryLimit: '512MB',
   projects: [
     {
       ...shared,
       displayName: 'node',
       testEnvironment: 'node',
-      testMatch: ['<rootDir>/src/**/*.test.ts', '<rootDir>/packages/*/src/**/*.test.ts'],
+      testMatch: ['<rootDir>/src/**/*.test.ts', '<rootDir>/packages/*/src/**/*.test.ts', '<rootDir>/scripts/**/*.test.ts', '<rootDir>/.claude/skills/**/*.test.ts'],
     },
     {
       ...shared,

@@ -1,4 +1,5 @@
-import { z } from "zod";
+import * as z from "zod";
+import { env } from "@/env.mjs";
 import { decideDelivery } from "@/agent/delivery";
 import { toDecisionEntry } from "@/agent/prompt";
 import { runWake } from "@/agent/runWake";
@@ -20,7 +21,7 @@ import {
 } from "@/agent/types";
 import type { NotisMessage, NotisSubscription, Prisma, PrismaClient } from "../../generated/client";
 import { clampToActiveHours, isQuietHour } from "./active-hours";
-import { alert as sendAlert } from "./alert";
+import { alert as sendAlert, notify as sendNotify } from "./alert";
 import { BirdLike, SEND_TIMEOUT_MS, realBird } from "./bird";
 import { buildDeps } from "./deps";
 import { hasNotisDb, notisDb } from "./db";
@@ -48,6 +49,13 @@ import {
 } from "./conversation";
 import { getProactiveSettings } from "./settings";
 import { markUnsubscribed, suppressPendingOutbound } from "./subscription";
+import {
+  appendReaderWords,
+  conversationUrl,
+  formatSupportNotification,
+  readerWordsOf,
+  type SupportRequestChange,
+} from "./support-requests";
 
 // The unsubscribe cleanup lives with the other state transitions now; the
 // name stays exported from here for the callers that learned it here.
@@ -72,12 +80,19 @@ export interface DrainDeps {
   bird?: BirdLike;
   db?: PrismaClient;
   alert?: (message: string) => Promise<void>;
+  /** Operational news that is not a failure: a support request that a wake
+   *  opened, updated or withdrew. */
+  notify?: (message: string) => Promise<void>;
 }
 
 export interface DrainResult {
   processed: number;
   failed: number;
 }
+
+/** How long a withdrawn or closed support request stays in the prompt, so
+ *  the agent can answer «το προώθησες;» after the team closed it. */
+export const ENDED_REQUEST_VISIBLE_MS = 30 * 24 * 60 * 60_000;
 
 /** Outbound messages still `pending` after this long get re-sent by the
  *  sweeper — covers a crash between the persist commit and the Bird call. */
@@ -168,6 +183,9 @@ const WEEK_MS = 7 * 24 * 60 * 60_000;
  *  counted: the window is the reader's chance to show that push landed, and
  *  it does not reopen. */
 const REPLY_WINDOW_MS = 24 * 60 * 60_000;
+/** How far ahead the prompt's delivery mode is judged: the send itself is
+ *  decided when the wake ends, minutes after the state is assembled. */
+const DELIVERY_MODE_MARGIN_MS = 10 * 60_000;
 /** Delivery states that mean the row reached the reader, or still will.
  *  `failed` and `suppressed` never arrived, so they never count. */
 const REACHED_STATUSES = ["pending", "sent", "delivered", "read"];
@@ -196,6 +214,10 @@ function resolveAlert(overrides: DrainDeps) {
   return overrides.alert ?? ((message: string) => sendAlert("queue", message));
 }
 
+function resolveNotify(overrides: DrainDeps) {
+  return overrides.notify ?? ((message: string) => sendNotify("support", message));
+}
+
 /**
  * The reader's cities, live from the view. No main database configured is a
  * deliberate dev mode and yields none; a configured database that is
@@ -218,6 +240,7 @@ async function runOneWake(
   overrides: DrainDeps,
 ): Promise<void> {
   const alert = resolveAlert(overrides);
+  const notify = resolveNotify(overrides);
   const deps = overrides.deps ?? buildDeps();
   const bird = overrides.bird ?? realBird;
   const ordered = [...events].sort((a, b) => a.at.localeCompare(b.at));
@@ -267,22 +290,67 @@ async function runOneWake(
 
   const cities = await assembleCities(sub);
   // Open promises never age out: unlike the two windows above, a commitment
-  // leaves only when the agent resolves it.
-  const openCommitments = await db.notisCommitment.findMany({
-    where: { subscriptionId: sub.id, resolvedAt: null },
-    orderBy: { createdAt: "asc" },
-    select: { slug: true, what: true, createdAt: true },
-  });
+  // leaves only when the agent resolves it. The same holds for an open
+  // support request; an ended one stays in view for ENDED_REQUEST_VISIBLE_MS.
+  const endedAfter = new Date(Date.now() - ENDED_REQUEST_VISIBLE_MS);
+  const [openCommitments, lastRequest] = await Promise.all([
+    db.notisCommitment.findMany({
+      where: { subscriptionId: sub.id, resolvedAt: null },
+      orderBy: { createdAt: "asc" },
+      select: { slug: true, what: true, createdAt: true },
+    }),
+    db.notisSupportRequest.findFirst({
+      where: {
+        subscriptionId: sub.id,
+        OR: [
+          { status: "open" },
+          { withdrawnAt: { gte: endedAfter } },
+          { closedAt: { gte: endedAfter } },
+        ],
+      },
+      // A reader's requests run one after another, so the newest one is the
+      // open one, or else the one that ended last.
+      orderBy: { createdAt: "desc" },
+      select: {
+        kind: true,
+        status: true,
+        summary: true,
+        createdAt: true,
+        withdrawnAt: true,
+        closedAt: true,
+      },
+    }),
+  ]);
+  const requestEnded = lastRequest?.closedAt ?? lastRequest?.withdrawnAt;
   const state = {
     user: { name: sub.userName ?? "", cities },
     profile: sub.profileText,
     conversation,
     decisions,
+    // The real send decision below is made when the wake ends, so this one
+    // is judged DELIVERY_MODE_MARGIN_MS ahead: a window about to close counts
+    // as closed, and the model writes one card instead of three.
+    deliveryMode: decideDelivery(
+      primary,
+      windowOpenedAt,
+      new Date(Date.now() + DELIVERY_MODE_MARGIN_MS),
+    ).mode,
     commitments: openCommitments.map((c) => ({
       slug: c.slug,
       what: c.what,
-      since: c.createdAt.toISOString().slice(0, 10),
+      since: c.createdAt.toISOString(),
     })),
+    ...(lastRequest
+      ? {
+          supportRequest: {
+            kind: lastRequest.kind,
+            status: lastRequest.status,
+            summary: lastRequest.summary,
+            since: lastRequest.createdAt.toISOString(),
+            ...(requestEnded ? { endedAt: requestEnded.toISOString() } : {}),
+          },
+        }
+      : {}),
     ...(sub.memory ? { memory: sub.memory } : {}),
   };
 
@@ -432,8 +500,15 @@ async function runOneWake(
       : undefined;
 
   const unparseableSchedules: string[] = [];
+  // What the reader typed in this wake, absorbed messages included. The
+  // shell copies it onto the support request: the model never writes it.
+  const readerWords = readerWordsOf(finalEvents);
+  // What the transaction did to the support request, for the line after the
+  // commit. A persist can run twice, so each attempt sets it again.
+  let supportRequestChange: SupportRequestChange | undefined;
   const persistOnce = () => db.$transaction(
     async (tx) => {
+    supportRequestChange = undefined;
     // updatedAt is always touched: it is the conversation list's activity
     // sort key. (The update also serializes concurrent writers of this
     // subscription on its row lock — the ΣΤΟΠ path touches the same row.)
@@ -515,6 +590,7 @@ async function runOneWake(
         truncated: outcome.truncated ?? false,
         finishWakeMissing: outcome.finishWakeMissing ?? false,
         model: deps.config.model,
+        effort: trace.effort,
         inputTokens: trace.usageTotal.input,
         outputTokens: trace.usageTotal.output,
         cacheReadTokens: trace.usageTotal.cacheRead,
@@ -526,6 +602,35 @@ async function runOneWake(
       },
       select: { id: true },
     });
+
+    // The support request rides the wake's transaction, like commitments:
+    // the row and the wake that explains it land together. The webhook line
+    // goes out after the commit, so a rolled-back wake tells nobody.
+    if (outcome.supportRequest?.open) {
+      const { kind, summary } = outcome.supportRequest.open;
+      const existing = await tx.notisSupportRequest.findFirst({
+        where: { subscriptionId: sub.id, status: "open" },
+        select: { id: true, readerWords: true },
+      });
+      if (existing) {
+        await tx.notisSupportRequest.update({
+          where: { id: existing.id },
+          data: { kind, summary, readerWords: appendReaderWords(existing.readerWords, readerWords) },
+        });
+        supportRequestChange = "updated";
+      } else {
+        await tx.notisSupportRequest.create({
+          data: { subscriptionId: sub.id, wakeId: wake.id, kind, summary, readerWords },
+        });
+        supportRequestChange = "opened";
+      }
+    } else if (outcome.supportRequest?.withdraw) {
+      const withdrawn = await tx.notisSupportRequest.updateMany({
+        where: { subscriptionId: sub.id, status: "open" },
+        data: { status: "withdrawn", withdrawnAt: new Date() },
+      });
+      if (withdrawn.count > 0) supportRequestChange = "withdrawn";
+    }
 
     for (const scheduled of outcome.scheduledWakes) {
       // The instant is model-written, so it is parsed defensively: an
@@ -637,6 +742,19 @@ async function runOneWake(
     await alert(`wake for ${sub.id} scheduled an unparseable instant (${at}) — note dropped`);
   }
 
+  if (supportRequestChange) {
+    // Neither line carries personal data: the panel has the details.
+    console.log(`[notis:support] request ${supportRequestChange} for ${sub.id}`);
+    // notify never throws, the same as the alerts around it.
+    await notify(
+      formatSupportNotification({
+        change: supportRequestChange,
+        conversationUrl: conversationUrl(env.NOTIS_PUBLIC_URL, sub.id),
+        kind: outcome.supportRequest?.open?.kind,
+      }),
+    );
+  }
+
   // The prompt reserves web_search for a reader's question. The tool list is
   // byte-identical across wakes on purpose — it is the head of the cached
   // prefix — so this boundary cannot be a runtime gate without paying for a
@@ -735,6 +853,47 @@ async function applySendResult(
  * the channels API has none — so every caller must guarantee single-fire
  * (the fallback's unique fallbackForId, the held release's claim fence).
  */
+/**
+ * A fallback SMS can carry the text of the wake's earlier WhatsApp cards (see
+ * maybeSendSmsFallback). Once the SMS is confirmed out, those cards are
+ * closed, so a late status event cannot send them a second time and the
+ * conversation does not count them as delivered over WhatsApp. Done here,
+ * after the send, so both the immediate path and the quiet-hours release
+ * close them — and never before the send: a card closed while the SMS still
+ * waits would hide the whole wake from the model if the SMS never left.
+ */
+async function closeCardsFoldedInto(db: PrismaClient, smsId: string): Promise<void> {
+  const sms = await db.notisMessage.findUnique({
+    where: { id: smsId },
+    select: { fallbackForId: true, body: true },
+  });
+  if (!sms?.fallbackForId) return;
+  const failed = await db.notisMessage.findUnique({
+    where: { id: sms.fallbackForId },
+    select: {
+      id: true,
+      subscriptionId: true,
+      wakeId: true,
+      body: true,
+      failureReason: true,
+      createdAt: true,
+    },
+  });
+  if (!failed) return;
+  // The same selection the fold made, by id: a card that was delivered in
+  // the meantime has left the set, and a single-card fallback (any other
+  // failure) selects nothing. The text check is a guard on top — a card
+  // whose words the SMS does not carry is never closed.
+  for (const card of await selectFoldedCards(db, failed)) {
+    if (!sms.body.includes(card.body)) continue;
+    // Fenced on «sent»: a delivery status that landed meanwhile wins.
+    await db.notisMessage.updateMany({
+      where: { id: card.id, status: "sent" },
+      data: { status: "failed", failureReason: `folded into SMS ${smsId}` },
+    });
+  }
+}
+
 export async function sendSmsAndRecord(
   db: PrismaClient,
   bird: BirdLike,
@@ -750,6 +909,7 @@ export async function sendSmsAndRecord(
       where: { id: messageId },
       data: { status: "sent", birdMessageId: result.messageId },
     });
+    await closeCardsFoldedInto(db, messageId);
     return true;
   }
   await db.notisMessage.update({
@@ -758,6 +918,67 @@ export async function sendSmsAndRecord(
   });
   await alert(`${context}: ${result.error ?? "unknown error"}`);
   return false;
+}
+
+/** Meta's code for a number that cannot receive WhatsApp messages — not a
+ *  WhatsApp user, or messaging blocked. The number refuses every card of a
+ *  wake, not only the one Bird happened to report. */
+export function isUndeliverableNumber(reason: string | null | undefined): boolean {
+  return /\b131026\b/.test(reason ?? "");
+}
+
+/** The longest story one SMS fallback carries. An SMS bills per 67-character
+ *  segment in Greek, so a fold stops where the next card would run past
+ *  this; a card left out stays «sent», as before. */
+export const SMS_FOLD_MAX_CHARS = 1000;
+
+interface FoldCard {
+  id: string;
+  body: string;
+  at: number;
+}
+
+type FoldSource = Pick<
+  NotisMessage,
+  "id" | "subscriptionId" | "wakeId" | "body" | "failureReason" | "createdAt"
+>;
+
+/**
+ * The wake's earlier cards that ride along in the SMS fallback for `failed`,
+ * oldest first, inside SMS_FOLD_MAX_CHARS. Only when the NUMBER is the
+ * problem (131026): then every card of the wake was refused, not only the
+ * one Bird reported. Deterministic over the rows' status, so the close after
+ * a quiet-hours release recomputes the same set the fold used, by id.
+ */
+async function selectFoldedCards(db: PrismaClient, failed: FoldSource): Promise<FoldCard[]> {
+  if (!failed.wakeId || !isUndeliverableNumber(failed.failureReason)) return [];
+  const siblings = await db.notisMessage.findMany({
+    where: {
+      subscriptionId: failed.subscriptionId,
+      wakeId: failed.wakeId,
+      direction: "outbound",
+      channel: "whatsapp",
+      status: "sent",
+    },
+    select: { id: true, body: true, createdAt: true },
+  });
+  const cards: FoldCard[] = [
+    ...siblings.filter((m) => m.id !== failed.id),
+    { id: failed.id, body: failed.body, createdAt: failed.createdAt },
+  ]
+    .map((m) => ({ id: m.id, body: m.body, at: m.createdAt.getTime() }))
+    .sort((a, b) => a.at - b.at);
+  const folded: FoldCard[] = [];
+  let length = failed.body.length;
+  for (const card of cards) {
+    if (card.id === failed.id) continue;
+    // Stop at the first card that does not fit, so no card is skipped in the
+    // middle of the story.
+    if (length + card.body.length + 2 > SMS_FOLD_MAX_CHARS) break;
+    folded.push(card);
+    length += card.body.length + 2;
+  }
+  return folded;
 }
 
 /**
@@ -787,6 +1008,8 @@ export async function maybeSendSmsFallback(
     | "proactive"
     | "railed"
     | "body"
+    | "failureReason"
+    | "createdAt"
   >,
   alert: (message: string) => Promise<void>,
 ): Promise<"sent" | "held" | "failed" | "skipped"> {
@@ -800,13 +1023,26 @@ export async function maybeSendSmsFallback(
     if (settings.paused) return "skipped";
   }
 
+  // Bird's conversation.updated event names the conversation's LAST message
+  // only, so when a number refuses WhatsApp (131026) only the last card of a
+  // multi-card wake is ever marked failed; the earlier cards stay «sent» for
+  // good and no fallback fires for them. Readers without WhatsApp received
+  // the second half of 180 stories in six weeks. When the number is the
+  // problem, every card of the wake travels in this one SMS, and the folded
+  // siblings are closed so a late status event cannot send them again.
+  const folded = await selectFoldedCards(db, failed);
+  // Oldest first, the failed card in its place.
+  const body = [...folded, { id: failed.id, body: failed.body, at: failed.createdAt.getTime() }]
+    .sort((a, b) => a.at - b.at)
+    .map((c) => c.body)
+    .join("\n\n");
   const text =
     failed.deliveryMode === "template" && failed.template
       ? (() => {
-          const rendered = renderTemplate(failed.template as TemplateName, failed.body);
+          const rendered = renderTemplate(failed.template as TemplateName, body);
           return `${rendered.body}\n\n${rendered.footer}`;
         })()
-      : failed.body;
+      : body;
   const held = failed.railed && isQuietHour(new Date());
 
   let smsId: string;
@@ -832,7 +1068,9 @@ export async function maybeSendSmsFallback(
     throw error;
   }
 
-  // Held rows leave here pending; the sweeper sends them at the release.
+  // Held rows leave here pending; the sweeper sends them at the release. On
+  // either path, sendSmsAndRecord closes the folded cards once the SMS is
+  // confirmed out.
   if (held) return "held";
 
   const ok = await sendSmsAndRecord(
@@ -1192,7 +1430,12 @@ export async function sendPendingMessages(
     // The conversation's second leg applies to the deterministic replies
     // too (the ΣΤΟΠ confirmation rides this path).
     if (outcome.status === "failed" && message.channel === "whatsapp") {
-      await maybeSendSmsFallback(db, bird, message, alert);
+      await maybeSendSmsFallback(
+        db,
+        bird,
+        { ...message, failureReason: outcome.failureReason ?? message.failureReason },
+        alert,
+      );
     }
   }
 }
@@ -1264,7 +1507,12 @@ export async function deliverPendingMessage(
   // conversation's second leg for free.
   const finish = async (outcome: SendOutcome): Promise<SendOutcome> => {
     if (outcome.status !== "failed" || message.channel !== "whatsapp") return outcome;
-    const smsFallback = await maybeSendSmsFallback(db, bird, message, alert);
+    const smsFallback = await maybeSendSmsFallback(
+      db,
+      bird,
+      { ...message, failureReason: outcome.failureReason ?? message.failureReason },
+      alert,
+    );
     return { ...outcome, smsFallback };
   };
 

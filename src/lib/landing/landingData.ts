@@ -4,7 +4,6 @@
  */
 
 import type { AdministrativeBodyType } from '@prisma/client';
-import { stripMarkdown } from '@/lib/formatters/markdown';
 import { normalizeText } from '@/lib/utils';
 import { haversineDistance } from '@/lib/geo';
 import type { RankingComponent } from '@/lib/ranking/subjects';
@@ -37,6 +36,14 @@ export type UpcomingMeeting = Pick<UpcomingMeetingWithCity, 'id' | 'cityId' | 'n
     administrativeBody: { name: string } | null;
 };
 
+/** A much-discussed subject as the "?" drawer's subject door shows one: only what it links and labels. */
+export type LandingHotSubject = Pick<GeneralSubjectRow, 'id' | 'name' | 'cityId' | 'cityName' | 'councilMeetingId' | 'logoImage'>;
+
+/** A subject page's path — the one place the landing spells it. */
+export function subjectPath(cityId: string, meetingId: string, subjectId: string): string {
+    return `/${cityId}/${meetingId}/subjects/${subjectId}`;
+}
+
 /** The topic accent shown on chips, pins and cards. */
 export type SubjectTopic = { name: string; color: string; icon: string | null };
 
@@ -44,7 +51,10 @@ export type SubjectTopic = { name: string; color: string; icon: string | null };
 export type LandingSubject = {
     id: string;
     title: string;
-    summary: string;
+    /** the description as plain text, cut to a preview (see previewDescription) */
+    descriptionPreview: string;
+    /** the description runs past the preview — the selected card fetches the rest (see useFullDescription) */
+    descriptionTruncated: boolean;
     cityId: string;
     cityName: string;
     /** the municipality in "Δήμος X" form, shown on cards when the subject has no address */
@@ -216,8 +226,8 @@ export function toGeneralCities(
         subjects: row.subjects.map((s) => ({
             id: s.id,
             title: s.name,
-            // descriptions are markdown with [text](REF:UTTERANCE:id) links — flatten to plain text
-            summary: stripMarkdown(s.description),
+            descriptionPreview: s.descriptionPreview,
+            descriptionTruncated: s.descriptionTruncated,
             cityId: s.cityId,
             cityName: row.cityName,
             nameMunicipality: row.nameMunicipality,
@@ -236,7 +246,7 @@ export function toGeneralCities(
             durationMin: Math.round((s.discussionTimeSeconds ?? 0) / 60),
             speakers: s.speakerCount ?? 0,
             hot: false,
-            href: `/${s.cityId}/${s.councilMeetingId}/subjects/${s.id}`,
+            href: subjectPath(s.cityId, s.councilMeetingId, s.id),
         })),
     }));
 }
@@ -266,8 +276,8 @@ export function toLandingSubjects(
             return {
                 id: s.id,
                 title: s.name,
-                // descriptions are markdown with [text](REF:UTTERANCE:id) links — flatten to plain text
-                summary: stripMarkdown(s.description),
+                descriptionPreview: s.descriptionPreview,
+                descriptionTruncated: s.descriptionTruncated,
                 cityId: s.cityId,
                 cityName: s.cityName,
                 nameMunicipality: s.nameMunicipality,
@@ -285,7 +295,7 @@ export function toLandingSubjects(
                 durationMin: Math.round((s.discussionTimeSeconds ?? 0) / 60),
                 speakers: s.speakerCount ?? 0,
                 hot: false,
-                href: `/${s.cityId}/${s.councilMeetingId}/subjects/${s.id}`,
+                href: subjectPath(s.cityId, s.councilMeetingId, s.id),
             };
         });
 

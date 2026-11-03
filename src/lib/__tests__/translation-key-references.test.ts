@@ -91,6 +91,18 @@ function unionMembers(file: string, typeName: string): string[] {
     return [...decl[1].matchAll(/'([^']+)'/g)].map((m) => m[1]);
 }
 
+/**
+ * Members of a `const X = ['a', 'b'] as const;` array declared in source, for the
+ * sets stated as values rather than as a union (`ISSUE_CODES`, whose union is
+ * `typeof ISSUE_CODES[number]`).
+ */
+function constArrayMembers(file: string, name: string): string[] {
+    const text = fs.readFileSync(path.join(ROOT, file), 'utf8');
+    const decl = new RegExp(`const\\s+${name}\\s*(?::[^=]+)?=\\s*\\[([^\\]]*)\\]`).exec(text);
+    if (!decl) throw new Error(`${name} not found in ${file} — update this test`);
+    return [...decl[1].matchAll(/'([^']+)'/g)].map((m) => m[1]);
+}
+
 /** Members of an enum declared in `prisma/schema.prisma`. */
 function prismaEnumMembers(name: string): string[] {
     const text = fs.readFileSync(path.join(ROOT, 'prisma', 'schema.prisma'), 'utf8');
@@ -216,8 +228,13 @@ function collectReferences(): { refs: Reference[]; groups: Reference[]; skipped:
                     // prefix catches the group being renamed or dropped wholesale,
                     // which is the failure a static scan can still see. Members are
                     // covered by the union checks below.
+                    // `t(`${field}.label`)` on a translator bound to one specific
+                    // namespace is the same shape with the group in the binding:
+                    // the namespace is the group. Only a translator bound at the
+                    // root, or to nothing, leaves no group to check.
                     const prefix = key.slice(0, interpolated);
-                    if (prefix) for (const ns of binding.namespaces) groups.push({ location, key: `${ns}.${prefix}` });
+                    const attributable = prefix ? binding.namespaces : binding.namespaces.filter((ns) => ns.includes('.'));
+                    if (attributable.length) for (const ns of attributable) groups.push({ location, key: `${ns}.${prefix}` });
                     else skipped++;
                     continue;
                 }
@@ -228,7 +245,7 @@ function collectReferences(): { refs: Reference[]; groups: Reference[]; skipped:
     return { refs, groups, skipped };
 }
 
-type MemberSource = { file?: string; type?: string; prismaEnum?: string };
+type MemberSource = { file?: string; type?: string; prismaEnum?: string; constArray?: string };
 
 /**
  * Every computed group the scan finds. `members` names the type that supplies
@@ -242,6 +259,18 @@ const COMPUTED_GROUPS: { group: string; members?: MemberSource; why?: string }[]
         members: { file: 'src/lib/export/meetings.tsx', type: 'AudioExportFailure' },
     },
     {
+        group: 'admin.machineAccounts.grantType.',
+        members: { file: 'src/lib/db/adminEntities.ts', type: 'AdminEntityType' },
+    },
+    {
+        group: 'notificationOutcome.phase.',
+        members: { file: 'packages/ui/src/lib/meeting-news.ts', type: 'MeetingNewsPhase' },
+    },
+    {
+        group: 'notificationOutcome.reason.',
+        why: 'a NotificationSkipReason (src/lib/notifications/freshness.ts), built from NewsDisposition, so no literal union states the set',
+    },
+    {
         group: 'admin.decisionsOverview.state.',
         members: { file: 'src/lib/db/decisionHealthState.ts', type: 'CityState' },
     },
@@ -250,9 +279,15 @@ const COMPUTED_GROUPS: { group: string; members?: MemberSource; why?: string }[]
         members: { file: 'src/lib/utils/geojson.ts', type: 'BoundaryParseError' },
     },
     { group: 'Common.adminBodyType_', members: { prismaEnum: 'AdministrativeBodyType' } },
+    { group: 'editing.speakerHints.status.', members: { file: 'src/lib/speakerIdentifications.ts', type: 'SpeakerIdentificationsStatus' } },
     { group: 'AddMeetingForm.administrativeBodyType.', members: { prismaEnum: 'AdministrativeBodyType' } },
+    { group: 'AddMeetingForm.kindOptions.', members: { prismaEnum: 'MeetingKind' } },
+    { group: 'AddMeetingForm.formatOptions.', members: { prismaEnum: 'MeetingFormat' } },
+    { group: 'AddMeetingForm.scheduleStatusOptions.', members: { prismaEnum: 'MeetingScheduleStatus' } },
     { group: 'AdministrativeBodiesList.types.', members: { prismaEnum: 'AdministrativeBodyType' } },
-    { group: 'meetingStage.label.', members: { file: 'src/lib/meetingStage.ts', type: 'PublicMeetingStage' } },
+    { group: 'meetingStage.label.', members: { file: 'src/lib/meetingPresentation.ts', constArray: 'PRESENTATION_KEYS' } },
+    { group: 'meetingStage.strip.', why: 'computed only for postponed and cancelled (MeetingStageStrip); the other strip keys are literal' },
+    { group: 'meetingStage.facts.format.', why: 'only remote and hybrid: the formats that the facts row names (meeting page)' },
     { group: 'meetingStage.rows.', why: 'the leaf is a PendingKind with processing folded into review (SubjectRow)' },
     { group: 'meetingStage.subject.', why: 'two leaves: the piece (summary, statements) and a PendingKind with processing folded into before (PendingNote)' },
 
@@ -275,6 +310,10 @@ const COMPUTED_GROUPS: { group: string; members?: MemberSource; why?: string }[]
     {
         group: 'signup.errors.',
         why: "saveErrorKey maps the save actions' string codes; no type states the set, and the group also holds the literal signIn leaf",
+    },
+    {
+        group: 'phoneVerification.errors.',
+        why: 'KNOWN_ERRORS in PhoneCodeForm names the codes with copy of their own and folds every other code into generic',
     },
     {
         group: 'reviews.completeDialog.runSummarize.unavailable.',
@@ -306,6 +345,49 @@ const COMPUTED_GROUPS: { group: string; members?: MemberSource; why?: string }[]
     { group: 'about.team.roadmap.items.', why: 'const array in the component' },
     { group: 'admin.adminActions.forms.forceDescription.', why: 'const array in the component' },
     {
+        group: 'admin.conventions.',
+        why: 'keyed by CONVENTION_FIELDS and CONVENTION_FLAGS, two const declarations; the form and rail tests render every member',
+    },
+    {
+        group: 'admin.decisionsPage.sheet.',
+        why: "keyed by the sheet's inline 'view' | 'reassign' prop, joined to a suffix (`${action}Title`): the group also holds the buttons",
+    },
+    {
+        group: 'admin.decisionsPage.issues.codes.',
+        members: { file: 'src/lib/derivation/types.ts', constArray: 'ISSUE_CODES' },
+    },
+    {
+        group: 'admin.decisionsPage.issues.messages.',
+        members: { file: 'src/lib/derivation/types.ts', constArray: 'ISSUE_CODES' },
+    },
+    {
+        group: 'admin.decisionsPage.issues.severity.',
+        members: { file: 'src/lib/derivation/issueCatalogue.ts', type: 'IssueSeverity' },
+    },
+    {
+        group: 'admin.decisionsPage.issues.person.',
+        members: { file: 'src/lib/derivation/issueText.ts', type: 'IssuePersonKind' },
+    },
+    {
+        group: 'admin.decisionsPage.issues.raisedIn.',
+        members: { file: 'src/lib/derivation/issueCatalogue.ts', constArray: 'DERIVATION_STAGES' },
+    },
+    {
+        group: 'admin.decisionsPage.derivation.stages.',
+        members: { file: 'src/lib/derivation/issueCatalogue.ts', constArray: 'DERIVATION_STAGES' },
+    },
+    {
+        group: 'admin.decisionsPage.derivation.lineKinds.',
+        why: 'keyed by LINE_KINDS in DerivationDialog.tsx, but the group also holds the literal title and intro; DerivationDialog.test.tsx renders every member in each locale',
+    },
+    {
+        // The leaf below the stage is the code, and which codes a stage lists
+        // is ISSUE_STAGES' business — `DerivationDialog.test.tsx` checks every
+        // (stage, code) pair in every locale, and renders the dialog in each.
+        group: 'admin.decisionsPage.derivation.why.',
+        members: { file: 'src/lib/derivation/issueCatalogue.ts', constArray: 'DERIVATION_STAGES' },
+    },
+    {
         group: 'admin.decisionsOverview.conflict.',
         why: 'ConflictResolutionOutcome supplies the toast leaves, but the group also holds literal panel copy',
     },
@@ -325,7 +407,6 @@ const COMPUTED_GROUPS: { group: string; members?: MemberSource; why?: string }[]
     { group: 'landingV2.nav.', why: 'const array in the component' },
     { group: 'mcp.clients.', why: 'const array in the component' },
     { group: 'mcp.examples.', why: 'const array in the component' },
-    { group: 'reviews.completeDialog.runSummarize.notifications.', why: 'const array in the component' },
     { group: 'reviews.completeDialog.toasts.followUpFailed.actions.', why: 'const array in the component' },
 ];
 
@@ -383,7 +464,9 @@ describe('message keys referenced by the code', () => {
         it('has copy for every member the type declares', () => {
             const declared = members!.prismaEnum
                 ? prismaEnumMembers(members!.prismaEnum)
-                : unionMembers(members!.file!, members!.type!);
+                : members!.constArray
+                    ? constArrayMembers(members!.file!, members!.constArray)
+                    : unionMembers(members!.file!, members!.type!);
             expect(memberLeaves(catalog, group).sort()).toEqual([...declared].sort());
         });
     });
