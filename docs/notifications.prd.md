@@ -203,7 +203,7 @@ A failure in these triggers does not fail the task or the release. A Discord ale
 
 ### 4. Notification View Page
 
-#### `src/app/notifications/[id]/page.tsx` - Public notification view:
+#### `src/app/[locale]/(other)/notifications/[id]/page.tsx` - Public notification view:
 **Requirements:**
 - **Unauthenticated access**: No login required
 - **Mobile-first responsive design**: Optimized for mobile devices

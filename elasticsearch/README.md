@@ -5,15 +5,16 @@ This document describes how OpenCouncil uses Elasticsearch to provide powerful s
 
 ### Table of Contents
 
-1. [Overview](#overview)
+1. [Overview](#architecture-overview)
 2. [Codebase Structure](#codebase-structure)
 3. [Set up Elasticsearch](#set-up-elasticsearch)
 4. [Configure PostgreSQL Views](#configure-postgresql-views)
 5. [Configure the Ingest Pipeline](#configure-the-ingest-pipeline)
+6. [Set up PGSync](#pgsync-setup-and-data-synchronization)
 6. [Set up PGSync](#set-up-pgsync)
    - [What syncs live](#what-syncs-live)
    - [Deploying a Schema Change](#deploying-a-schema-change)
-7. [Sync Data](#sync-data)
+7. [Sync Data](#deployment-and-sync-operations)
 8. [Search Examples](#search-examples)
 9. [Best Practices & FAQ](#best-practices--faq)
 
@@ -197,7 +198,7 @@ The index mapping and sync configuration are defined in `elasticsearch/schema.js
 
 The schema is version-controlled, so any changes to the index structure are tracked in git.
 
-To create the index with the mappings from `elasticsearch/schema.json`, PGSync will handle this automatically during bootstrap (see [Sync Data](#sync-data) section).
+To create the index with the mappings from `elasticsearch/schema.json`, PGSync will handle this automatically during bootstrap (see [Sync Data](#deployment-and-sync-operations) section).
 
 You can view the current mapping configuration in `elasticsearch/schema.json`.
 

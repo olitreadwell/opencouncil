@@ -37,10 +37,12 @@ OpenCouncil is developed by [Schema Labs](https://schemalabs.gr), a non-profit o
 
 ## Technical Architecture
 
-Next.js 14 (TypeScript) + PostgreSQL/PostGIS + Prisma. A separate [task server](https://github.com/schemalabz/opencouncil-tasks) handles media processing and AI features. See the [documentation index](./docs/README.md) for architecture details and the full deployment topology.
+Next.js 16 (TypeScript) + PostgreSQL/PostGIS + Prisma. A separate [task server](https://github.com/schemalabz/opencouncil-tasks) handles media processing and AI features. See the [documentation index](./docs/README.md) for architecture details and the full deployment topology.
 
 ### Prerequisites
 
+- Node.js 24+ and npm
+- PostgreSQL 16+ with the postgis extension
 - Node.js 18+ and npm
 - PostgreSQL 16 with the postgis extension, the PostgreSQL 16 client tools (`pg_restore`, `psql`), and `zstd`. The Nix and Docker setups include them.
 - Docker (optional, but recommended)

@@ -399,6 +399,7 @@ Do not narrate each step. Do not repeat what the diff already shows.
 ## Environment Setup
 
 Required services:
+- PostgreSQL 16+ with PostGIS extension
 - PostgreSQL 16 with PostGIS extension; the seed restore needs the PostgreSQL 16 client tools
 - Elasticsearch instance
 - Task API server (separate backend)
