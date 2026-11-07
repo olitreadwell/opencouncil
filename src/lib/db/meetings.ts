@@ -8,7 +8,7 @@
 // the lifecycle module (meetingLifecycle.ts), which meetingWrites.ts calls.
 import "server-only";
 import { AdministrativeBodyType, Prisma, Realm } from '@prisma/client';
-import { revalidateTag, revalidatePath } from 'next/cache';
+import { revalidateAfterResponse } from '../cache/afterResponse';
 import { after } from 'next/server';
 import prisma from "./prisma";
 import { withUserAuthorizedToEdit, isUserAuthorizedToEdit } from '../auth';
@@ -20,6 +20,7 @@ import { CUSTOMER_CITY_WHERE, publicMeetingWhere } from '../cityStatus';
 // Import from the cache leaf (see the note in subject.ts) to keep the barrel's heavy chain out.
 import { createCache } from '../cache/index';
 import { getCityRealm } from "./cityRealm";
+import { getCityTimezone } from "./cityTimezone";
 import { deleteMeetingRecord, setMeetingReleased } from "./meetingLifecycle";
 import { LifecycleRuleError, PUBLIC_RECORDING_WHERE, TAKES_PLACE_WHERE } from "@/lib/meetingLifecycleRules";
 import { hideLinks } from "@/lib/meetingPublic";
@@ -45,9 +46,10 @@ export async function deleteCouncilMeeting(cityId: string, id: string): Promise<
 /**
  * Generate a unique meeting ID for a city, handling collisions
  * by appending _2, _3, etc. (matches existing convention).
+ * The ID names the day of the meeting in the city's time zone.
  */
 export async function generateUniqueMeetingId(cityId: string, date: Date): Promise<string> {
-    const baseId = formatDateAsMeetingId(date);
+    const baseId = formatDateAsMeetingId(date, await getCityTimezone(cityId));
 
     // Fetch all existing meeting IDs with this base prefix in one query
     const existing = await prisma.councilMeeting.findMany({
@@ -186,6 +188,11 @@ export async function getUpcomingMeetingsCached(realm: Realm, { limit = 10 }: { 
 
 export async function toggleMeetingRelease(cityId: string, id: string, released: boolean): Promise<CouncilMeetingWithAdminBody> {
     await withUserAuthorizedToEdit({ councilMeetingId: id, cityId: cityId });
+    return (await setMeetingReleaseDirect(cityId, id, released)).meeting;
+}
+
+/** Caller-gated release workflow shared by the browser action and token-authorized MCP tools. */
+export async function setMeetingReleaseDirect(cityId: string, id: string, released: boolean) {
     try {
         // The module also releases or hides the other meetings of a postponement.
         const { meeting: updatedMeeting, changed } = await setMeetingReleased(cityId, id, released);
@@ -193,16 +200,17 @@ export async function toggleMeetingRelease(cityId: string, id: string, released:
         // release does. After the response: rendering one email per reader
         // must not hold the admin's toggle.
         if (released && changed) after(() => notifySubscribersOnRelease(cityId, id));
-        // TODO: utilize api/cities/[cityId]/meetings/[meetingId] to edit the meeting
-        revalidateTag(`city:${cityId}:meetings`, 'max');
-        revalidatePath(`/${cityId}`, "layout");
         const realm = await getCityRealm(cityId);
-        if (realm) {
-            revalidateTag(landingSubjectsTag(realm), 'max');
-            // a newly (un)released meeting can enter/leave the landing's upcoming list
-            revalidateTag(upcomingMeetingsTag(realm), 'max');
-        }
-        return updatedMeeting;
+        // MCP runs after its streaming Response has already been returned.
+        // The shared helper also handles browser actions and non-request calls.
+        revalidateAfterResponse({
+            tags: [
+                `city:${cityId}:meetings`,
+                ...(realm ? [landingSubjectsTag(realm), upcomingMeetingsTag(realm)] : []),
+            ],
+            paths: [{ path: `/${cityId}`, type: 'layout' }],
+        });
+        return { meeting: updatedMeeting, changed };
     } catch (error) {
         // A lifecycle rule explains itself to the admin (lib/actions/meetings.ts).
         if (error instanceof LifecycleRuleError) throw error;

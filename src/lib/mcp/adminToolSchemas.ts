@@ -6,9 +6,10 @@ import { STARTABLE_MEETING_TASKS } from '@/lib/tasks/startableTasks';
 import { baseCityFields, cityIdSchema } from '@/lib/zod-schemas/city';
 import { baseMeetingFields } from '@/lib/zod-schemas/meeting';
 import { isoZonedDateTime } from '@/lib/zod-schemas/dates';
-import { webUrl } from '@/lib/zod-schemas/primitives';
+import { refuseDuplicateKeys, webUrl } from '@/lib/zod-schemas/primitives';
 import { UPLOAD_FORMAT_NAMES, type UploadKind } from '@/types/upload';
 import { completeUploadRequestSchema, uploadSizeBytes } from '@/lib/zod-schemas/upload';
+import { createTopicSchema, topicLabelKeys } from '@/lib/zod-schemas/topic';
 
 /**
  * The input schemas of the admin tools. adminTools.ts registers them, and
@@ -59,16 +60,21 @@ const meetingRecordInput = {
     place: baseMeetingFields.place.nullable().optional(),
 } satisfies Record<(typeof MEETING_RECORD_INPUT_KEYS)[number], z.ZodType>;
 
-export const publishCityDemoToolInput = z.object({ cityId: cityIdSchema });
-export type PublishCityDemoToolArgs = z.output<typeof publishCityDemoToolInput>;
-
-export const setCityBoundaryToolInput = z.object({
+export const updateCityToolInput = z.object({
     cityId: cityIdSchema,
-    geojson: z.string().min(1).meta({ description: 'The complete boundary GeoJSON text, not a URL. '
+    status: z.literal('demo').optional().meta({ description: 'Publish a pending city as a public demo, or leave a demo unchanged. Supported cities are refused. Send separately from geojson.' }),
+    geojson: z.string().min(1).optional().meta({ description: 'The complete verified municipal boundary GeoJSON text, not a URL. '
         + 'Use WGS84 [longitude, latitude] coordinates. Accepts Polygon, MultiPolygon, Feature or FeatureCollection; '
-        + 'polygonal features are combined and non-polygonal features ignored. Replaces the existing boundary.' }),
+        + 'polygonal features are combined and non-polygonal features ignored. Replaces the existing boundary. Send separately from status.' }),
+}).strict().superRefine((args, ctx) => {
+    if (args.status === undefined && args.geojson === undefined) {
+        ctx.addIssue({ code: 'custom', message: 'Supply geojson or status: "demo".' });
+    }
+    if (args.status !== undefined && args.geojson !== undefined) {
+        ctx.addIssue({ code: 'custom', message: 'Send boundary and publication changes in separate calls.' });
+    }
 });
-export type SetCityBoundaryToolArgs = z.output<typeof setCityBoundaryToolInput>;
+export type UpdateCityToolArgs = z.output<typeof updateCityToolInput>;
 
 export const createMeetingToolInput = z.object({
     cityId: z.string().min(1),
@@ -94,6 +100,15 @@ export const updateMeetingToolInput = z.object({
     agendaUrl: baseMeetingFields.agendaUrl.nullable().optional(),
     administrativeBodyId: baseMeetingFields.administrativeBodyId.nullable().optional(),
     ...meetingRecordInput,
+    released: z.boolean().optional().meta({ description: 'Release or unrelease the meeting. Send this separately from detail edits; uses the normal release lifecycle and notification rules' }),
+    dryRun: z.boolean().optional().meta({ description: 'Visibility changes only: preview without changing data or scheduling notifications' }),
+}).strict().superRefine(({ cityId, meetingId, released, dryRun, ...details }, ctx) => {
+    if (released !== undefined && Object.values(details).some(value => value !== undefined)) {
+        ctx.addIssue({ code: 'custom', path: ['released'], message: 'Send a visibility change separately from meeting detail edits.' });
+    }
+    if (dryRun !== undefined && released === undefined) {
+        ctx.addIssue({ code: 'custom', path: ['dryRun'], message: 'dryRun applies to a released change only.' });
+    }
 });
 export type UpdateMeetingToolArgs = z.output<typeof updateMeetingToolInput>;
 
@@ -111,7 +126,7 @@ export const createUploadUrlToolInput = z.object({
         .meta({ description: 'Names the file: the date of the meeting, e.g. "2026-10-15", or the date and the '
             + 'body, e.g. "2026-10-15-oikonomiki". Lowercase letters a-z, digits and dashes only' }),
     format: z.enum(UPLOAD_FORMAT_NAMES)
-        .meta({ description: 'The format of the file: pdf or docx for an agenda, mp4, mov or mp3 for a recording. '
+        .meta({ description: 'The format of the file: pdf or docx for an agenda; mp4, mov or mkv for a video recording, mp3, wav, m4a or aac for an audio one. '
             + 'The answer carries the matching Content-Type' }),
     sizeBytes: uploadSizeBytes
         .meta({ description: 'The exact size of the file in bytes, e.g. from `wc -c < <file>`. It decides '
@@ -169,6 +184,28 @@ export const createCityToolInput = z.object({
         .meta({ description: 'The realm (country) of the city. Omit for the realm of this domain' }),
 });
 export type CreateCityToolArgs = z.output<typeof createCityToolInput>;
+
+// The fields and rules of the topic form of /admin/topics.
+const topicFields = createTopicSchema.shape;
+export const MAX_TOPICS_PER_CALL = 50;
+
+export const createTopicsToolInput = z.object({
+    realm: topicFields.realm.meta({ description: 'The realm (country) whose taxonomy gets the topics. See list_realms' }),
+    topics: z.array(z.object({
+        name: topicFields.name.meta({ description: 'The name in the language of the realm\'s councils. '
+            + 'processAgenda and summarize choose a topic for each subject by this name' }),
+        name_en: topicFields.name_en.meta({ description: 'The name in English, for the English interface' }),
+        colorHex: topicFields.colorHex.meta({ description: 'Colour as "#rrggbb", distinct from the other topics of the realm' }),
+        icon: topicFields.icon.meta({ description: 'A lucide icon name, e.g. "landmark", "bus", "leaf"' }),
+        description: topicFields.description.meta({ description: 'What the topic covers, with the local institutions and terms. '
+            + 'The model reads it to choose a topic' }),
+    })).min(1).max(MAX_TOPICS_PER_CALL).superRefine((topics, ctx) => refuseDuplicateKeys(ctx, topics, {
+        path: [], field: 'name', keysOf: topicLabelKeys,
+        message: (topic, first) => `"${topic.name}" (${topic.name_en}) shares a name or English name with topics[${first}]. `
+            + 'The search finds a topic by either, so each must be different',
+    })),
+});
+export type CreateTopicsToolArgs = z.output<typeof createTopicsToolInput>;
 
 export const inspectMediaToolInput = z.object({ url: webUrl() });
 export type InspectMediaToolArgs = z.output<typeof inspectMediaToolInput>;

@@ -7,11 +7,11 @@ import {
     mcpInspectMedia,
     mcpCreateCity,
     mcpCreateMeeting,
+    mcpCreateTopics,
     mcpCreateUploadUrl,
     mcpListRealms,
     mcpPopulateCity,
-    mcpPublishCityDemo,
-    mcpSetCityBoundary,
+    mcpUpdateCity,
     mcpStartTask,
     mcpUpdateMeeting,
 } from './adminData';
@@ -20,13 +20,15 @@ import {
     inspectMediaToolInput,
     createCityToolInput,
     createMeetingToolInput,
+    createTopicsToolInput,
+    MAX_TOPICS_PER_CALL,
     createUploadUrlToolInput,
     startTaskToolInput,
     updateMeetingToolInput,
-    publishCityDemoToolInput,
-    setCityBoundaryToolInput,
+    updateCityToolInput,
 } from './adminToolSchemas';
-import { category, run } from './toolSupport';
+import { category, run, runStructured } from './toolSupport';
+import { updateCityResultSchema } from './citySchemas';
 import { cityPopulationSchema } from '@/lib/zod-schemas/cityPopulation';
 
 /**
@@ -54,7 +56,7 @@ function registerMeetingAdminTools(server: McpServer) {
                 'Create a council meeting in a municipality, or of an administrative body, that you administer. '
                 + 'An administrator of a body must pass that body. The meeting is saved as a '
                 + 'draft (unreleased), so the public does not see it, and a draft notifies no subscriber: '
-                + 'an admin releases it from the admin page, and the release notifies them. It also creates the calendar event. '
+                + 'an admin releases it with update_meeting or from the admin page. The release applies the usual notification rules. It also creates the calendar event. '
                 + 'Call list_meetings first with the same date: a second call creates a second meeting. '
                 + 'Pass administrativeBodyId (see get_city): the meeting list of the site shows the council '
                 + 'by default and hides a meeting that has no body. The meeting has no name to set: the site '
@@ -68,7 +70,7 @@ function registerMeetingAdminTools(server: McpServer) {
         'update_meeting',
         {
             title: 'Update meeting',
-            annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
             _meta: category('admin'),
             description:
                 'Change the details of a meeting in a municipality, or of an administrative body, that you administer: '
@@ -77,8 +79,12 @@ function registerMeetingAdminTools(server: McpServer) {
                 + 'is not a field: the site derives it from the kind and the session number. Mark a '
                 + 'meeting postponed or cancelled with scheduleStatus. An administrator of a body cannot move a meeting '
                 + 'to a body that they do not administer. It cannot link a meeting to a postponed '
-                + 'meeting, it cannot release a meeting and it cannot delete one. Confirm the change with the '
-                + 'user before you call.',
+                + 'meeting and it cannot delete one. Set released to true to publish or false to unrelease. '
+                + 'Send visibility changes separately from detail edits. For visibility, use dryRun=true to preview effects, '
+                + 'then confirm with the user before writing. Release can notify subscribers and hide earlier postponed meetings. '
+                + 'Unrelease can restore a postponed predecessor. Repeating the same visibility schedules no new release notifications. '
+                + 'This does not publish the city or mark human review complete. Unsupported fields are rejected. '
+                + 'Confirm detail edits with the user before calling.',
             inputSchema: updateMeetingToolInput,
         },
         (args, ctx: ServerContext) => run(() => mcpUpdateMeeting(identityFromContext(ctx), args))
@@ -95,7 +101,7 @@ function registerMeetingAdminTools(server: McpServer) {
                 + 'storage of OpenCouncil, in a municipality that you administer. Use it when the file has no public '
                 + 'URL that the task server can read: an email attachment, a download link that expires, a video '
                 + 'joined from parts or downloaded from a player. An agenda is a PDF or a .docx, at most 20 MiB; '
-                + 'a recording is an mp4, .mov or .mp3, at most 40 GiB. A file of up '
+                + 'a recording is a video (.mp4, .mov, .mkv) or an audio file (.mp3, .wav, .m4a, .aac), at most 40 GiB. A file of up '
                 + 'to partSize bytes goes up in one PUT, and `completion` is null. A bigger file goes up in parts, '
                 + 'one PUT per part, and complete_upload then joins them. The answer\'s `next` gives the steps. The '
                 + 'file is then public at `publicUrl`.',
@@ -165,33 +171,23 @@ function registerTaskAdminTools(server: McpServer) {
 
 function registerCityAdminTools(server: McpServer) {
     server.registerTool(
-        'publish_city_demo',
+        'update_city',
         {
-            title: 'Publish city demo',
-            annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            title: 'Update a city',
+            annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
             _meta: category('admin'),
-            description: 'Superadmin only. Promote a pending city to a public demo, or leave an existing demo unchanged. '
-                + 'The city and its already released meetings become discoverable on its realm. Draft meetings stay unreleased. '
-                + 'This does not enable official support or notifications, and refuses supported cities. '
-                + 'Read get_city and confirm publication with the user before calling; an approved pending import is not approval to publish.',
-            inputSchema: publishCityDemoToolInput,
+            description: 'Superadmin only. Update a city boundary with geojson, or publish a pending city with status: "demo". '
+                + 'Send boundary and publication changes in separate calls; empty calls and unsupported fields are refused. '
+                + 'GeoJSON uses the same normalization and storage as the city edit form and replaces the existing boundary. '
+                + 'Confirm the source, municipal territorial unit and replacement before writing; never substitute a country outline or bounding box. '
+                + 'Demo publication makes the city and already released meetings discoverable on its realm; draft meetings stay unreleased. '
+                + 'It does not enable official support or notifications, and refuses supported cities. '
+                + 'Returns the same city profile as get_city, plus changed and before/after changes. Equivalent boundaries and existing demos are no-ops. '
+                + 'Read get_city and obtain publication approval first; approval to import pending is not approval to publish.',
+            inputSchema: updateCityToolInput,
+            outputSchema: updateCityResultSchema,
         },
-        (args, ctx: ServerContext) => run(() => mcpPublishCityDemo(identityFromContext(ctx), args)),
-    );
-
-    server.registerTool(
-        'set_city_boundary',
-        {
-            title: 'Set city boundary',
-            annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-            _meta: category('admin'),
-            description: 'Superadmin only. Save or replace a city boundary using verified municipal GeoJSON in WGS84. '
-                + 'Uses the same normalization and storage as the city edit form. This replaces any existing boundary; '
-                + 'it does not publish the city or release meetings. Confirm the source, territorial unit and replacement with the user before calling. '
-                + 'Never substitute a country outline or a bounding box for the municipal boundary.',
-            inputSchema: setCityBoundaryToolInput,
-        },
-        (args, ctx: ServerContext) => run(() => mcpSetCityBoundary(identityFromContext(ctx), args)),
+        (args, ctx: ServerContext) => runStructured(() => mcpUpdateCity(identityFromContext(ctx), args)),
     );
 
     server.registerTool(
@@ -202,11 +198,29 @@ function registerCityAdminTools(server: McpServer) {
             _meta: category('admin'),
             description:
                 'Superadmin only. List the realms (one per country and domain): the country, the domain, the '
-                + 'language of the site, whether the realm has paying municipalities yet, and how many cities it '
-                + 'has in each status. Call it before you add a city.',
+                + 'language of the site, whether the realm has paying municipalities yet, how many cities it '
+                + 'has in each status and how many active topics. Call it before you add a city.',
             inputSchema: z.object({}),
         },
         (_args, ctx: ServerContext) => run(() => mcpListRealms(identityFromContext(ctx)))
+    );
+
+    server.registerTool(
+        'create_topics',
+        {
+            title: 'Create topics',
+            annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            _meta: category('admin'),
+            description:
+                'Superadmin only. Add topics to the taxonomy of a realm. processAgenda and summarize give each '
+                + 'subject one topic of its city\'s realm, so a realm needs its topics before its first meeting is '
+                + 'processed. A topic with a name or English name that a topic of the realm already has, in any letter case and deprecated or not, is skipped. '
+                + `At most ${MAX_TOPICS_PER_CALL} per call. Topics are shared by every `
+                + 'city of the realm: name them in the language of its councils and fit them to the powers of its '
+                + 'municipalities. Show the complete list to the user and get a confirmation before you call.',
+            inputSchema: createTopicsToolInput,
+        },
+        (args, ctx: ServerContext) => run(() => mcpCreateTopics(identityFromContext(ctx), args))
     );
 
     server.registerTool(
@@ -219,7 +233,7 @@ function registerCityAdminTools(server: McpServer) {
                 'Superadmin only. Create a municipality or a region in the realm of this domain, or in the realm '
                 + 'you name. The city is saved as '
                 + 'pending, so it is not public, and it has no logo and no boundary. Add the logo on the site '
-                + 'and the verified boundary with set_city_boundary. Fill it with populate_city. The id is permanent and is part of every URL of '
+                + 'and the verified boundary with update_city using geojson. Fill it with populate_city. The id is permanent and is part of every URL of '
                 + 'the city. Confirm the id and the names with the user before you call.',
             inputSchema: createCityToolInput,
         },

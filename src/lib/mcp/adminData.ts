@@ -3,7 +3,7 @@ import { CityLanguage, Prisma, type City } from '@prisma/client';
 import { inspectMedia } from '@/lib/tasks/inspectMedia';
 import prisma from '@/lib/db/prisma';
 import { BadRequestError, ConflictError, NotFoundError } from '@/lib/api/errors';
-import { createCityDirect, publishCityDemoDirect, updateCityGeometryDirect } from '@/lib/db/citiesAdmin';
+import { createCityDirect, applyCityUpdateDirect } from '@/lib/db/citiesAdmin';
 import { populateCity } from '@/lib/db/cityPopulate';
 import type { CityPopulationData } from '@/lib/zod-schemas/cityPopulation';
 import { createMeetingWithEffects, updateMeetingWithEffects, type MeetingDetailsEdit } from '@/lib/meetingWrites';
@@ -14,17 +14,18 @@ import { revalidateAfterResponse } from '@/lib/cache/afterResponse';
 import { CITY_DEFAULTS, cityLanguageSchema } from '@/lib/zod-schemas/city';
 import { ALL_REALMS, REALMS, getRealmDisplayName } from '@/lib/realm';
 import { countCitiesByRealmAndStatus } from '@/lib/db/citiesAdmin';
+import { countActiveTopicsByRealm, createRealmTopicsDirect } from '@/lib/db/topicsAdmin';
 import type { McpIdentity } from './auth';
 import type {
     CompleteUploadToolArgs,
     InspectMediaToolArgs,
     CreateCityToolArgs,
     CreateMeetingToolArgs,
+    CreateTopicsToolArgs,
     CreateUploadUrlToolArgs,
     StartTaskToolArgs,
     UpdateMeetingToolArgs,
-    PublishCityDemoToolArgs,
-    SetCityBoundaryToolArgs,
+    UpdateCityToolArgs,
 } from './adminToolSchemas';
 import { requireAdminAccess, requireBodyAdmin, requireCityAdmin, requireMeetingAdmin, requireSuperadmin } from './adminAccess';
 import { requireVisibleMeeting } from './gate';
@@ -32,10 +33,14 @@ import { mcpTaskSummary } from './taskSummary';
 import { requireCityBodies, requireRealmCity } from './realmGuards';
 import { cityBaseUrl, currentBaseUrl, currentRealm, rememberCityRealm } from './realm-context';
 import { meetingDisplayName, meetingLabel } from '@/lib/meetingName';
+import { setMeetingReleaseDirect } from '@/lib/db/meetings';
+import { getReleaseOutlook } from '@/lib/notifications/meetingNotifications';
 import { getCityTimezone } from '@/lib/db/cityTimezone';
 import { landingSubjectsTag } from '@/lib/db/subject';
 import { parseBoundaryInput } from '@/lib/utils/geojson';
 import { isNewsPhase } from '@/lib/notifications/freshness';
+import { projectCityProfile } from './data';
+import type { CityChanges, UpdateCityResult } from './citySchemas';
 
 /**
  * The write side of the MCP server for administrators: meetings and their
@@ -85,7 +90,7 @@ export async function mcpCreateMeeting(identity: McpIdentity, args: CreateMeetin
         url: meetingUrl(meeting.cityId, meeting.id),
         ...(processAgendaStatus && { processAgendaStatus }),
         next: 'The meeting is saved as a draft: only administrators see it, and no subscriber is notified '
-            + 'until it is released. Transcription and release are done on the site, on the admin page of the meeting.',
+            + 'until it is released. Use start_task for processing and update_meeting with released for publication.',
     };
 }
 
@@ -93,6 +98,30 @@ export async function mcpUpdateMeeting(identity: McpIdentity, args: UpdateMeetin
     await requireMeetingAdmin(identity, args.cityId, args.meetingId);
     // Realm-scoped, and an administrator of the meeting passes it for a draft.
     const current = await requireVisibleMeeting(args.cityId, args.meetingId, identity);
+    if (args.released !== undefined) {
+        const notifications = args.released && !current.released
+            ? await getReleaseOutlook(args.cityId, args.meetingId)
+            : null;
+        const result = args.dryRun
+            ? { meeting: { released: current.released }, changed: false }
+            : await setMeetingReleaseDirect(args.cityId, args.meetingId, args.released);
+        return {
+            cityId: args.cityId,
+            meetingId: args.meetingId,
+            dryRun: args.dryRun ?? false,
+            released: result.meeting.released,
+            changed: result.changed,
+            notifications: args.dryRun || result.changed ? notifications : null,
+            url: meetingUrl(args.cityId, args.meetingId),
+            next: args.dryRun
+                ? 'Preview only: no visibility change or notifications. Confirm the visibility change with the user before writing.'
+                : !result.changed
+                    ? 'The meeting already had the requested visibility. No new release notifications were scheduled.'
+                    : args.released
+                        ? 'The meeting is released. Normal notification rules apply. Public discovery also requires a public city.'
+                        : 'The meeting is unreleased. Postponement rules can make an earlier meeting visible again.',
+        };
+    }
     // A body admin may not move a meeting away from their body, nor take the
     // meeting of another body: the new body needs its own right.
     if (args.administrativeBodyId !== undefined && args.administrativeBodyId !== current.administrativeBodyId) {
@@ -225,43 +254,38 @@ function revalidateCityDiscovery(cityId: string, realm: City['realm']) {
     revalidateAfterResponse({ blockingTags: ['city', 'cities:all', `city:${cityId}`, landingSubjectsTag(realm)] });
 }
 
-export async function mcpSetCityBoundary(identity: McpIdentity, args: SetCityBoundaryToolArgs) {
+export async function mcpUpdateCity(identity: McpIdentity, args: UpdateCityToolArgs): Promise<UpdateCityResult> {
     await requireSuperadmin(identity);
     const realm = await requireRealmCity(args.cityId);
-    const boundary = parseBoundaryInput(args.geojson);
-    if (!boundary.ok) throw new BadRequestError(`Invalid boundary GeoJSON: ${boundary.error}. Supply the municipality's WGS84 Polygon or MultiPolygon.`);
-    await updateCityGeometryDirect(args.cityId, boundary.geometry);
-    rememberCityRealm(args.cityId, realm);
-    revalidateCityDiscovery(args.cityId, realm);
-    revalidateAfterResponse({ blockingTags: [`city:${args.cityId}:geometry`] });
-    return {
-        cityId: args.cityId, realm,
-        geometryType: boundary.geometry.type,
-        polygonCount: boundary.geometry.type === 'Polygon' ? 1 : boundary.geometry.coordinates.length,
-        url: `${cityBaseUrl(args.cityId)}/${args.cityId}/map`,
-        next: 'The boundary is saved. Verify its outline on the city map. City status and meeting release flags are unchanged.',
-    };
-}
-
-export async function mcpPublishCityDemo(identity: McpIdentity, args: PublishCityDemoToolArgs) {
-    await requireSuperadmin(identity);
-    await requireRealmCity(args.cityId);
-    let city: City;
+    let geometry: GeoJSON.Polygon | GeoJSON.MultiPolygon | undefined;
+    if (args.geojson !== undefined) {
+        const boundary = parseBoundaryInput(args.geojson);
+        if (!boundary.ok) throw new BadRequestError(`Invalid boundary GeoJSON: ${boundary.error}. Supply the municipality's WGS84 Polygon or MultiPolygon.`);
+        geometry = boundary.geometry;
+    }
+    let outcome: Awaited<ReturnType<typeof applyCityUpdateDirect>>;
     try {
-        city = await publishCityDemoDirect(args.cityId);
+        outcome = await applyCityUpdateDirect(args.cityId, geometry !== undefined ? { geometry } : { status: 'demo' });
     } catch (error) {
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') {
             throw new ConflictError('Only a pending or demo city can be published as a demo. Check list_cities with includePending before retrying.');
         }
         throw error;
     }
-    rememberCityRealm(city.id, city.realm);
-    revalidateCityDiscovery(city.id, city.realm);
-    return {
-        id: city.id, status: city.status, realm: city.realm,
-        url: `${cityBaseUrl(city.id)}/${city.id}`,
-        next: 'The city is a public demo. Already released meetings are discoverable; draft meetings remain unreleased. No official support or notifications have been enabled.',
-    };
+    rememberCityRealm(args.cityId, realm);
+    const changes: CityChanges = {};
+    if (outcome.changed) {
+        revalidateCityDiscovery(args.cityId, realm);
+        if (geometry !== undefined) {
+            revalidateAfterResponse({ blockingTags: [`city:${args.cityId}:geometry`] });
+            // A saved polygon always has a non-null summary.
+            if (!outcome.after.boundary) throw new Error('Missing boundary after successful write');
+            changes.boundary = { before: outcome.before.boundary, after: outcome.after.boundary };
+        } else {
+            changes.status = { before: outcome.before.status, after: 'demo' };
+        }
+    }
+    return { city: await projectCityProfile(outcome.city, outcome.after.boundary, identity), changed: outcome.changed, changes };
 }
 
 export async function mcpCreateCity(identity: McpIdentity, args: CreateCityToolArgs) {
@@ -310,7 +334,7 @@ export async function mcpCreateCity(identity: McpIdentity, args: CreateCityToolA
         realm: city.realm,
         language: city.language,
         url: `${cityBaseUrl(city.id)}/${city.id}`,
-        next: 'The city is saved as pending, so it is not public. Fill it with populate_city and save its verified boundary with set_city_boundary. '
+        next: 'The city is saved as pending, so it is not public. Fill it with populate_city and save its verified boundary with update_city using geojson. '
             + `Add the logo on the site: ${currentBaseUrl()}/admin/cities.`,
     };
 }
@@ -321,7 +345,7 @@ export async function mcpCreateCity(identity: McpIdentity, args: CreateCityToolA
  */
 export async function mcpListRealms(identity: McpIdentity) {
     await requireSuperadmin(identity);
-    const counts = await countCitiesByRealmAndStatus();
+    const [counts, topicCounts] = await Promise.all([countCitiesByRealmAndStatus(), countActiveTopicsByRealm()]);
     const cityCount = (realm: string, status: string) =>
         counts.find((row) => row.realm === realm && row.status === status)?._count._all ?? 0;
     return {
@@ -338,9 +362,33 @@ export async function mcpListRealms(identity: McpIdentity) {
                 demo: cityCount(realm, 'demo'),
                 pending: cityCount(realm, 'pending'),
             },
+            topics: topicCounts.find((row) => row.realm === realm)?._count._all ?? 0,
         })),
         next: 'Pass a realm to create_city to add a city there, and to list_cities (with includePending) to see its cities. '
-            + 'The UI language is the site\'s; the language a council speaks is set per city.',
+            + 'The UI language is the site\'s; the language a council speaks is set per city. '
+            + '`topics` counts the active topics of the realm: with none, processAgenda and summarize give no subject a topic. Add them with create_topics.',
+    };
+}
+
+/**
+ * Add topics to the taxonomy of a realm, as the topic form of /admin/topics
+ * does one at a time.
+ */
+export async function mcpCreateTopics(identity: McpIdentity, args: CreateTopicsToolArgs) {
+    await requireSuperadmin(identity);
+    const { created, skipped } = await createRealmTopicsDirect(args.realm, args.topics);
+    revalidateAfterResponse({ paths: [{ path: '/admin/topics' }] });
+    return {
+        realm: args.realm,
+        created,
+        skipped,
+        next: (skipped.length
+            ? 'For each skipped topic, the realm already had `existing`, and it stays as it is. '
+            : '')
+            + (skipped.some((topic) => topic.existing.deprecated)
+                ? 'A skipped topic marked deprecated is not offered to processAgenda or summarize: un-deprecate it on the site to use it. '
+                : '')
+            + `Edit or deprecate a topic on the site: ${currentBaseUrl()}/admin/topics.`,
     };
 }
 
@@ -358,7 +406,7 @@ export async function mcpPopulateCity(
         cityId: data.cityId,
         ...stats,
         url: `${cityBaseUrl(data.cityId)}/${data.cityId}`,
-        next: 'The city stays pending. After checking the import and obtaining approval to publish, a superadmin can call publish_city_demo.',
+        next: 'The city stays pending. After checking the import and obtaining approval to publish, a superadmin can call update_city with status: "demo".',
     };
 }
 
