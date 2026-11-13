@@ -11,7 +11,7 @@ jest.mock('@/lib/tasks/tasks', () => ({ startTask: jest.fn() }))
 
 import { SpeakerAssignmentSource } from '@prisma/client'
 import prisma from '@/lib/db/prisma'
-import { findEligiblePeopleForVoiceprintGeneration, findLongestSpeakerSegmentForPerson } from '@/lib/tasks/generateVoiceprint'
+import { findEligiblePeopleForVoiceprintGeneration, findVoiceprintSources } from '@/lib/tasks/generateVoiceprint'
 import { resetDatabase } from '../helpers/test-db'
 import { createCity, createMeeting, createPerson, createSpeakerSegment, createTaskStatus } from '../helpers/factories'
 
@@ -29,6 +29,8 @@ describe('voiceprint source tags', () => {
         meetingId = meeting.id
         const person = await createPerson(cityId, { name: 'Speaker' })
         personId = person.id
+        // Eligibility needs a consent in force; which audio may be used is what is under test.
+        await prisma.voicePrintConsent.create({ data: { personId } })
     })
 
     /** A segment of the person's, on a tag whose person was set by `personSetBy`. */
@@ -44,7 +46,7 @@ describe('voiceprint source tags', () => {
         await speaks('transcript', 120)
 
         expect(await findEligiblePeopleForVoiceprintGeneration(cityId)).toEqual({ eligiblePeople: [], count: 0 })
-        expect(await findLongestSpeakerSegmentForPerson(personId)).toBeNull()
+        expect(await findVoiceprintSources(personId)).toEqual([])
     })
 
     test('it becomes one when the review of its meeting completes: the reviewer read the name and left it', async () => {
@@ -52,7 +54,7 @@ describe('voiceprint source tags', () => {
         await reviewed(minutesFromNow(10))
 
         expect((await findEligiblePeopleForVoiceprintGeneration(cityId)).eligiblePeople).toEqual([{ id: personId, name: 'Speaker' }])
-        const source = await findLongestSpeakerSegmentForPerson(personId)
+        const [source] = await findVoiceprintSources(personId)
         expect(source?.id).toBe(segment.id)
         // What the choice was made from stays on the server.
         expect(source).not.toHaveProperty('meeting')
@@ -64,14 +66,21 @@ describe('voiceprint source tags', () => {
         await createTaskStatus(meetingId, cityId, { type: 'humanReview', status: 'pending', createdAt: minutesFromNow(10) })
 
         expect((await findEligiblePeopleForVoiceprintGeneration(cityId)).count).toBe(0)
-        expect(await findLongestSpeakerSegmentForPerson(personId)).toBeNull()
+        expect(await findVoiceprintSources(personId)).toEqual([])
     })
 
     test.each([null, 'voiceprint', 'both', 'user'] as const)('a tag whose person was set by %s is a source', async (personSetBy) => {
         const segment = await speaks(personSetBy, 120)
 
         expect((await findEligiblePeopleForVoiceprintGeneration(cityId)).eligiblePeople).toEqual([{ id: personId, name: 'Speaker' }])
-        expect((await findLongestSpeakerSegmentForPerson(personId))?.id).toBe(segment.id)
+        expect((await findVoiceprintSources(personId))[0]?.id).toBe(segment.id)
+    })
+
+    test('a person whose consent is withdrawn is not eligible, whatever the tag says', async () => {
+        await speaks('user', 120)
+        await prisma.voicePrintConsent.updateMany({ where: { personId }, data: { withdrawnAt: new Date() } })
+
+        expect(await findEligiblePeopleForVoiceprintGeneration(cityId)).toEqual({ eligiblePeople: [], count: 0 })
     })
 
     test('the source is the longest segment that is not the transcript\'s alone', async () => {
@@ -79,7 +88,7 @@ describe('voiceprint source tags', () => {
         const chosen = await speaks('user', 45)
 
         expect((await findEligiblePeopleForVoiceprintGeneration(cityId)).count).toBe(1)
-        expect((await findLongestSpeakerSegmentForPerson(personId))?.id).toBe(chosen.id)
+        expect((await findVoiceprintSources(personId))[0]?.id).toBe(chosen.id)
     })
 
     test('eligibility needs one source segment of at least 30 seconds', async () => {
@@ -113,6 +122,7 @@ describe('voiceprint source tags', () => {
     test('with personIds, only those people are checked; an empty list checks nobody', async () => {
         await speaks('user', 120)
         const other = await createPerson(cityId, { name: 'Other' })
+        await prisma.voicePrintConsent.create({ data: { personId: other.id } })
         const tag = await prisma.speakerTag.create({ data: { label: 'SPEAKER_2', personId: other.id, personSetBy: 'user' } })
         await createSpeakerSegment(meetingId, cityId, { speakerTagId: tag.id, startTimestamp: 0, endTimestamp: 120 })
 
