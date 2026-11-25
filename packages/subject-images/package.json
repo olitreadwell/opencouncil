@@ -6,11 +6,12 @@
     ".": "./src/index.ts",
     "./constants": "./src/constants.ts",
     "./store": "./src/store.ts",
-    "./image": "./src/image.ts"
+    "./image": "./src/image.ts",
+    "./decode": "./src/decode.ts"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.1165.0",
-    "@google/genai": "^2.32.0",
+    "@aws-sdk/client-s3": "^3.1175.0",
+    "@google/genai": "^3.4.0",
     "sharp": "^0.35.5"
   }
 }
